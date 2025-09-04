@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "dengue-africa"
+version = "0.1.0"
+description = ""
+authors = ["Riccardo D'Ercole"]
+readme = "README.md"
+
+packages = [
+    { include = "utils", from = "src" },
+    { include = "models", from = "src" }
+]
+
+[tool.poetry.dependencies]
+python = ">=3.13"
+xarray = "^2025.8.0"
+torch = "2.7.1"
+ipykernel = "^6.30.1"
+matplotlib = "^3.10.6"
+seaborn = "^0.13.2"
+geopandas = "^1.1.1"
+rasterio = "^1.4.3"
+tqdm = "^4.67.1"
+xesmf = "^0.8.10"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
