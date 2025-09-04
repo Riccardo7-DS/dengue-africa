@@ -1,2 +1,2 @@
-# mtg-fci-query
-Repo to clone data from MTG FCI
+# Dengue africa
+Repo to predict dengue in Africa at high temporal resolution
