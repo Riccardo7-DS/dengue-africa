@@ -7,6 +7,10 @@ import rasterio
 from rasterio.features import rasterize
 from tqdm.auto import tqdm
 
+
+def latin_box():
+    return [-35.317366,-86.308594,13.111580,-34.277344]
+
 african_countries = [ 
     'ANGOLA', 'BENIN', 'BURKINA FASO', 'CABO VERDE', 'CAMEROON', 
     'CENTRAL AFRICAN REPUBLIC', 'CHAD', "COTE D'IVOIRE", 'ERITREA', 
