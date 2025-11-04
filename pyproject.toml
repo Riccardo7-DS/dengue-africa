@@ -1,38 +1,39 @@
-[tool.poetry]
+[project]
 name = "dengue-africa"
 version = "0.1.0"
-description = ""
-authors = ["Riccardo D'Ercole"]
+description = "Package to predict dengue at high temporal resolution"
+authors = [
+  { name = "Riccardo D’Ercole" }
+]
 readme = "README.md"
+requires-python =">=3.11"
 
-packages = [
-    { include = "utils", from = "src" },
-    { include = "models", from = "src" }
+dependencies = [
+    "xarray>=2025.8.0",
+    "ipykernel>=6.30.1",
+    "matplotlib>=3.10.6",
+    "seaborn>=0.13.2",
+    "geopandas>=1.1.1",
+    "rasterio>=1.4.3",
+    "tqdm>=4.67.1",
+    "xesmf>=0.8.10",
+    "zarr>=3.1.3",
+    "earthengine-api>=1.6.10",
+    "geemap>=0.36.4",
+    "rioxarray>=0.19.0",
+    "modis-tools>=1.2.0",
+    "notebook>=7.4.7",
+    "pyhdf>=0.11.6",
+    "h5py>=3.12.1",
+    "numpy>=2.3.3",
+    "earthaccess>=0.15.1",
+    "satpy>=0.58.0",
+    "gdal==3.11.3",
+    "dotenv>=0.9.9",
+    "ipywidgets>=8.1.8",
 ]
 
-[tool.poetry.dependencies]
-python = ">=3.11,<4.0"
-xarray = "^2025.8.0"
-torch = "2.7.1"
-ipykernel = "^6.30.1"
-matplotlib = "^3.10.6"
-seaborn = "^0.13.2"
-geopandas = "^1.1.1"
-rasterio = "^1.4.3"
-tqdm = "^4.67.1"
-xesmf = "^0.8.10"
-zarr = "^3.1.3"
-earthengine-api = "^1.6.10"
-geemap = "^0.36.4"
-rioxarray = "^0.19.0"
-modis-tools = "^1.2.0"
-notebook = "^7.4.7"
-pyhdf = "^0.11.6"
-h5py = "3.12.1"
-numpy = "^2.3.3"
-earthaccess = "^0.15.1"
-satpy = "^0.58.0"
-
-[build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+[dependency-groups]
+dev = [
+    "py-spy>=0.4.1",
+]

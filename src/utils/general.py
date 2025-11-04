@@ -1,15 +1,16 @@
-import torch
 import geopandas as gpd
 import pandas as pd
 import numpy as np
 import xarray as xr
 import rasterio
-from rasterio.features import rasterize
+# from rasterio.features import rasterize
 from tqdm.auto import tqdm
 
-
-def latin_box():
-    return [-35.317366,-86.308594,13.111580,-34.277344]
+def latin_box(invert:bool=False):
+    if invert:
+        return [-86.308594,-35.317366, -34.277344, 13.111580]
+    else:
+        return [-35.317366,-86.308594,13.111580,-34.277344]
 
 african_countries = [ 
     'ANGOLA', 'BENIN', 'BURKINA FASO', 'CABO VERDE', 'CAMEROON', 
@@ -95,6 +96,9 @@ def rasterize_timeseries(da:xr.DataArray, shapefile:gpd.GeoDataFrame, region_col
 # -----------------
 # Preprocessing
 # -----------------
+
+
+
 
 
 def df_to_xarray(df, freq="W-MON", countries:str=None, fill_value=0):

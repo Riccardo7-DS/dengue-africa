@@ -1,15 +1,28 @@
-import ee, geemap, xarray as xr
+# import ee
 import logging
-from tqdm.auto import tqdm
-
-ee.Authenticate()
-ee.Initialize(project="ee-querying-maps")
-logger = logging.getLogger(__name__)
-
-
+from pathlib import Path
+from osgeo import gdal
+from definitions import DATA_PATH
+import tempfile
+from collections import defaultdict
+import os
+import re
+import glob
+import shutil
+import tempfile
+import pandas as pd
+from tqdm import tqdm
+import earthaccess
+from dotenv import load_dotenv
 import os
 import xarray as xr
 from typing import Literal
+
+
+logger = logging.getLogger(__name__)
+
+
+
 
 class EeModis():
     def __init__(self,
@@ -20,6 +33,9 @@ class EeModis():
                  geometry=None,
                  output_resolution:int=1000,
                  download_collection:bool=True):
+        
+        ee.Authenticate()
+        ee.Initialize(project="ee-querying-maps")
         
         valid_names = {"ref_061","LST_061"}
         assert name in valid_names, \
@@ -197,13 +213,273 @@ class EeModis():
                                     preprocess=self._preprocess_file, 
                                     engine="rasterio")
         return dataset
+    
 
+# class ProcessModis:
+#     """Process MODIS HDF files into mosaicked and reprojected NetCDF files."""
+
+#     def __init__(self, 
+#             folder_path: str, 
+#             mosaics_folder: str):
+        
+#         self.folder_path = Path(folder_path)
+#         self.modis_folder = Path(DATA_PATH) / "modis"
+#         self.mosaics_folder = Path(mosaics_folder)
+#         self.mosaics_folder.mkdir(parents=True, exist_ok=True)
+
+#     @staticmethod
+#     def _get_date(filename: str) -> datetime:
+#         """Extract date from MODIS filename (assuming format MOD11A1.AYYYYDDD...)."""
+#         try:
+#             doy_str = filename.split(".")[1][1:]  # e.g. 'A2021205'
+#             year, doy = int(doy_str[:4]), int(doy_str[4:])
+#             return datetime(year, 1, 1) + timedelta(days=doy - 1)
+#         except Exception as e:
+#             raise ValueError(f"Cannot parse date from filename: {filename}") from e
+
+#     def _group_files_by_date(self) -> dict:
+#         """Group all .hdf files by date."""
+#         files_by_date = defaultdict(list)
+#         for file in self.folder_path.glob("*.hdf"):
+#             date = self._get_date(file.name)
+#             files_by_date[date].append(file)
+#         return files_by_date
+
+#     def process_all(self):
+#         """Run mosaicking and processing for all available dates."""
+#         files_by_date = self._group_files_by_date()
+#         dates = sorted(files_by_date.keys())
+#         self._process_dates(files_by_date, dates)
+
+#     def _process_dates(self, files_by_date: dict, dates: list[datetime]):
+#         """Process mosaics for each date."""
+#         template_transform = None
+#         template_shape = None
+
+#         for i, date in enumerate(tqdm(dates, desc="Processing MODIS mosaics")):
+#             tiles = files_by_date[date]
+
+#             # Build list of MODIS subdatasets
+#             subdatasets = [
+#                 f'HDF4_EOS:EOS_GRID:"{f.resolve()}":MODIS_Grid_8Day_1km_LST:LST_Day_1km'
+#                 for f in tiles
+#             ]
+
+#             # Temporary VRT path
+#             with tempfile.NamedTemporaryFile(suffix=".vrt", delete=False) as tmp_vrt:
+#                 vrt_path = tmp_vrt.name
+
+#             tif_path = self.mosaics_folder / f"{date.strftime('%Y%m%d')}.tif"
+
+#             # Build and translate VRT → GeoTIFF
+#             gdal.BuildVRT(vrt_path, subdatasets)
+#             gdal.Translate(str(tif_path), vrt_path)
+#             os.remove(vrt_path)  # clean temp file
+
+#             # Load as xarray and process
+#             da = (
+#                 xr.open_dataset(tif_path, engine="rasterio", chunks={"x": 1000, "y": 1000})["band_data"]
+#                 .rio.write_crs("EPSG:6933")
+#             )
+#             da = da.where(da != 0) * 0.02 - 273.15  # Convert to Celsius
+#             da = da.rename("LST_Day_Celsius").expand_dims(time=[date]).isel(band=0)
+
+#             # Reproject to EPSG:4326
+#             if i == 0:
+#                 da_latlon = da.rio.reproject("EPSG:4326")
+#                 template_transform = da_latlon.rio.transform()
+#                 template_shape = da_latlon.shape[-2:]
+#             else:
+#                 da_latlon = da.rio.reproject(
+#                     "EPSG:4326",
+#                     transform=template_transform,
+#                     shape=template_shape,
+#                 )
+
+#             da_latlon = da_latlon.astype(np.float32)
+
+#             # Export to NetCDF
+#             out_nc = self.mosaics_folder / f"{date.strftime('%Y%m%d')}.nc"
+#             da_latlon.to_netcdf(out_nc)
+#             da.close()
+
+#         logger.info(f"\n✅ Processing complete. Output saved to {self.mosaics_folder}")
+
+
+
+
+
+
+class EarthAccessDownloader:
+    """
+    Generic downloader for NASA Earthdata (via earthaccess).
+    Handles: authentication, search, download, mosaic, cleanup, and export to Zarr.
+    """
+
+    def __init__(
+        self,
+        short_name="MOD11A1",
+        variable="MODIS_Grid_Daily_1km_LST:LST_Day_1km",
+        date_range=None,
+        bbox=None,
+        data_dir=Path(DATA_PATH) / "modis",
+        collection_name="lst_061",
+        zarr_path=None,
+    ):
+        
+        self.date_range = self._check_dates(date_range)
+
+        self.short_name = short_name
+        self.variable = variable
+        self.bbox = bbox
+        self.data_dir = Path(data_dir)
+        self.collection_name = collection_name
+        self.granule_dir = self.data_dir / self.collection_name
+        self.zarr_path = zarr_path or (self.data_dir / f"{self.short_name}_dataset.zarr")
+
+        self.granule_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self._login_earthaccess()
+
+    def _login_earthaccess(self):
+        load_dotenv()
+        # Login once
+        earthaccess.login(strategy="environment")
+
+    def _check_dates(self, date_range):
+        if date_range is None or len(date_range) != 2:
+            raise ValueError("date_range must be a tuple of (start_date, end_date)")
+        return date_range
+
+    # ------------------------
+    # Search and Download
+    # ------------------------
+    def _search_and_download(self):
+        logger.info(f"🔍 Searching for {self.short_name} data...")
+        results = earthaccess.search_data(
+            short_name=self.short_name,
+            bounding_box=(self.bbox[0], self.bbox[1], self.bbox[2], self.bbox[3]),
+            temporal=self.date_range,
+        )
+
+        logger.info(f"⬇️ Downloading {len(results)} files to {self.granule_dir}")
+        earthaccess.download(results, str(self.granule_dir))
+        self.files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.hdf")))
+
+
+    def _custom_preprocess(self, da):
+        # ---------- PRODUCT-SPECIFIC TRANSFORMS ----------
+        if self.short_name == "MOD11A1":
+            # LST products: scale factor and conversion to Celsius
+            da = da.where(da != 0) * 0.02 - 273.15
+            da.name = "LST_Day_Celsius"
+        elif "MOD13" in self.short_name:
+            # NDVI products (MOD13Q1, MYD13A2, etc.)
+            da = da.where(da != -3000) * 0.0001  # NDVI scale factor
+            da.name = "NDVI"
+        else:
+            da.name = "band_data"
+        # -------------------------------------------------
+
+        return da
+
+    def _get_date(self, filename):
+        match = re.search(r'\.A(\d{7})\.', filename)
+        return pd.to_datetime(match.group(1), format="%Y%j")
+
+    # ------------------------
+    # Mosaic and Convert
+    # ------------------------
+    def _mosaic_daily(self):
+        logger.info("🧩 Grouping and mosaicking tiles by date...")
+
+
+        # Group files by date
+        files_by_date = defaultdict(list)
+        for f in self.files:
+            files_by_date[self._get_date(f)].append(f)
+
+        mosaics = []
+
+        for date, files in tqdm(sorted(files_by_date.items()), desc="Processing dates"):
+            subdatasets = [
+                f'HDF4_EOS:EOS_GRID:"{f}":{self.variable}' for f in files
+            ]
+
+            # Ensure the temp directory exists
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+
+            vrt_path = self.temp_dir / f"{self.short_name}_{date.strftime('%Y%m%d')}.vrt"
+            tif_path = self.temp_dir / f"{self.short_name}_{date.strftime('%Y%m%d')}.tif"
+
+            # Build the VRT (returning an in-memory dataset)
+            vrt = gdal.BuildVRT(str(vrt_path), subdatasets)
+            if vrt is None:
+                raise RuntimeError(f"❌ GDAL failed to build VRT for {date.strftime('%Y-%m-%d')}")
+
+            # Make sure it flushes to disk
+            vrt = None  # close the GDAL dataset
+
+            # Confirm file exists before translating
+            if not vrt_path.exists():
+                raise FileNotFoundError(f"VRT not found at {vrt_path}")
+
+            # Translate to GeoTIFF
+            gdal.Translate(str(tif_path), str(vrt_path))
+            if not tif_path.exists():
+                raise RuntimeError(f"❌ GDAL failed to create GeoTIFF for {date.strftime('%Y-%m-%d')}")
+
+            da = xr.open_dataset(tif_path, engine="rasterio")["band_data"]
+            da = da.rio.write_crs("EPSG:6933")
+
+            da = self._custom_preprocess(da)
+            
+            da = da.rio.reproject("EPSG:4326")
+            da = da.expand_dims(time=[date])
+
+            mosaics.append(da)
+
+        ds = xr.concat(mosaics, dim="time", join="override")
+        return ds
+
+    # ------------------------
+    # Export to Zarr
+    # ------------------------
+    def _export_to_zarr(self, ds):
+        logger.info(f"💾 Appending data to {self.zarr_path}")
+        if not self.zarr_path.exists():
+            ds.to_zarr(self.zarr_path, mode="w")
+        else:
+            ds.to_zarr(self.zarr_path, mode="a", append_dim="time")
+
+    # ------------------------
+    # Cleanup
+    # ------------------------
+    def cleanup(self):
+        logger.info(f"🧹 Cleaning up temporary files in {self.temp_dir}")
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    # ------------------------
+    # Full pipeline
+    # ------------------------
+    def run(self):
+        self._search_and_download()
+        ds = self._mosaic_daily()
+        self._export_to_zarr(ds)
+        self.cleanup()
+        logger.info("✅ Done!")
 
 
 if __name__ == "__main__":
-    EeModis(
-        start_date="2013-09-08", 
-        end_date= "2023-02-17",
-        name= "NDVI_06", 
-        output_resolution=1000,
-        download_collection=True)
+    from utils import latin_box
+    bbox = latin_box(True)
+    
+    downloader = EarthAccessDownloader(
+        short_name="MOD11A1",
+        bbox= bbox,
+        variable="MODIS_Grid_Daily_1km_LST:LST_Day_1km",
+        date_range=("2020-12-30", "2020-12-31"),
+    )
+
+    downloader.cleanup()
+    downloader.run()
