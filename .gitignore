@@ -5,3 +5,5 @@ src/__pycache__/
 .env
 *.lock
 .vscode/
+*.log
+.github/
