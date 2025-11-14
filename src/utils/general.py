@@ -5,15 +5,62 @@ import xarray as xr
 import rasterio
 # from rasterio.features import rasterize
 from tqdm.auto import tqdm
-import logging 
+from typing import Union
+import logging
+import itertools
 
 logger = logging.getLogger(__name__)
+
+
+
+def generate_bboxes_fixed(lat_min=-70, lat_max=70, lon_min=-70, lon_max=70, n_lat=7, n_lon=7):
+    """
+    Divide a lat/lon area into n_lat × n_lon non-overlapping tiles.
+    
+    Parameters
+    ----------
+    lat_min, lat_max : float
+        Minimum and maximum latitude.
+    lon_min, lon_max : float
+        Minimum and maximum longitude.
+    n_lat : int
+        Number of tiles along latitude.
+    n_lon : int
+        Number of tiles along longitude.
+    
+    Returns
+    -------
+    List of bounding boxes: [lon_min, lat_min, lon_max, lat_max]
+    """
+    # Compute tile size
+    lat_step = (lat_max - lat_min) / n_lat
+    lon_step = (lon_max - lon_min) / n_lon
+
+    # Generate edges
+    lat_edges = [lat_min + i * lat_step for i in range(n_lat)]
+    lon_edges = [lon_min + i * lon_step for i in range(n_lon)]
+
+    bboxes = []
+    for lat, lon in itertools.product(lat_edges, lon_edges):
+        bboxes.append([
+            float(lon),
+            float(lat),
+            float(lon + lon_step),
+            float(lat + lat_step)
+        ])
+    return bboxes
 
 def latin_box(invert:bool=False):
     if invert:
         return [-86.308594,-35.317366, -34.277344, 13.111580]
     else:
         return [-35.317366,-86.308594,13.111580,-34.277344]
+    
+def mtg_box(invert:bool=False):
+    if invert:
+        return [-70, 70, -70, 70]
+    else:
+        return [-70, -70, 70, 70]
 
 african_countries = [ 
     'ANGOLA', 'BENIN', 'BURKINA FASO', 'CABO VERDE', 'CAMEROON', 
@@ -47,6 +94,17 @@ other_places = [
     'VIRGIN ISLANDS (UK)', 'VIRGIN ISLANDS (US)', 'WALLIS AND FUTUNA',
     'YEMEN'
 ]
+
+def prepare(dataset:Union[xr.DataArray, xr.Dataset]):
+    if "longitude" in dataset.dims:
+        dataset = dataset.rename({"latitude":"lat", "longitude":"lon"})
+    if "x" in dataset.dims:
+        dataset = dataset.rename({"y":"lat", "x":"lon"})
+    if "X" in dataset.dims:
+        dataset = dataset.rename({"Y":"lat", "X":"lon"})
+    dataset.rio.write_crs("EPSG:4326", inplace=True)
+    dataset.rio.set_spatial_dims(x_dim='lon', y_dim='lat', inplace=True)
+    return dataset
 
 def rasterize_timeseries(da:xr.DataArray, shapefile:gpd.GeoDataFrame, region_col:str="region_id", res:float=0.05):
     """
@@ -220,25 +278,6 @@ def convert_data_to_yearly_presence(data:pd.DataFrame, filter_year:int=2000, spa
     names = data["adm_0_name"].unique()
     
     return heatmap_data, names
-
-
-def admin2_aggregate(pred_weekly, admin2_mask):
-    B, weeks, H, W = pred_weekly.shape
-    num_admin2 = admin2_mask.shape[0]
-    pred_flat = pred_weekly.view(B, weeks, H*W)
-    mask_flat = admin2_mask.view(num_admin2, H*W).float()
-    agg = torch.einsum("bwh,nh->bwn", pred_flat, mask_flat)  # (B, weeks, num_admin2)
-    return agg
-
-def aggregate_to_admin(pred, admin2_mask):
-    # pred: (B, weeks, H, W)
-    # admin2_mask: (num_admin2, H, W)
-    B, weeks, H, W = pred.shape
-    num_admin2 = admin2_mask.shape[0]
-    pred_flat = pred.view(B, weeks, H*W)
-    mask_flat = admin2_mask.view(num_admin2, H*W).float()
-    agg = torch.einsum("bwh,nh->bwn", pred_flat, mask_flat)  # (B, weeks, num_admin2)
-    return agg
 
 
 def init_logging(log_file=None, verbose=False):
