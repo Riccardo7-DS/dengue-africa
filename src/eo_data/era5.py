@@ -3,6 +3,7 @@ import cdsapi
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
+from definitions import DATA_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -20,46 +21,75 @@ era5_variables = ['total_precipitation',
                   "u_component_of_wind_10m",
                   "v_component_of_wind_10m"]
 
+class Era5CDS():
+    def __init__(self, variables:list, 
+                 output_name:str):
 
-def query_era5_cdsapi(
-        year_min: int,
-        year_max: int,
-        area: list,
-        variables: list,
-        output_name:str,
-        output_path:str,
-        product_name: str = "reanalysis-era5-land",
-        format_output: str = "netcdf"
-    ):
-    """
-    Download ERA5/ERA5-Land data from CDS API.
-    """
+        self.api_url = os.environ["CDS_API_URL"]
+        self.api_key = os.environ["CDS_API_KEY"]
+        self.zip_path = Path(DATA_PATH) / "shapefiles/GAUL_2024.zip"
+        self.output_path = Path(DATA_PATH) / "ERA5" 
+        os.makedirs(output_path, exist_ok=True)
 
-    load_dotenv()  # your function to load .env variables
+        self.variables = variables
+        self._output_name = output_name
 
-    api_url = os.environ["CDS_API_URL"]
-    api_key = os.environ["CDS_API_KEY"]   # should be "uid:apikey"
+    def run(self, countries, year_min, year_max):
+        logger.info(f"Starting downloading data for countries {countries} from year {year_min} to {year_max}")
+        bbox = self._select_area(countries)
+        query_era5_cdsapi(
+                  year_min=year_min, 
+                  year_max=year_max, 
+                  area=bbox, 
+                  output_path=self.output_path, 
+                  variables=self.variables, 
+                  output_name=self._output_name)   
 
-    c = cdsapi.Client(url=api_url, key=api_key)
+    def _select_area(self, countries):
+        gdf = process_gdf(self.zip_path, countries=countries)
+        gdf_admin0 = gdf.dissolve(by="adm_0_name", as_index=False)
+        bbox = countries_to_bbox(countries, gdf_admin0)
+        return bbox
 
-    years = range(year_min, year_max + 1)
+    def query_era5_cdsapi(
+            self, 
+            year_min: int,
+            year_max: int,
+            area: list,
+            variables: list,
+            output_name:str,
+            output_path:str,
+            product_name: str = "reanalysis-era5-land",
+            format_output: str = "netcdf"
+        ):
+        """
+        Download ERA5/ERA5-Land data from CDS API.
+        """
 
-    for year in years:
-        output_file = f"era5land_{output_name}_{year}.nc"
-        output_path_year = output_path / output_file
+        load_dotenv()  # your function to load .env variables
 
-        c.retrieve(
-            product_name,
-            {
-                "variable": variables,
-                "year": str(year),
-                "month": [f"{m:02d}" for m in range(1, 13)],
-                "day":   [f"{d:02d}" for d in range(1, 32)],
-                "time": ["00:00"],
-                "area": area,   # [North, West, South, East]
-                "format": format_output,
-            },
-            output_path_year,
-        )
 
-        logger.info(f"{output_file} downloaded.")
+
+        c = cdsapi.Client(url=self.api_url, key=self.api_key)
+
+        years = range(year_min, year_max + 1)
+
+        for year in years:
+            output_file = f"era5land_{output_name}_{year}.nc"
+            output_path_year = output_path / output_file
+
+            c.retrieve(
+                product_name,
+                {
+                    "variable": variables,
+                    "year": str(year),
+                    "month": [f"{m:02d}" for m in range(1, 13)],
+                    "day":   [f"{d:02d}" for d in range(1, 32)],
+                    "time": ["00:00"],
+                    "area": area,   # [North, West, South, East]
+                    "format": format_output,
+                },
+                output_path_year,
+            )
+
+            logger.info(f"{output_file} downloaded.")
