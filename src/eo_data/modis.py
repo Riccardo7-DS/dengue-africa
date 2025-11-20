@@ -6,7 +6,7 @@ from definitions import DATA_PATH
 import tempfile
 from collections import defaultdict
 import gc 
-import rioxarray
+import rasterio
 import os
 import re
 import glob
@@ -288,6 +288,7 @@ class EarthAccessDownloader:
         zarr_path=None,
         reproj_lib:Literal["rioxarray","xesmf"]="xesmf",
         reproj_method:Literal["nearest","bilinear"]="nearest",
+        output_format:Literal["tiff","zarr"]="zarr",
     ):
         
         self.date_range = self._check_dates(date_range)
@@ -301,6 +302,8 @@ class EarthAccessDownloader:
         self.zarr_path = zarr_path or (self.data_dir / f"{self.short_name}_dataset.zarr")
         self._reproj_lib = self._check_reproj_lib(reproj_lib)
         self._reproj_method = self._check_reproj_method(reproj_method)
+
+        self._output_format = output_format
 
         self.granule_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = Path(tempfile.mkdtemp())
@@ -347,6 +350,7 @@ class EarthAccessDownloader:
 
 
     def _custom_preprocess(self, da):
+
         # ---------- PRODUCT-SPECIFIC TRANSFORMS ----------
         if self.short_name == "MOD11A1":
             # LST products: scale factor and conversion to Celsius
@@ -366,92 +370,7 @@ class EarthAccessDownloader:
         match = re.search(r'\.A(\d{7})\.', filename)
         return pd.to_datetime(match.group(1), format="%Y%j")
 
-    # ------------------------
-    # Mosaic and Convert
-    # ------------------------
-    # def _mosaic_daily(self):
-    #     logger.info("🧩 Grouping and mosaicking tiles by date...")
-
-    #     files_by_date = defaultdict(list)
-    #     for f in self.files:
-    #         files_by_date[self._get_date(f)].append(f)
-
-    #     mosaics = []
-
-    #     if isinstance(self.variable, str):
-    #         variables = [self.variable]
-    #     else:
-    #         variables = self.variable
-
-    #     for date, files in tqdm(sorted(files_by_date.items()), desc="Processing dates"):
-    #         variable_data = {}
-
-    #         for var in variables:
-    #             subdatasets = []
-
-    #             # --- Collect subdataset paths for this variable across all tiles ---
-    #             for f in files:
-    #                 ds = gdal.Open(str(f))
-    #                 if ds is None:
-    #                     logger.warning(f"⚠️ Could not open {f}, skipping.")
-    #                     continue
-
-    #                 # # Match the correct subdataset by variable name
-    #                 matched = [
-    #                     s[0] for s in ds.GetSubDatasets()
-    #                     if var in s[0]  # e.g. 'sur_refl_b01'
-    #                 ]
-    #                 if not matched:
-    #                     logger.warning(f"⚠️ Variable '{var}' not found in {f}")
-    #                     continue
-
-    #                 subdatasets.append(matched[0])  # one per tile
-
-    #             if not subdatasets:
-    #                 logger.warning(f"⚠️ No subdatasets found for variable '{var}' on {date:%Y-%m-%d}")
-    #                 continue
-
-    #             # --- Prepare output paths ---
-    #             self.temp_dir.mkdir(parents=True, exist_ok=True)
-    #             vrt_path = self.temp_dir / f"{self.short_name}_{var}_{date:%Y%m%d}.vrt"
-    #             tif_path = self.temp_dir / f"{self.short_name}_{var}_{date:%Y%m%d}.tif"
-
-    #             # --- Build the VRT mosaic for this variable ---
-    #             try:
-    #                 gdal.UseExceptions()
-    #                 vrt = gdal.BuildVRT(str(vrt_path), subdatasets)
-    #             except RuntimeError as e:
-    #                 raise RuntimeError(f"❌ GDAL failed to build VRT for {var} on {date:%Y-%m-%d}: {e}")
-
-    #             if vrt is None:  #or not vrt_path.exists():
-    #                 raise RuntimeError(f"❌ GDAL failed to create VRT for {var} on {date:%Y-%m-%d}")
-    #             vrt = None  # close handle
-
-    #             # --- Translate to GeoTIFF ---
-    #             gdal.Translate(str(tif_path), str(vrt_path))
-    #             if not tif_path.exists():
-    #                 raise RuntimeError(f"❌ GDAL failed to create GeoTIFF for {var} on {date:%Y-%m-%d}")
-
-    #             # --- Open, reproject, and preprocess ---
-    #             da = xr.open_dataset(tif_path, engine="rasterio")["band_data"]
-    #             da = da.rio.write_crs("EPSG:6933")
-    #             da = self._custom_preprocess(da)
-    #             da = da.rio.reproject("EPSG:4326")
-    #             da = da.expand_dims(time=[date])
-    #             da.name = var
-
-    #             variable_data[var] = da
-
-    #         if variable_data:
-    #             ds_date = xr.merge(variable_data.values())
-    #             mosaics.append(ds_date)
-
-    #     if not mosaics:
-    #         raise RuntimeError("❌ No mosaics were generated. Check variable names or input files.")
-
-    #     ds = xr.concat(mosaics, dim="time", join="override")
-    #     return ds
-
+    
     def _validate_latlon_bounds(self, lat, lon, tol=1e-6):
         """
         Validate that the lat/lon arrays define a meaningful bounding box.
@@ -575,7 +494,11 @@ class EarthAccessDownloader:
     
 
     def _mosaic_daily(self, max_workers=1):
-        logger.info("🧩 Grouping and mosaicking tiles by date...")
+        """
+        Process all tiles, mosaic and reproject them per day.
+        Export either as Zarr or TIFF based on self.arg.output.
+        """
+        logger.info("🧩 Grouping tiles by date...")
 
         # --- Group files by date ---
         files_by_date = defaultdict(list)
@@ -584,13 +507,17 @@ class EarthAccessDownloader:
 
         variables = [self.variable] if isinstance(self.variable, str) else list(self.variable)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.tif_out_dir = self.granule_dir / "tiffs"
+        self.tif_out_dir.mkdir(parents=True, exist_ok=True)
 
+        # ------------------------
+        # Helper: process one day
+        # ------------------------
         def process_one_day(date_files):
-            """Process a single date group (can run in parallel)."""
             date, files = date_files
             variable_data = {}
 
-            # --- Cache subdatasets for all tiles once ---
+            # --- Cache subdatasets for all tiles ---
             subdatasets_cache = {}
             for f in files:
                 ds = gdal.Open(str(f))
@@ -608,84 +535,152 @@ class EarthAccessDownloader:
                     if var in s[0]
                 ]
                 if not subdatasets:
-                    logger.warning(f"⚠️ No subdatasets found for '{var}' on {date:%Y-%m-%d}")
+                    logger.warning(f"⚠️ No subdatasets for '{var}' on {date:%Y-%m-%d}")
                     continue
 
-                # --- Output paths ---
-                vrt_path = self.temp_dir / f"{self.short_name}_{var}_{date:%Y%m%d}.vrt"
-                tif_path = self.temp_dir / f"{self.short_name}_{var}_{date:%Y%m%d}.tif"
-
-                # --- Build mosaic only (no reprojection) ---
-                try:
-                    gdal.UseExceptions()
-                    vrt = gdal.BuildVRT(str(vrt_path), subdatasets, creationOptions=["NUM_THREADS=ALL_CPUS"])
-                    if vrt is None:
-                        raise RuntimeError("BuildVRT returned None")
-
-                    # Write GeoTIFF in original CRS (MODIS sinusoidal)
-                    gdal.Translate(
-                        str(tif_path),
-                        vrt,
-                        creationOptions=["TILED=YES", "BIGTIFF=YES", "COMPRESS=LZW", "NUM_THREADS=ALL_CPUS"]
-                    )
-                    vrt = None
-                except RuntimeError as e:
-                    raise RuntimeError(f"❌ GDAL failed for {var} on {date:%Y-%m-%d}: {e}")
-
-                if not tif_path.exists():
-                    raise RuntimeError(f"❌ GeoTIFF not created for {var} on {date:%Y-%m-%d}")              
-
-                # --- Open lazily with rioxarray ---
-                da = rioxarray.open_rasterio(tif_path, chunks=True).squeeze("band", drop=True).astype("int16")
-            
-                # --- MOD09 scaling and masking ---
-                # da = da.where((da > 0) & (da <= 10000)) / 10000.0
+                da = self._build_mosaic(subdatasets, var)
+                if da is None:
+                    continue
 
                 # --- Custom preprocessing ---
                 da = self._custom_preprocess(da)
-
-                # --- Add time dimension ---
                 da = da.expand_dims(time=[date])
                 da.name = var
-
                 variable_data[var] = da
 
-                del da
-                gc.collect()
+            # --- Merge variables ---
+            if not variable_data:
+                return None
 
-            # --- Merge variables for this date ---
-            if variable_data:
-                ds_date = xr.merge(variable_data.values())
-                logger.info(f"Starting reprojection for date %s...", date.strftime("%Y-%m-%d"))
-                ds_date = self._reproject(ds_date)
-                return ds_date
-            return None
+            ds_date = xr.merge(variable_data.values())
+            logger.info(f"Reprojecting dataset for {date:%Y-%m-%d}...")
+            ds_date = self._reproject(ds_date)
 
-        # --- Parallel or sequential execution ---
+            # --- Export tiff---
+            if self._output_format.lower() == "tiff":
+                self._export_data(ds_date, date)
+            return ds_date
+
+        # ------------------------
+        # Parallel or sequential execution
+        # ------------------------
+        mosaics = []
+        items = sorted(files_by_date.items())
         if max_workers > 1:
-            mosaics = []
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
-                futures = {ex.submit(process_one_day, item): item[0] for item in files_by_date.items()}
+                futures = {ex.submit(process_one_day, item): item[0] for item in items}
                 for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing dates"):
                     result = fut.result()
                     if result is not None:
                         mosaics.append(result)
         else:
-            mosaics = []
-            for item in tqdm(sorted(files_by_date.items()), desc="Processing dates"):
+            for item in tqdm(items, desc="Processing dates"):
                 ds_date = process_one_day(item)
                 if ds_date is not None:
-                    # mosaics.append(result)
-                    path = self.granule_dir / f"{self.short_name}_{item[0]:%Y%m%d}.nc"
-                    ds_date.to_netcdf(path, engine="h5netcdf")
+                    mosaics.append(ds_date)
                     del ds_date
                     gc.collect()
 
-            
+        # --- If Zarr is requested, merge all days into a single dataset ---
+        if self._output_format.lower() == "zarr":
+            ds = xr.open_mfdataset(str(self.granule_dir / "*.nc"), combine="by_coords", parallel=True, chunks="auto")
+            ds= prepare(ds)
+            ds = ds.chunk({"time": 1, "lat": 1024, "lon": 1024})
+            self._export_to_zarr(ds)
+
+
+    # ------------------------
+    # Helper: build mosaic for one variable
+    # ------------------------
+    def _build_mosaic(self, subdatasets, var):
+        from osgeo import gdal
+        import rioxarray
+
+        vrt_path = self.temp_dir / f"{self.short_name}_{var}.vrt"
+        tif_path = self.temp_dir / f"{self.short_name}_{var}.tif"
+
+        try:
+            gdal.UseExceptions()
+            vrt = gdal.BuildVRT(str(vrt_path), subdatasets, creationOptions=["NUM_THREADS=ALL_CPUS"])
+            if vrt is None:
+                raise RuntimeError("BuildVRT returned None")
+
+            gdal.Translate(
+                str(tif_path),
+                vrt,
+                creationOptions=["TILED=YES", "BIGTIFF=YES", "COMPRESS=LZW", "NUM_THREADS=ALL_CPUS"]
+            )
+            vrt = None
+
+            da = rioxarray.open_rasterio(tif_path, chunks=True).squeeze("band", drop=True).astype("int16")
+            return da
+
+        except RuntimeError as e:
+            logger.warning(f"GDAL mosaic failed for {var}: {e}")
+            return None
         
-        ds = xr.open_mfdataset(str(self.granule_dir / "*.nc"), combine="by_coords", parallel=True, chunks="auto")
-        # --- Lazy reprojection (rioxarray) ---
+
+    def _drop_empty_coordinates(self, ds:xr.Dataset):
+        # Only drop if coordinates exist
+        if "lat" in ds.coords:
+            ds = ds.dropna(dim="lat", how="all")
+        if "lon" in ds.coords:
+            ds = ds.dropna(dim="lon", how="all")
+        if "x" in ds.coords:
+            ds = ds.dropna(dim="x", how="all")
+        if "y" in ds.coords:
+            ds = ds.dropna(dim="y", how="all")
         return ds
+
+    def _export_multiband_raster(self, ds:xr.Dataset | xr.DataArray, date:str,  tile_dir:str, dtype="int16"):
+
+        out_tif = Path(tile_dir) / f"{self.short_name}_{date:%Y%m%d}.tif"  
+        var_names = list(ds.data_vars)
+        first = ds[var_names[0]]
+
+        time, height, width = first.shape
+        transform = first.rio.transform()
+        crs = first.rio.crs
+
+        profile = {
+            "driver": "GTiff",
+            "height": height,
+            "width": width,
+            "count": len(var_names),
+            "dtype": dtype,
+            "crs": crs,
+            "transform": transform,
+            "compress": "LZW"
+        }
+
+        with rasterio.open(out_tif, "w", **profile) as dst:
+            for i, var in enumerate(var_names, start=1):
+                arr = ds[var].data
+                arr = arr.squeeze()     # pulls only one band into RAM
+                dst.write(arr.astype(dtype), i)
+                dst.set_band_description(i, var)
+
+    def _export_single_bands(self, ds_date, date, tile_dir):
+        for var in ds_date.data_vars:
+            out_tif = Path(tile_dir) / f"{self.short_name}_{var}_{date:%Y%m%d}.tif"  
+            da = ds_date[var]             
+            da.rio.to_raster( str(out_tif), 
+                            driver="GTiff", 
+                            # standard GeoTIFF 
+                            compress="LZW", 
+                            dtype="int16" ) 
+
+    # ------------------------
+    # Helper: export dataset according to arg.output
+    # ------------------------
+    def _export_data(self, ds_date:xr.Dataset | xr.DataArray, date:str): 
+        """ Export daily dataset according to self.arg.output """ 
+        if self._output_format.lower() == "tiff": 
+            tile_dir = self.tif_out_dir / '_'.join(format(x, ".1f") for x in self.bbox)
+            os.makedirs(tile_dir, exist_ok=True) 
+            self._export_multiband_raster(ds_date, date, tile_dir)
+        else: 
+            raise ValueError(f"Unknown output format '{self._output_format}'")
         
     def _reproject(self, ds: xr.Dataset | xr.DataArray) -> xr.Dataset | xr.DataArray:
 
@@ -707,6 +702,11 @@ class EarthAccessDownloader:
                 dst_crs="EPSG:4326",   
                 resampling=reproject,
             )#.chunk({"x": 1024, "y": 1024})
+
+            ds_repr = ds_repr.rio.clip_box(minx=self.bbox[0], 
+                                           miny=self.bbox[1], 
+                                           maxx=self.bbox[2], 
+                                           maxy=self.bbox[3])
 
         elif self._reproj_lib == "xesmf":
             ds_repr = self._regridding_with_xe_modis(
@@ -738,16 +738,15 @@ class EarthAccessDownloader:
     def cleanup(self):
         logger.info(f"🧹 Cleaning up temporary files in {self.temp_dir}")
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+        [os.remove(os.path.join(self.granule_dir, x)) for x in os.listdir(self.granule_dir) if x.endswith(".hdf")]
 
     # ------------------------
     # Full pipeline
     # ------------------------
     def run(self):
         self._search_and_download()
-        ds = self._mosaic_daily()
-        ds= prepare(ds)
-        ds = ds.chunk({"time": 1, "lat": 1024, "lon": 1024})
-        self._export_to_zarr(ds)
+        self._mosaic_daily()
+        
         self.cleanup()
         logger.info("✅ Done!")
 
@@ -758,6 +757,9 @@ if __name__ == "__main__":
     from utils import init_logging
     from osgeo import gdal
     import argparse
+    from dotenv import load_dotenv
+    from definitions import ROOT_DIR
+    load_dotenv(Path(ROOT_DIR)/ ".env")
 
     gdal.SetConfigOption('GDAL_CACHEMAX', '512')    # MB, tune to memory
     gdal.SetConfigOption('GDAL_DISABLE_READDIR_ON_OPEN', 'EMPTY_DIR')
@@ -796,7 +798,7 @@ if __name__ == "__main__":
     short_name = products[args.product]["short_name"]
 
     logger = init_logging(log_file="modis_downloader.log", verbose=False)
-    bbox = [-70.0, -70.0, -61.25, -61.25]
+    bbox = [-70.0, -70.0, -62.22222222222222, -62.22222222222222]
 
     try:
         
@@ -808,6 +810,7 @@ if __name__ == "__main__":
         collection_name=f"{short_name}_061",
         reproj_lib=args.reproj_lib,
         reproj_method=args.reproj_method,
+        output_format="tiff"
     )   
         if args.delete_temp and downloader.temp_dir.exists():
             logger.warning("Deleting temporary directory as per user request.")
