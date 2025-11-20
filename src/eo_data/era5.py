@@ -44,11 +44,9 @@ def query_era5_cdsapi(
 
     years = range(year_min, year_max + 1)
 
-    main_output_path = Path(output_path)
-
     for year in years:
         output_file = f"era5land_{output_name}_{year}.nc"
-        output_path = main_output_path / output_file
+        output_path_year = output_path / output_file
 
         c.retrieve(
             product_name,
@@ -61,7 +59,7 @@ def query_era5_cdsapi(
                 "area": area,   # [North, West, South, East]
                 "format": format_output,
             },
-            output_path,
+            output_path_year,
         )
 
         logger.info(f"{output_file} downloaded.")
