@@ -1,7 +1,7 @@
 # import ee
 import logging
 from pathlib import Path
-from osgeo import gdal
+# from osgeo import gdal
 from definitions import DATA_PATH
 import tempfile
 from collections import defaultdict
@@ -22,7 +22,7 @@ from typing import Literal
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from utils import prepare
 from pyproj import Transformer
-import ee, geemap 
+# import geemap 
 
 
 

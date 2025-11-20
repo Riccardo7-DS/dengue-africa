@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 from typing import Union
 import logging
 import itertools
+import geopandas as gpd
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,24 @@ def generate_bboxes_fixed(lat_min=-70, lat_max=70, lon_min=-70, lon_max=70, n_la
             float(lat + lat_step)
         ])
     return bboxes
+
+
+
+def countries_to_bbox(country_list:list, geopandas_object:gpd.GeoDataFrame, col_name="adm_0_name"):
+    # Load Natural Earth country boundaries (comes bundled with geopandas)
+    # world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+    
+    # Filter for the selected countries
+    selected = geopandas_object[geopandas_object[col_name].isin(country_list)]
+
+    if selected.empty:
+        raise ValueError("No matching country names found.")
+
+    # Compute bounding box of the union
+    minx, miny, maxx, maxy = selected.total_bounds  # (west, south, east, north)
+
+    return minx, miny, maxx, maxy
+
 
 def latin_box(invert:bool=False):
     if invert:
@@ -107,6 +126,7 @@ def prepare(dataset:Union[xr.DataArray, xr.Dataset]):
     return dataset
 
 def rasterize_timeseries(da:xr.DataArray, shapefile:gpd.GeoDataFrame, region_col:str="region_id", res:float=0.05):
+    from rasterio.features import rasterize
     """
     Convert xarray DataArray (time x region) into raster cube (time x H x W).
     
