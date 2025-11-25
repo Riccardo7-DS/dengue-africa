@@ -9,6 +9,7 @@ from typing import Union
 import logging
 import itertools
 import geopandas as gpd
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,56 @@ def generate_bboxes_fixed(lat_min=-70, lat_max=70, lon_min=-70, lon_max=70, n_la
     return bboxes
 
 
+def clip_file(dataset:Union[xr.DataArray, xr.Dataset], 
+              gdf=None, 
+              invert=False):
+    
+    from shapely.geometry import mapping, box
+    import geopandas as gpd
+
+    epsg_coords = "EPSG:4326"
+    dataset = prepare(dataset)
+    
+    if gdf is not None:
+        clipped = dataset.rio.clip(gdf.geometry.apply(mapping), 
+                             gdf.crs, 
+                             drop=True,
+                             invert=invert)
+    elif gdf is None:
+        logging.info(f"Using the defeault bbox for Latin America"
+                     f" to clip the images")
+        bbox = latin_box(invert=invert)
+        geodf = gpd.GeoDataFrame(
+                geometry=[box(bbox[0], bbox[1], bbox[2], bbox[3])],
+                crs=epsg_coords)
+        
+        clipped = dataset.rio.clip(geodf.geometry.values, 
+                                       geodf.crs,
+                                       drop=True,
+                                       invert=invert)
+    return clipped
+
+def subsetting_by_names(dataset:Union[xr.DataArray, xr.Dataset], 
+                        countries:Union[list, None], 
+                        column = "adm_0_name",
+                        shapefile="GAUL_2024.zip",
+                        invert=False):
+    
+    from definitions import DATA_PATH
+    import geopandas as gpd
+    import shapely
+    if countries is None:
+        raise ValueError("You must a list of countries")
+
+    shapefile_path = Path(DATA_PATH / "shapefiles"/ shapefile)
+    gdf = gpd.read_file(shapefile_path)
+    subset = gdf[gdf[column].isin(countries)]
+
+    if invert==True:
+        subset = subset['geometry'].map(
+            lambda polygon: shapely.ops.transform(lambda x, y: (y, x), polygon))
+    return clip_file(dataset, subset)
+
 
 def countries_to_bbox(country_list:list, geopandas_object:gpd.GeoDataFrame, col_name="adm_0_name"):
     # Load Natural Earth country boundaries (comes bundled with geopandas)
@@ -66,7 +117,7 @@ def countries_to_bbox(country_list:list, geopandas_object:gpd.GeoDataFrame, col_
     # Compute bounding box of the union
     minx, miny, maxx, maxy = selected.total_bounds  # (west, south, east, north)
 
-    return minx, miny, maxx, maxy
+    return [minx, miny, maxx, maxy], selected
 
 
 def latin_box(invert:bool=False):

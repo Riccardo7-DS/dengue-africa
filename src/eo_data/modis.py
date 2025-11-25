@@ -1,7 +1,7 @@
 # import ee
 import logging
 from pathlib import Path
-# from osgeo import gdal
+from osgeo import gdal
 from definitions import DATA_PATH
 import tempfile
 from collections import defaultdict
@@ -22,7 +22,7 @@ from typing import Literal
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from utils import prepare
 from pyproj import Transformer
-# import geemap 
+import ee, geemap 
 
 
 
@@ -289,6 +289,7 @@ class EarthAccessDownloader:
         reproj_lib:Literal["rioxarray","xesmf"]="xesmf",
         reproj_method:Literal["nearest","bilinear"]="nearest",
         output_format:Literal["tiff","zarr"]="zarr",
+        raw_data_type=".hdf"
     ):
         
         self.date_range = self._check_dates(date_range)
@@ -302,6 +303,7 @@ class EarthAccessDownloader:
         self.zarr_path = zarr_path or (self.data_dir / f"{self.short_name}_dataset.zarr")
         self._reproj_lib = self._check_reproj_lib(reproj_lib)
         self._reproj_method = self._check_reproj_method(reproj_method)
+        self.raw_data_type = raw_data_type
 
         self._output_format = output_format
 
@@ -346,7 +348,7 @@ class EarthAccessDownloader:
 
         logger.info(f"⬇️ Downloading {len(results)} files to {self.granule_dir}")
         earthaccess.download(results, str(self.granule_dir))
-        self.files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.hdf")))
+        self.files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.{self.raw_data_type}")))
 
 
     def _custom_preprocess(self, da):
@@ -360,6 +362,9 @@ class EarthAccessDownloader:
             # NDVI products (MOD13Q1, MYD13A2, etc.)
             da = da.where(da != -3000) * 0.0001  # NDVI scale factor
             da.name = "NDVI"
+        elif "VNP46A" in self.short_name:
+            da = da.rio.write_nodata(-9999)  # int16-safe nodata
+            da = da.where(da != 65535, -9999)
         else:
             da.name = "band_data"
         # -------------------------------------------------
@@ -746,7 +751,6 @@ class EarthAccessDownloader:
     def run(self):
         self._search_and_download()
         self._mosaic_daily()
-        
         self.cleanup()
         logger.info("✅ Done!")
 
@@ -754,10 +758,12 @@ class EarthAccessDownloader:
 
 
 if __name__ == "__main__":
-    from utils import init_logging
+    from utils import init_logging, countries_to_bbox
     from osgeo import gdal
     import argparse
     from dotenv import load_dotenv
+    import geopandas as gpd 
+
     from definitions import ROOT_DIR
     load_dotenv(Path(ROOT_DIR)/ ".env")
 
@@ -767,7 +773,7 @@ if __name__ == "__main__":
     sys.dont_write_bytecode = True
 
     parser = argparse.ArgumentParser(description="MODIS Downloader")
-    parser.add_argument('--product', type=str, default='reflectance_250m', help='MODIS product to download')
+    parser.add_argument('--product', type=str, default='VIIRS_500m_night_monthly', help='MODIS product to download')
     parser.add_argument('--reproj_lib', choices=['rioxarray', 'xesmf'], default=os.getenv('REPROJ_LIB', 'rioxarray'), help='Reprojection library to use (rioxarray or xesmf)')
     parser.add_argument('--reproj_method', choices=['nearest', 'bilinear'], default=os.getenv('REPROJ_METHOD', 'nearest'), help='Reprojection method to use')    
     parser.add_argument('-d', '--delete_temp', action='store_true', default=False, help='Delete temporary files after processing')
@@ -790,15 +796,36 @@ if __name__ == "__main__":
             "variables": ["NDVI",
                           "EVI",
                           "SummaryQA"
-            ]
+            ],
+            "raw_data_type" : "hdf"
+        },
+        "VIIRS_500m_night_monthly": {
+            "short_name": "VNP46A3",
+            "variables": ["NearNadir_Composite_Snow_Free",
+                          "NearNadir_Composite_Snow_Free_Std",
+                          "NearNadir_Composite_Snow_Free_Quality"
+            ],
+            "raw_data_type" : "h5"
+        },
+        
+        "VIIRS_500m_night_daily": {
+            "short_name": "VNP46A2",
+            "variables": ["Gap_Filled_DNB_BRDF_Corrected_NTL",
+                          "DNB_BRDF_Corrected_NTL",
+                          "QF_Cloud_Mask"
+            ],
+            "raw_data_type" : "h5"
         }
     }
 
     variables = products[args.product]["variables"]
     short_name = products[args.product]["short_name"]
+    raw_data_type = products[args.product]["raw_data_type"]
 
     logger = init_logging(log_file="modis_downloader.log", verbose=False)
-    bbox = [-70.0, -70.0, -62.22222222222222, -62.22222222222222]
+    
+    gdf = gpd.read_file(DATA_PATH/ "shapefiles"/ "GAUL_2024.zip")
+    bbox, polygon = countries_to_bbox(["Brazil", "Argentina", "Peru", "Colombia", "Panama"], gdf, col_name="gaul0_name")
 
     try:
         
@@ -806,11 +833,12 @@ if __name__ == "__main__":
         short_name=short_name,
         bbox= bbox,
         variables=variables,
-        date_range=("2010-01-01", "2010-01-05"),
+        date_range=("2012-01-01", "2024-01-01"),
         collection_name=f"{short_name}_061",
         reproj_lib=args.reproj_lib,
         reproj_method=args.reproj_method,
-        output_format="tiff"
+        output_format="tiff",
+        raw_data_type=raw_data_type
     )   
         if args.delete_temp and downloader.temp_dir.exists():
             logger.warning("Deleting temporary directory as per user request.")
