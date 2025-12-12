@@ -93,9 +93,14 @@ def subsetting_by_names(dataset:Union[xr.DataArray, xr.Dataset],
     import shapely
     if countries is None:
         raise ValueError("You must a list of countries")
+    
+    
 
     shapefile_path = Path(DATA_PATH / "shapefiles"/ shapefile)
     gdf = gpd.read_file(shapefile_path)
+    if column not in gdf.columns:
+        print(f"Available columns in the shapefile: {gdf.columns.tolist()}")
+        raise ValueError(f"The shapefile must contain the column {column}")
     subset = gdf[gdf[column].isin(countries)]
 
     if invert==True:
@@ -166,6 +171,8 @@ other_places = [
 ]
 
 def prepare(dataset:Union[xr.DataArray, xr.Dataset]):
+    if "valid_time" in dataset.dims:
+        dataset = dataset.rename({"valid_time":"time"})
     if "longitude" in dataset.dims:
         dataset = dataset.rename({"latitude":"lat", "longitude":"lon"})
     if "x" in dataset.dims:

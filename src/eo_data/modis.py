@@ -23,6 +23,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from utils import prepare
 from pyproj import Transformer
 import ee, geemap 
+from datetime import datetime
 
 
 
@@ -348,7 +349,8 @@ class EarthAccessDownloader:
 
         logger.info(f"⬇️ Downloading {len(results)} files to {self.granule_dir}")
         earthaccess.download(results, str(self.granule_dir))
-        self.files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.{self.raw_data_type}")))
+        files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.{self.raw_data_type}")))
+        self.files = self._exclude_processed_files(files)
 
 
     def _custom_preprocess(self, da):
@@ -497,6 +499,34 @@ class EarthAccessDownloader:
 
         return ds_regridded
     
+    def _exclude_processed_files(self, files):
+        tif_out_dir = self.granule_dir / "tiffs"
+        tile_dir = tif_out_dir / '_'.join(format(x, ".1f") for x in self.bbox)
+
+        # Step 1: Get all processed dates from existing TIFFs
+        processed_dates = set()
+        for tif_file in tile_dir.glob("*.tif"):
+            # Assuming your TIFFs are like: VNP46A3_20120101.tif
+            date_str = tif_file.stem.split('_')[-1]  # Extract the date part
+            processed_dates.add(date_str)
+
+        # Step 2: Filter self.files
+        filtered_files = []
+        for h5_file in files:
+            h5_stem = Path(h5_file).stem
+            # Extract the AYYYYDDD part
+            doy_part = [part for part in h5_stem.split('.') if part.startswith('A')]
+            if not doy_part:
+                continue  # skip if no AYYYYDDD found
+            doy_str = doy_part[0][1:]  # remove the 'A', e.g., '2012001'
+            # Convert YYYYDDD to YYYYMMDD
+            date_obj = datetime.strptime(doy_str, "%Y%j")
+            date_str = date_obj.strftime("%Y%m%d")
+
+            if date_str not in processed_dates:
+                filtered_files.append(h5_file)
+        return filtered_files
+
 
     def _mosaic_daily(self, max_workers=1):
         """
