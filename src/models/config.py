@@ -25,8 +25,7 @@ class ConfigTransf(BaseConfig):
 
     num_frames_output = 1 ### means 1 frame as output
     output_channels = 1
-    include_lag = True
-    num_samples = 9 #### the number of channels to use
+    patch_size = (1024/4, 1024/4)
 
     epochs = 50
     patience = 10
@@ -35,16 +34,6 @@ class ConfigTransf(BaseConfig):
     dim = 64
 
     masked_loss = True
-
-    ### Parameters specific to GWNET
-    weight_decay = 0.0001
-    in_dim = 10
-    out_dim = 1
-    dropout = 0.3
-    nhid = 16
-    blocks = 6
-    layers = 4
-    print_every = 100
 
     scheduler_patience = 3
     scheduler_factor = 0.7

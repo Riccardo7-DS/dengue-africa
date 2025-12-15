@@ -29,8 +29,9 @@ from torchgeo.datasets import RasterDataset, XarrayDataset
 from torch.utils.data import DataLoader, Dataset
 from torchgeo.samplers import GridGeoSampler
 from torchgeo.datasets.utils import stack_samples, lazy_import
+import torch.nn.functional as F
 from pathlib import Path
-from utils import latin_box,  load_admin_data, process_gdf, df_to_xarray, rasterize_timeseries, init_logging
+from utils import latin_box,  load_admin_data, process_gdf, df_to_xarray, rasterize_timeseries, init_logging, prepare
 import torch 
 import pandas as pd 
 import numpy as np
@@ -38,11 +39,12 @@ from datetime import timedelta
 import os 
 import xarray as xr
 from torch.nn import MSELoss
-from models.model_utils import EarlyStopping, collate_pad
+from models.model_utils import EarlyStopping, collate_skip_none
 from models.config import config_transf as model_config
 import argparse
 from tqdm import tqdm
 import logging
+import math
 
 logger = init_logging(Path(ROOT_DIR) / "training_transformer.log")
 # simplefilter("ignore", UserWarning)
@@ -107,6 +109,7 @@ class XarrayDataset(RasterDataset):
         self._aggregated_dataset = xr.open_mfdataset(
             [str(f) for f in self._files], combine="by_coords"
         )
+        self.res = prepare(self._aggregated_dataset).rio.resolution()
         self._aggregated_dataset = self._normalize_lat_lon_coords(self._aggregated_dataset)
         self.T_max = T_MAX
 
@@ -253,17 +256,41 @@ class DengueDataset(Dataset):
         self.samples = []
         self._generate_samples()
 
+
+    def _derive_width_height(self, coordinate_span, pixel_resolution):
+        return int(round(coordinate_span / pixel_resolution))
+    
+
+    def _target_patch_size(self, high_patch_size, high_res, low_res):
+        return int(math.ceil(high_patch_size * abs(high_res) / abs(low_res)))
+
+    def _padding_coarse(self, X, target_h, target_w):
+        """
+        Pads a coarse-resolution tensor to (target_h, target_w)
+        Padding is applied on bottom and right only.
+        """
+        if len(X.shape) == 4:
+            c, t, h, w = X.shape
+        elif len(X.shape) == 3:
+            t, h, w = X.shape
+        pad_h = max(target_h - h, 0)
+        pad_w = max(target_w - w, 0)
+
+        if pad_h > 0 or pad_w > 0:
+            # F.pad format: (left, right, top, bottom)
+            X = F.pad(X, (0, pad_w, 0, pad_h))
+
+        return X
+
     # -------------------------------------------------
     # Build (time, space) index
     # -------------------------------------------------
     def _generate_samples(self):
-        for t in range(len(self.y.index)):
+        
+        for t in tqdm(range(len(self.y.index))):
             t_current = self.y.index[t]
 
-            if t + 1 < len(self.y.index):
-                t_next = self.y.index[t + 1]
-            else:
-                t_next = self.y.index[t]
+            t_next = self.y.index[t + 1] if t + 1 < len(self.y.index) else t_current
 
             t_query_start = t_current - timedelta(days=self.offset_days)
             t_query_end = t_current
@@ -274,39 +301,38 @@ class DengueDataset(Dataset):
                 roi=self.bbox,
                 toi=pd.Interval(t_query_start, t_query_end)
             )
-
+            
             queries = list(sampler)
+            dropped = 0
 
             if len(queries) == 0:
                 continue  # safely skip
 
-            for (x_slice, y_slice, _) in tqdm(queries, desc="Preparing patches..."):
-                self.samples.append(
-                    (
-                        t_query_start,
-                        t_query_end,
-                        t_next,
-                        x_slice,
-                        y_slice,
-                    )
-                )
+            for (x_slice, y_slice, _) in queries:
+                h = self._derive_width_height((x_slice.stop - x_slice.start), self.viirs.res[0])
+                w = self._derive_width_height((y_slice.stop - y_slice.start), self.viirs.res[1])
 
-    # -------------------------------------------------
-    # PyTorch API
-    # -------------------------------------------------
+                # Skip patch if it’s smaller than desired patch_size
+                if h != self.patch_size[0] or w != self.patch_size[1]:
+                    dropped += 1
+                    continue
+
+
+                # Store slice info only; no array is loaded
+                self.samples.append(
+                    (t_query_start, t_query_end, t_next, x_slice, y_slice)
+                )
+                if dropped > 0:
+                    logger.info(f"In total {dropped} samples have been dropped")
+
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        (
-            t_query_start,
-            t_query_end,
-            t_next,
-            x_slice,
-            y_slice,
-        ) = self.samples[idx]
+        t_start, t_end, t_next, x_slice, y_slice = self.samples[idx]
 
-        query_x = (x_slice, y_slice, slice(t_query_start, t_query_end))
+        query_x = (x_slice, y_slice, slice(t_start, t_end))
         query_y = (x_slice, y_slice, slice(t_next, t_next))
 
         # Load data lazily
@@ -314,6 +340,26 @@ class DengueDataset(Dataset):
         x_med = self.era5[query_x]["image"].float()
         x_static = self.static[query_x]["image"].float()
         y = self.y[query_y]["image"].float()
+
+        target_h_med = self._target_patch_size(
+            self.patch_size[0], self.viirs.res[0], self.era5.res[0])
+        target_w_med = self._target_patch_size(
+            self.patch_size[1], self.viirs.res[1], self.era5.res[1])
+        x_med = self._padding_coarse(x_med, target_h_med, target_w_med)
+
+        # Static
+        target_h_static = self._target_patch_size(
+            self.patch_size[0], self.viirs.res[0], self.static.res[0])
+        target_w_static = self._target_patch_size(
+            self.patch_size[1], self.viirs.res[1], self.static.res[1])
+        x_static = self._padding_coarse(x_static, target_h_static, target_w_static)
+
+        ## target
+        target_h_y = self._target_patch_size(
+            self.patch_size[0], self.viirs.res[0], self.y.res[0])
+        target_w_y = self._target_patch_size(
+            self.patch_size[1], self.viirs.res[1], self.y.res[1])
+        y = self._padding_coarse(y, target_h_y, target_w_y)
 
         # Normalize per-sample (optional but consistent with your intent)
         x_high = (x_high - x_high.mean()) / (x_high.std() + 1e-6)
@@ -326,13 +372,18 @@ class DengueDataset(Dataset):
                 x_high, x_med, x_static
             )
 
-        return x_high, x_med, x_static, y
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.info(f"Index {idx} High-res: {x_high.shape}")
+            logger.info(f"Index {idx} Medium-res: {x_med.shape}")
+            logger.info(f"Index {idx} Static: {x_static.shape}")
+            logger.info(f"Index {idx} y: {y.shape}")
 
+        return x_high, x_med, x_static, y
 
 bbox = latin_box()
 
 #bbox = [xmin, ymin, xmax, ymax] in CRS coordinates
-patch_size = (1024, 1024)
+patch_size = model_config.patch_size
 
 # Base datasets
 y_dir = DIRData(DATA_PATH, T_MAX=1)
@@ -353,8 +404,8 @@ loader = DataLoader(
     dataset,
     batch_size=4,
     shuffle=False,
-    collate_fn=collate_pad,
-    num_workers=0
+    num_workers=0,
+    collate_fn=collate_skip_none
 )
 
 from models.transformer import DenguePredictor
@@ -367,7 +418,7 @@ model = DenguePredictor(
     med_out=128,
     static_out=128,
     hidden_dim=256,
-    output_dim=1
+    output_size=(22, 22)
 )
 
 if model_config.masked_loss is False:
@@ -414,66 +465,65 @@ def training_loop(
     
     from models import masked_mape, masked_rmse, masked_custom_loss, mask_mape, mask_rmse
 
-    train_loss_records = []
     epoch_records = {'loss': [], "mape":[], "rmse":[], "lr":[]}
     
     for epoch in tqdm(range(start_epoch, trainer.config.epochs)):
-        model.train()
+        trainer.model.train()
+
+        epoch_records = {'loss': [], "mape": [], "rmse": []}
 
         for batch in dataloader:
             if batch is None:
                 continue
-            x_high, x_med, x_static, y = batch
-            
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.info(f"High-res: {x_high.shape}")
-                logger.info(f"Medium-res: {x_med.shape}")
-                logger.info(f"Static: {x_static.shape}")
 
+            x_high, x_med, x_static, y = batch
             outputs = trainer.model(x_high, x_med, x_static)
             y = y.squeeze(1)
-            mask = np.isfinite(y)
 
-            if model_config.masked_loss is False:
-                losses = trainer.loss(outputs, y)
+            mask = torch.isfinite(y)
+
+            if not model_config.masked_loss:
+                loss = trainer.loss(outputs, y)
                 mape = masked_mape(outputs, y).item()
                 rmse = masked_rmse(outputs, y).item()
             else:
-                if mask is None:
-                    raise ValueError("Please provide a mask for loss computation")
-                else:
-                    mask = mask.float().to(trainer.config.device)
-                    losses =  masked_custom_loss(trainer.loss, outputs, y, mask)
-                    mape = mask_mape(outputs, y, mask).item()
-                    rmse = mask_rmse(outputs, y, mask).item()
+                mask = mask.float().to(trainer.config.device)
+                loss = masked_custom_loss(trainer.loss, outputs, y, mask)
+                mape = mask_mape(outputs, y, mask).item()
+                rmse = mask_rmse(outputs, y, mask).item()
 
             trainer.optimizer.zero_grad()
-            losses.backward()
+            loss.backward()
             trainer.optimizer.step()
 
-            epoch_records['loss'].append(losses.item())
-            epoch_records["rmse"].append(rmse)
-            epoch_records["mape"].append(mape)
+            epoch_records['loss'].append(loss.item())
+            epoch_records['mape'].append(mape)
+            epoch_records['rmse'].append(rmse)
 
-            train_loss_records.append(np.mean(epoch_records['loss']))
+        # ---- epoch-level logging ----
+        mean_loss = np.mean(epoch_records['loss'])
+        mean_mape = np.mean(epoch_records['mape'])
+        mean_rmse = np.mean(epoch_records['rmse'])
 
-            log = 'Epoch: {:03d}, Train Loss: {:.4f}, Train MAPE: {:.4f}, Train RMSE: {:.4f}'
-            logger.info(log.format(epoch, np.mean(epoch_records['loss']), 
-                                   np.mean(epoch_records['mape']), 
-                                   np.mean(epoch_records['rmse'])))
-            
-            model_dict = {
-                'epoch': epoch,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                "lr_sched": scheduler.state_dict()}
-        
-            early_stopping(np.mean(losses.item()), 
-                        model_dict, epoch, checkpoint_dir)
-            
-            if early_stopping.early_stop:
-                logger.info("Early stopping")
-                break
+        logger.info(
+            f"Epoch: {epoch:03d}, "
+            f"Train Loss: {mean_loss:.4f}, "
+            f"Train MAPE: {mean_mape:.4f}, "
+            f"Train RMSE: {mean_rmse:.4f}"
+        )
+
+        model_dict = {
+            'epoch': epoch,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'lr_sched': scheduler.state_dict()
+        }
+
+        early_stopping(mean_loss, model_dict, epoch, checkpoint_dir)
+
+        if early_stopping.early_stop:
+            logger.info("Early stopping")
+            break
 
 checkpoint_dir = ROOT_DIR / "outputs" / f"{args.model}" / "checkpoints"
 os.makedirs(checkpoint_dir, exist_ok=True)
@@ -489,10 +539,25 @@ try:
         logger.info(f"Resuming training from epoch {checkp_epoch}")
     
     start_epoch = 0 if checkpoint_path is None else checkp_epoch
+
 except FileNotFoundError:
     from models.model_utils import load_checkpoint
     model, optimizer, scheduler, start_epoch = load_checkpoint(checkpoint_path, model, optimizer, scheduler) 
 
 mask = None
-trainer = Trainer(args, config=model_config, model=model, optimizer=optimizer, scheduler=scheduler, loss=criterion)
-training_loop(loader, trainer, checkpoint_dir, start_epoch=start_epoch, mask=mask)
+trainer = Trainer(
+    args, 
+    config=model_config, 
+    model=model, 
+    optimizer=optimizer, 
+    scheduler=scheduler, 
+    loss=criterion
+)
+
+training_loop(
+    loader, 
+    trainer, 
+    checkpoint_dir, 
+    start_epoch=start_epoch, 
+    mask=mask
+)

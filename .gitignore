@@ -13,3 +13,4 @@ __pycache__/
 *.pyd
 .venv/
 *.sh
+outputs/

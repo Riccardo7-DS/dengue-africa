@@ -142,7 +142,6 @@ class DenguePredictor(nn.Module):
                  med_out=128,
                  static_out=128,
                  hidden_dim=256,
-                 output_dim=1,
                  output_size=(86, 86),
                  output_channels=1,
                  decoder_channels=64):
