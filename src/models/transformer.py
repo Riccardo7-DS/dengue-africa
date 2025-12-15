@@ -142,17 +142,37 @@ class DenguePredictor(nn.Module):
                  med_out=128,
                  static_out=128,
                  hidden_dim=256,
-                 output_dim=1):
+                 output_dim=1,
+                 output_size=(86, 86),
+                 output_channels=1,
+                 decoder_channels=64):
         super().__init__()
         self.high_branch = HighResBranch(out_dim=high_out, in_ch=high_in_ch)
         self.med_branch = MediumResBranchAttention(out_dim=med_out, in_ch=med_in_ch)
         self.static_branch = StaticBranch(out_dim=static_out, in_ch=static_in_ch)
 
-        # Fusion head (MLP)
+        # Output configuration
+        self.output_size = output_size
+        self.output_channels = output_channels
+        self.decoder_channels = decoder_channels
+
+        # Fusion head (MLP) that projects to a small spatial feature map,
+        # which is then decoded by convolutional layers to produce the final image.
+        total_in = high_out + med_out + static_out
+        H, W = output_size
+        proj_pixels = decoder_channels * H * W
         self.fc = nn.Sequential(
-            nn.Linear(high_out + med_out + static_out, hidden_dim),
+            nn.Linear(total_in, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dim, proj_pixels),
+            nn.ReLU()
+        )
+
+        # Simple conv-based decoder: refines the projected feature-map to the final output
+        self.decoder = nn.Sequential(
+            nn.Conv2d(decoder_channels, decoder_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(decoder_channels, output_channels, kernel_size=1)
         )
 
     def forward(self, x_high, x_med, x_static):
@@ -163,6 +183,14 @@ class DenguePredictor(nn.Module):
         # Concatenate embeddings
         fusion = torch.cat([f_high, f_med, f_static], dim=1)
 
-        # Predict dengue risk / cases
+        # Predict dengue risk / cases: project to spatial feature-map then decode
         out = self.fc(fusion)
+
+        # Reshape to feature-map: (B, decoder_channels, H, W)
+        B = out.shape[0]
+        H, W = self.output_size
+        out = out.view(B, self.decoder_channels, H, W)
+
+        # Decode to final image
+        out = self.decoder(out)
         return out

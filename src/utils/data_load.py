@@ -1,7 +1,7 @@
 from definitions import DATA_PATH
 from typing import Optional , Literal
 
-def load_data(data_path, 
+def load_admin_data(data_path, 
             temporal_resolution:Literal[None, "Week", "Month"]=None, 
             spatial_resolution:Literal[None, "Admin0", "Admin1", "Admin2"]=None, 
             filter_year:int=2000
