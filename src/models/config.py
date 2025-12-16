@@ -14,7 +14,7 @@ from definitions import ROOT_DIR
 class BaseConfig():
     def __init__(self):
         self.data_dir = os.path.join(ROOT_DIR,  "..",'data')
-        self.output_dir = os.path.join(ROOT_DIR, "..", 'output')
+        self.output_dir = os.path.join(ROOT_DIR, "..", 'outputs')
         self.model_dir = os.path.join(self.output_dir, 'model')
         self.log_dir = os.path.join(self.output_dir, 'log')
         for path in [self.data_dir, self.output_dir, self.log_dir, self.model_dir]:
@@ -37,6 +37,7 @@ class ConfigTransf(BaseConfig):
 
     scheduler_patience = 3
     scheduler_factor = 0.7
+    weight_decay = 0.01
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     

@@ -6,10 +6,35 @@ import os
 import logging 
 import numpy as np 
 import torch
+from torch.utils.data import Subset
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 
+def rolling_split(dataset, train_end, horizon_days=365):
+    times = dataset.get_target_times()
+
+    val_start = train_end + pd.Timedelta(days=1)
+    val_end = train_end + pd.Timedelta(days=horizon_days)
+
+    train_idx = np.where(times <= train_end)[0]
+    val_idx = np.where((times >= val_start) & (times <= val_end))[0]
+
+    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
+def temporal_split(dataset, train_end, val_end):
+    times = dataset.get_target_times()
+
+    train_idx = np.where(times <= train_end)[0]
+    val_idx = np.where((times > train_end) & (times <= val_end))[0]
+    test_idx = np.where(times > val_end)[0]
+
+    return (
+        Subset(dataset, train_idx),
+        Subset(dataset, val_idx),
+        Subset(dataset, test_idx),
+    )
 
 class MetricsRecorder:
     def __init__(self):

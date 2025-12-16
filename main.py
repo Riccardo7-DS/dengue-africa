@@ -27,6 +27,7 @@
 from definitions import DATA_PATH, ROOT_DIR
 from torchgeo.datasets import RasterDataset, XarrayDataset
 from torch.utils.data import DataLoader, Dataset
+import sys
 from torchgeo.samplers import GridGeoSampler
 from torchgeo.datasets.utils import stack_samples, lazy_import
 import torch.nn.functional as F
@@ -39,7 +40,7 @@ from datetime import timedelta
 import os 
 import xarray as xr
 from torch.nn import MSELoss
-from models.model_utils import EarlyStopping, collate_skip_none
+from models.model_utils import EarlyStopping, collate_skip_none, MetricsRecorder, rolling_split
 from models.config import config_transf as model_config
 import argparse
 from tqdm import tqdm
@@ -121,6 +122,7 @@ class XarrayDataset(RasterDataset):
     def index(self):
         """Return a list of time indices for TorchGeo compatibility"""
         return pd.to_datetime(self._aggregated_dataset["time"].values)
+        
 
     def _normalize_lat_lon_coords(self, src):
         rename_map = {}
@@ -325,7 +327,9 @@ class DengueDataset(Dataset):
                 if dropped > 0:
                     logger.info(f"In total {dropped} samples have been dropped")
 
-
+    def get_target_times(self):
+        return np.array([s[2] for s in self.samples]) 
+    
     def __len__(self):
         return len(self.samples)
 
@@ -400,12 +404,27 @@ dataset = DengueDataset(
     patch_size=patch_size
 )
 
-loader = DataLoader(
+train_ds, val_ds = rolling_split(
     dataset,
+    train_end=pd.Timestamp("2018-12-31"),
+    horizon_days=365,
+)
+
+train_loader = DataLoader(
+    train_ds,
     batch_size=4,
-    shuffle=False,
-    num_workers=0,
-    collate_fn=collate_skip_none
+    shuffle=True,      # ✔️ OK for training
+    num_workers=4,
+    collate_fn=collate_skip_none,
+    persistent_workers=True
+)
+
+val_loader = DataLoader(
+    val_ds,
+    batch_size=4,
+    shuffle=False,     # ❌ NEVER shuffle validation
+    num_workers=4,
+    collate_fn=collate_skip_none,
 )
 
 from models.transformer import DenguePredictor
@@ -438,6 +457,8 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     patience=model_config.scheduler_patience, 
 )
 
+metrics_recorder = MetricsRecorder()
+
 class Trainer():
     def __init__(self, 
         args, 
@@ -446,84 +467,170 @@ class Trainer():
         optimizer, 
         scheduler, 
         loss,
+        checkpoint_dir,
         ema = None
     ): 
         self.config = config
+        self.args = args
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = config.device
         self.loss = loss
-        self.model = model
+        self.model = model.to(self.device)
         self.ema = ema
+        self.checkpoint_dir = checkpoint_dir
+        self._prev_lr = None
 
-def training_loop(
-                  dataloader,
-                  trainer,
-                  checkpoint_dir,
-                  mask = None,
-                  start_epoch=0):
-    
+
+def validation_loop(epoch, validation_loader, trainer):
+    """Run validation over `validation_loader` and return aggregated metrics.
+
+    Returns a dict with keys: 'loss', 'mape', 'rmse', 'lr' (per-batch lists).
+    """
+    import sys
     from models import masked_mape, masked_rmse, masked_custom_loss, mask_mape, mask_rmse
 
-    epoch_records = {'loss': [], "mape":[], "rmse":[], "lr":[]}
-    
-    for epoch in tqdm(range(start_epoch, trainer.config.epochs)):
-        trainer.model.train()
+    trainer.model.eval()
+    val_records = {'loss': [], 'mape': [], 'rmse': [], 'lr': []}
 
-        epoch_records = {'loss': [], "mape": [], "rmse": []}
-
-        for batch in dataloader:
+    with torch.no_grad():
+        for batch in validation_loader:
             if batch is None:
                 continue
 
             x_high, x_med, x_static, y = batch
+            # Move to device
+            x_high = x_high.to(trainer.device)
+            x_med = x_med.to(trainer.device)
+            x_static = x_static.to(trainer.device)
+            y = y.to(trainer.device)
+            
             outputs = trainer.model(x_high, x_med, x_static)
             y = y.squeeze(1)
 
-            mask = torch.isfinite(y)
+            mask_batch = torch.isfinite(y)
 
             if not model_config.masked_loss:
                 loss = trainer.loss(outputs, y)
                 mape = masked_mape(outputs, y).item()
                 rmse = masked_rmse(outputs, y).item()
             else:
-                mask = mask.float().to(trainer.config.device)
-                loss = masked_custom_loss(trainer.loss, outputs, y, mask)
-                mape = mask_mape(outputs, y, mask).item()
-                rmse = mask_rmse(outputs, y, mask).item()
+                mask_t = mask_batch.float().to(trainer.device)
+                loss = masked_custom_loss(trainer.loss, outputs, y, mask_t)
+                mape = mask_mape(outputs, y, mask_t).item()
+                rmse = mask_rmse(outputs, y, mask_t).item()
 
-            trainer.optimizer.zero_grad()
-            loss.backward()
-            trainer.optimizer.step()
+            val_records['loss'].append(loss.item())
+            val_records['mape'].append(mape)
+            val_records['rmse'].append(rmse)
 
-            epoch_records['loss'].append(loss.item())
-            epoch_records['mape'].append(mape)
-            epoch_records['rmse'].append(rmse)
+    # aggregate
+    mean_loss = np.mean(val_records['loss'])
+    mean_mape = np.mean(val_records['mape'])
+    mean_rmse = np.mean(val_records['rmse'])
 
-        # ---- epoch-level logging ----
-        mean_loss = np.mean(epoch_records['loss'])
-        mean_mape = np.mean(epoch_records['mape'])
-        mean_rmse = np.mean(epoch_records['rmse'])
+    trainer.scheduler.step(mean_loss)
 
+    prev_lr = getattr(trainer, "_prev_lr", None)
+    current_lr = trainer.optimizer.param_groups[0]['lr']
+    if prev_lr is not None and current_lr < prev_lr:
         logger.info(
-            f"Epoch: {epoch:03d}, "
-            f"Train Loss: {mean_loss:.4f}, "
-            f"Train MAPE: {mean_mape:.4f}, "
-            f"Train RMSE: {mean_rmse:.4f}"
+            f"LR reduced from {prev_lr:.2e} → {current_lr:.2e} at epoch {epoch}"
         )
 
-        model_dict = {
-            'epoch': epoch,
-            'state_dict': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'lr_sched': scheduler.state_dict()
-        }
+    trainer._prev_lr = current_lr
+    val_records['lr'].append(current_lr)
+    
 
-        early_stopping(mean_loss, model_dict, epoch, checkpoint_dir)
+    logger.info(
+        f"Epoch: {epoch:03d}, "
+        f"Val Loss: {mean_loss:.4f}, "
+        f"Val MAPE: {mean_mape:.4f}, "
+        f"Val RMSE: {mean_rmse:.4f}, "
+        f"LR: {current_lr:.2e}"
+    )
 
-        if early_stopping.early_stop:
-            logger.info("Early stopping")
+    model_dict = {
+        'epoch': epoch,
+        'state_dict': trainer.model.state_dict(),
+        'optimizer': trainer.optimizer.state_dict(),
+        'lr_sched': trainer.scheduler.state_dict()
+    }
+
+    # Early stopping driven by validation loss
+    early_stopping(mean_loss, model_dict, epoch, trainer.checkpoint_dir)
+    stop = early_stopping.early_stop
+    
+    if stop:
+        logger.info("Early stopping")
+
+    return val_records, stop
+
+
+def training_loop(epoch, dataloader, trainer):
+    from models import masked_mape, masked_rmse, masked_custom_loss, mask_mape, mask_rmse
+
+    trainer.model.train()
+    epoch_records = {'loss': [], "mape": [], "rmse": []}
+
+    for batch in dataloader:
+        if batch is None:
+            continue
+        x_high, x_med, x_static, y = batch
+        # Move to device
+        x_high = x_high.to(trainer.device)
+        x_med = x_med.to(trainer.device)
+        x_static = x_static.to(trainer.device)
+        y = y.to(trainer.device)
+        
+        outputs = trainer.model(x_high, x_med, x_static)
+        y = y.squeeze(1)
+        mask_batch = torch.isfinite(y)
+
+        if not model_config.masked_loss:
+            loss = trainer.loss(outputs, y)
+            mape = masked_mape(outputs, y).item()
+            rmse = masked_rmse(outputs, y).item()
+        else:
+            mask_t = mask_batch.float().to(trainer.device)
+            loss = masked_custom_loss(trainer.loss, outputs, y, mask_t)
+            mape = mask_mape(outputs, y, mask_t).item()
+            rmse = mask_rmse(outputs, y, mask_t).item()
+
+        trainer.optimizer.zero_grad()
+        loss.backward()
+        trainer.optimizer.step()
+        epoch_records['loss'].append(loss.item())
+        epoch_records['mape'].append(mape)
+        epoch_records['rmse'].append(rmse)
+        
+    # ---- epoch-level logging ----
+    mean_loss = np.mean(epoch_records['loss'])
+    mean_mape = np.mean(epoch_records['mape'])
+    mean_rmse = np.mean(epoch_records['rmse'])
+
+    logger.info(
+        f"Epoch: {epoch:03d}, "
+        f"Train Loss: {mean_loss:.4f}, "
+        f"Train MAPE: {mean_mape:.4f}, "
+        f"Train RMSE: {mean_rmse:.4f}"
+    )
+    return epoch_records
+
+def pipeline(
+    trainer,
+    start_epoch=0):
+    
+    for epoch in tqdm(range(start_epoch, trainer.config.epochs)):
+        
+        train_records = training_loop(epoch, train_loader, trainer)
+        val_records, stop = validation_loop(epoch, val_loader, trainer)
+        if stop:
             break
+
+        metrics_recorder.add_train_metrics(train_records, epoch)
+        metrics_recorder.add_val_metrics(val_records, epoch)
+
 
 checkpoint_dir = ROOT_DIR / "outputs" / f"{args.model}" / "checkpoints"
 os.makedirs(checkpoint_dir, exist_ok=True)
@@ -544,20 +651,17 @@ except FileNotFoundError:
     from models.model_utils import load_checkpoint
     model, optimizer, scheduler, start_epoch = load_checkpoint(checkpoint_path, model, optimizer, scheduler) 
 
-mask = None
 trainer = Trainer(
     args, 
     config=model_config, 
     model=model, 
     optimizer=optimizer, 
     scheduler=scheduler, 
-    loss=criterion
+    loss=criterion,
+    checkpoint_dir=checkpoint_dir,
 )
 
-training_loop(
-    loader, 
-    trainer, 
-    checkpoint_dir, 
-    start_epoch=start_epoch, 
-    mask=mask
+pipeline(
+    trainer,
+    start_epoch=start_epoch
 )
