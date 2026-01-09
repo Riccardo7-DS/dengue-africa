@@ -10,10 +10,77 @@ import logging
 import itertools
 import geopandas as gpd
 from pathlib import Path
+import itertools
+import math
 
 logger = logging.getLogger(__name__)
 
 
+
+
+def meters_to_degrees_lat(meters):
+    """Convert meters to degrees latitude."""
+    return meters / 111_320.0
+
+
+def meters_to_degrees_lon(meters, lat):
+    """Convert meters to degrees longitude at a given latitude."""
+    return meters / (111_320.0 * math.cos(math.radians(lat)))
+
+def generate_bboxes_from_resolution(
+    lat_min=-70,
+    lat_max=70,
+    lon_min=-70,
+    lon_max=70,
+    spatial_resolution_m=250,  # e.g. MODIS
+    n_pixels=7
+):
+    """
+    Generate bounding boxes of n_pixels × n_pixels given a spatial resolution.
+    
+    Parameters
+    ----------
+    lat_min, lat_max : float
+        Latitude bounds.
+    lon_min, lon_max : float
+        Longitude bounds.
+    spatial_resolution_m : float
+        Pixel size in meters (e.g. 250 for MODIS).
+    n_pixels : int
+        Number of pixels per side (n × n).
+    
+    Returns
+    -------
+    List of bounding boxes: [lon_min, lat_min, lon_max, lat_max]
+    """
+
+    # Tile size in meters
+    tile_size_m = spatial_resolution_m * n_pixels
+
+    bboxes = []
+
+    lat = lat_min
+    while lat < lat_max:
+        # Latitude step is constant
+        lat_step = meters_to_degrees_lat(tile_size_m)
+
+        lon = lon_min
+        while lon < lon_max:
+            # Longitude step depends on latitude
+            lon_step = meters_to_degrees_lon(tile_size_m, lat)
+
+            bboxes.append([
+                float(lon),
+                float(lat),
+                float(lon + lon_step),
+                float(lat + lat_step)
+            ])
+
+            lon += lon_step
+
+        lat += lat_step
+
+    return bboxes
 
 def generate_bboxes_fixed(lat_min=-70, lat_max=70, lon_min=-70, lon_max=70, n_lat=7, n_lon=7):
     """

@@ -23,7 +23,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from utils import prepare
 from pyproj import Transformer
 import ee, geemap 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 
@@ -300,7 +300,11 @@ class EarthAccessDownloader:
         self.bbox = bbox
         self.data_dir = Path(data_dir)
         self.collection_name = collection_name
-        self.granule_dir = self.data_dir / self.collection_name
+
+        base_path = self.data_dir / self.collection_name
+        bbox_path = base_path / '_'.join(format(x, ".1f") for x in self.bbox) if self.bbox else base_path
+        self.granule_dir = bbox_path / "raw_data"
+
         self.zarr_path = zarr_path or (self.data_dir / f"{self.short_name}_dataset.zarr")
         self._reproj_lib = self._check_reproj_lib(reproj_lib)
         self._reproj_method = self._check_reproj_method(reproj_method)
@@ -335,22 +339,100 @@ class EarthAccessDownloader:
         if date_range is None or len(date_range) != 2:
             raise ValueError("date_range must be a tuple of (start_date, end_date)")
         return date_range
+    
+
+    def _missing_date_ranges(self, start_date, end_date, processed_dates):
+        """
+        Returns a list of (start, end) date tuples (YYYY-MM-DD)
+        representing contiguous missing date intervals.
+        """
+
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+
+        processed = set(
+            datetime.strptime(d, "%Y-%m-%d") for d in processed_dates
+        )
+
+        all_dates = []
+        d = start
+        while d <= end:
+            if d not in processed:
+                all_dates.append(d)
+            d += timedelta(days=1)
+
+        if not all_dates:
+            return []
+
+        ranges = []
+        range_start = all_dates[0]
+        prev = all_dates[0]
+
+        for d in all_dates[1:]:
+            if d == prev + timedelta(days=1):
+                prev = d
+            else:
+                ranges.append((range_start, prev))
+                range_start = d
+                prev = d
+
+        ranges.append((range_start, prev))
+
+        return [
+            (r[0].strftime("%Y-%m-%d"), r[1].strftime("%Y-%m-%d"))
+            for r in ranges
+        ]
 
     # ------------------------
     # Search and Download
     # ------------------------
-    def _search_and_download(self):
-        logger.info(f"🔍 Searching for {self.short_name} data...")
-        results = earthaccess.search_data(
-            short_name=self.short_name,
-            bounding_box=(self.bbox[0], self.bbox[1], self.bbox[2], self.bbox[3]),
-            temporal=self.date_range,
-        )
+    def _search_and_download(self, date_range=None):
+        """
+        Search and download data for missing dates within a given date range.
+        """
+    
+        if date_range is None:
+            date_range = self.date_range
+    
+        start_date, end_date = date_range
+    
+        processed_dates = self._get_processed_tiffs()
 
-        logger.info(f"⬇️ Downloading {len(results)} files to {self.granule_dir}")
-        earthaccess.download(results, str(self.granule_dir))
-        files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.{self.raw_data_type}")))
-        self.files = self._exclude_processed_files(files)
+        done_dates_range = [d for d in date_range if d in processed_dates]
+        
+        if len(done_dates_range) > 0:
+            logger.info(f"Skipping {len(done_dates_range)} already processed dates.")
+    
+        missing_ranges = self._missing_date_ranges(
+            start_date, end_date, processed_dates
+        )
+    
+        if not missing_ranges:
+            logger.info("✅ No missing dates to download.")
+            self.files = None
+            return
+    
+        for sub_range in missing_ranges:
+            logger.info(
+                f"🔍 Searching for {self.short_name} data from {sub_range[0]} to {sub_range[1]}..."
+            )
+    
+            results = earthaccess.search_data(
+                short_name=self.short_name,
+                bounding_box=(
+                    self.bbox[0], self.bbox[1],
+                    self.bbox[2], self.bbox[3]
+                ),
+                temporal=sub_range,
+            )
+    
+            logger.info(f"⬇️ Downloading {len(results)} files to {self.granule_dir}")
+    
+            if results:
+                earthaccess.download(results, str(self.granule_dir))
+
+        # After download, refresh file list 
+        self.files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.{self.raw_data_type}")))
 
 
     def _custom_preprocess(self, da):
@@ -499,16 +581,22 @@ class EarthAccessDownloader:
 
         return ds_regridded
     
-    def _exclude_processed_files(self, files):
-        tif_out_dir = self.granule_dir / "tiffs"
-        tile_dir = tif_out_dir / '_'.join(format(x, ".1f") for x in self.bbox)
+    def _get_processed_tiffs(self):
+        tif_out_dir = self.granule_dir / ".." / "tiffs"
+        # tile_dir = tif_out_dir / '_'.join(format(x, ".1f") for x in self.bbox)
 
         # Step 1: Get all processed dates from existing TIFFs
         processed_dates = set()
-        for tif_file in tile_dir.glob("*.tif"):
+        for tif_file in tif_out_dir.glob("*.tif"):
             # Assuming your TIFFs are like: VNP46A3_20120101.tif
             date_str = tif_file.stem.split('_')[-1]  # Extract the date part
-            processed_dates.add(date_str)
+            date_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+            processed_dates.add(date_fmt)
+
+        return processed_dates
+    
+    def _exclude_processed_files(self, files):
+        processed_dates = self._get_processed_tiffs()
 
         # Step 2: Filter self.files
         filtered_files = []
@@ -521,11 +609,15 @@ class EarthAccessDownloader:
             doy_str = doy_part[0][1:]  # remove the 'A', e.g., '2012001'
             # Convert YYYYDDD to YYYYMMDD
             date_obj = datetime.strptime(doy_str, "%Y%j")
-            date_str = date_obj.strftime("%Y%m%d")
+            date_str = date_obj.strftime("%Y-%m-%d")
 
             if date_str not in processed_dates:
                 filtered_files.append(h5_file)
-        return filtered_files
+        
+        pattern = re.compile(r'\.h(\d+)v(\d+)\.')
+        files_sorted = sorted(filtered_files, key=lambda x: tuple(map(int, pattern.search(x).groups())))
+        
+        return files_sorted
 
 
     def _mosaic_daily(self, max_workers=1):
@@ -542,7 +634,7 @@ class EarthAccessDownloader:
 
         variables = [self.variable] if isinstance(self.variable, str) else list(self.variable)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.tif_out_dir = self.granule_dir / "tiffs"
+        self.tif_out_dir = self.granule_dir / ".." / "tiffs"
         self.tif_out_dir.mkdir(parents=True, exist_ok=True)
 
         # ------------------------
@@ -558,6 +650,8 @@ class EarthAccessDownloader:
                 ds = gdal.Open(str(f))
                 if ds is None:
                     logger.warning(f"⚠️ Could not open {f}, skipping.")
+                    if f.endswith(self.raw_data_type):
+                        Path(f).unlink(missing_ok=True)
                     continue
                 subdatasets_cache[f] = ds.GetSubDatasets()
 
@@ -711,9 +805,9 @@ class EarthAccessDownloader:
     def _export_data(self, ds_date:xr.Dataset | xr.DataArray, date:str): 
         """ Export daily dataset according to self.arg.output """ 
         if self._output_format.lower() == "tiff": 
-            tile_dir = self.tif_out_dir / '_'.join(format(x, ".1f") for x in self.bbox)
-            os.makedirs(tile_dir, exist_ok=True) 
-            self._export_multiband_raster(ds_date, date, tile_dir)
+            # tile_dir =  self.tif_out_dir / '_'.join(format(x, ".1f") for x in self.bbox)
+            os.makedirs(self.tif_out_dir, exist_ok=True) 
+            self._export_multiband_raster(ds_date, date, self.tif_out_dir)
         else: 
             raise ValueError(f"Unknown output format '{self._output_format}'")
         
@@ -770,21 +864,94 @@ class EarthAccessDownloader:
     # ------------------------
     # Cleanup
     # ------------------------
+    def _cleanup_raw_files(self):
+        """Delete raw downloaded files (HDF/H5) to free disk space."""
+        raw_extensions = (self.raw_data_type.lstrip("."), self.raw_data_type)
+        deleted_count = 0
+        
+        if self.granule_dir.exists():
+            for f in os.listdir(self.granule_dir):
+                if f.endswith(raw_extensions):
+                    file_path = os.path.join(self.granule_dir, f)
+                    try:
+                        Path(file_path).unlink()
+                        deleted_count += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to delete {file_path}: {e}")
+        
+        logger.info(f"🧹 Deleted {deleted_count} raw data files from {self.granule_dir}")
+
     def cleanup(self):
         logger.info(f"🧹 Cleaning up temporary files in {self.temp_dir}")
         shutil.rmtree(self.temp_dir, ignore_errors=True)
-        [os.remove(os.path.join(self.granule_dir, x)) for x in os.listdir(self.granule_dir) if x.endswith(".hdf")]
+        self._cleanup_raw_files()
 
     # ------------------------
-    # Full pipeline
+    # Full pipeline with batch support
     # ------------------------
-    def run(self):
-        self._search_and_download()
-        self._mosaic_daily()
+    def _split_date_range(self, start_date, end_date, batch_days=30):
+        """
+        Split a date range into batches of specified days.
+        
+        Parameters
+        ----------
+        start_date : str
+            Start date in format 'YYYY-MM-DD'
+        end_date : str
+            End date in format 'YYYY-MM-DD'
+        batch_days : int
+            Number of days per batch
+            
+        Returns
+        -------
+        list of tuples
+            List of (batch_start, batch_end) date ranges
+        """
+        from datetime import datetime, timedelta
+        
+        start = pd.to_datetime(start_date)
+        end = pd.to_datetime(end_date)
+        batches = []
+        
+        current = start
+        while current < end:
+            batch_end = min(current + timedelta(days=batch_days), end)
+            batches.append((current.strftime("%Y-%m-%d"), batch_end.strftime("%Y-%m-%d")))
+            current = batch_end + timedelta(days=1)
+        
+        return batches
+
+    def run(self, batch_days=30):
+        """
+        Run the full pipeline with batch downloading.
+        
+        Parameters
+        ----------
+        batch_days : int
+            Number of days per batch. Downloads are performed in batches
+            to manage memory and handle large date ranges efficiently.
+            Raw files are deleted after each batch to free disk space.
+        """
+        start_date, end_date = self.date_range
+        batches = self._split_date_range(start_date, end_date, batch_days=batch_days)
+        self._cleanup_raw_files()
+        logger.info(f"📦 Processing {len(batches)} batches of ~{batch_days} days each...")
+        
+        for i, (batch_start, batch_end) in enumerate(batches, 1):
+            logger.info(f"Processing batch {i}/{len(batches)}: {batch_start} to {batch_end}")
+            self._search_and_download(date_range=(batch_start, batch_end))
+            
+            if self.files is None:
+                logger.info(f"✅ No new files to process in batch {i}. Skipping.")
+                continue
+            else:
+                self._mosaic_daily()
+
+            self._cleanup_raw_files()  # Free disk space after each batch
+            logger.info(f"✅ Batch {i}/{len(batches)} completed!")
+        
         self.cleanup()
-        logger.info("✅ Done!")
-
-
+        logger.info("✅ All batches completed!")
 
 
 if __name__ == "__main__":
@@ -804,6 +971,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="MODIS Downloader")
     parser.add_argument('--product', type=str, default='VIIRS_500m_night_monthly', help='MODIS product to download')
+    parser.add_argument('--start_date', type=str, help='date to start collection')
+    parser.add_argument('--end_date', type=str, help='date to end collection')
     parser.add_argument('--reproj_lib', choices=['rioxarray', 'xesmf'], default=os.getenv('REPROJ_LIB', 'rioxarray'), help='Reprojection library to use (rioxarray or xesmf)')
     parser.add_argument('--reproj_method', choices=['nearest', 'bilinear'], default=os.getenv('REPROJ_METHOD', 'nearest'), help='Reprojection method to use')    
     parser.add_argument('-d', '--delete_temp', action='store_true', default=False, help='Delete temporary files after processing')
@@ -819,7 +988,8 @@ if __name__ == "__main__":
             "variables": ["sur_refl_b01", 
                            "sur_refl_b02", 
                            "QC_250m"
-            ]
+            ],
+            "raw_data_type" : "hdf"
         },
         "NDVI_1km_monthly": {
             "short_name": "MOD13A3",
@@ -863,7 +1033,7 @@ if __name__ == "__main__":
         short_name=short_name,
         bbox= bbox,
         variables=variables,
-        date_range=("2012-01-01", "2024-01-01"),
+        date_range=(args.start_date, args.end_date),
         collection_name=f"{short_name}_061",
         reproj_lib=args.reproj_lib,
         reproj_method=args.reproj_method,
@@ -875,10 +1045,11 @@ if __name__ == "__main__":
             shutil.rmtree( downloader.temp_dir)
 
         downloader.cleanup()
-        downloader.run()
+        downloader.run(batch_days=10)
 
     except Exception as e:
-        downloader.cleanup()
-        if downloader.granule_dir.exists():
-            shutil.rmtree( downloader.granule_dir)
+        # downloader.cleanup()
+        # if downloader.granule_dir.exists():
+        #     shutil.rmtree( downloader.granule_dir)
+        logger.error(e)
         raise e

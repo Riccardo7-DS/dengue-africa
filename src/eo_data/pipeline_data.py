@@ -1,12 +1,19 @@
 from eo_data.modis import EarthAccessDownloader
-from utils import latin_box, generate_bboxes_fixed, init_logging
+from utils import generate_bboxes_fixed, init_logging, tile_has_min_land_fraction, plot_boxes_on_map, generate_bboxes_from_resolution
 from osgeo import gdal
-from definitions import ROOT_DIR
+from definitions import ROOT_DIR, DATA_DIR
 from pathlib import Path
 from dotenv import load_dotenv
 import argparse
 import os
 import shutil
+from utils import init_logging
+import sys
+from tqdm import tqdm
+import numpy as np
+
+
+logger = init_logging(log_file="modis_downloader.log", verbose=False)
 
 # Load environment variables
 load_dotenv(Path(ROOT_DIR)/ ".env")
@@ -14,8 +21,6 @@ load_dotenv(Path(ROOT_DIR)/ ".env")
 # GDAL tuning
 gdal.SetConfigOption('GDAL_CACHEMAX', '512')    # MB, tune to memory
 gdal.SetConfigOption('GDAL_DISABLE_READDIR_ON_OPEN', 'EMPTY_DIR')
-
-import sys
 sys.dont_write_bytecode = True
 
 # Argument parsing
@@ -28,66 +33,125 @@ parser.add_argument('--lon_min', type=float, default=-70)
 parser.add_argument('--lat_min', type=float, default=-70)
 parser.add_argument('--lon_max', type=float, default=70)
 parser.add_argument('--lat_max', type=float, default=70)
-parser.add_argument('--n_lon', type=int, default=5)
-parser.add_argument('--n_lat', type=int, default=5)
-parser.add_argument('--start_date', type=str, default="2025-07-01")
-parser.add_argument('--end_date', type=str, default="2025-07-05")
+parser.add_argument('--n_lon', type=int, default=7)
+parser.add_argument('--n_lat', type=int, default=7)
+parser.add_argument('--start_date', type=str, default=os.getenv('start_date', "2025-07-01"))
+parser.add_argument('--end_date', type=str, default=os.getenv('end_date', "2025-07-05"))
+parser.add_argument('--batch_days', type=int, default=os.getenv("batch_days", 30), help='Number of days per download batch')
+
 args = parser.parse_args()
 
-# Define products
 products = {
-    "LST": {
-        "short_name": "MOD11A1",
-        "variables": ["MODIS_Grid_Daily_1km_LST:LST_Day_1km"]
-    },
-    "reflectance_250m": {
-        "short_name": "MOD09GQ",
-        "variables": ["sur_refl_b01", "sur_refl_b02", "QC_250m"]
-    },
-    "NDVI_1km_monthly": {
-        "short_name": "MOD13A3",
-        "variables": ["NDVI", "EVI", "SummaryQA"]
+        "LST": {
+            "short_name": "MOD11A1",
+            "variables": ["MODIS_Grid_Daily_1km_LST:LST_Day_1km"]
+        },
+        "reflectance_250m": {
+            "short_name": "MOD09GQ",
+            "variables": ["sur_refl_b01", 
+                           "sur_refl_b02", 
+                           "QC_250m"
+            ],
+            "raw_data_type" : "hdf"
+        },
+        "NDVI_1km_monthly": {
+            "short_name": "MOD13A3",
+            "variables": ["NDVI",
+                          "EVI",
+                          "SummaryQA"
+            ],
+            "raw_data_type" : "hdf"
+        },
+        "VIIRS_500m_night_monthly": {
+            "short_name": "VNP46A3",
+            "variables": ["NearNadir_Composite_Snow_Free",
+                          "NearNadir_Composite_Snow_Free_Std",
+                          "NearNadir_Composite_Snow_Free_Quality"
+            ],
+            "raw_data_type" : "h5"
+        },
+        
+        "VIIRS_500m_night_daily": {
+            "short_name": "VNP46A2",
+            "variables": ["Gap_Filled_DNB_BRDF_Corrected_NTL",
+                          "DNB_BRDF_Corrected_NTL",
+                          "QF_Cloud_Mask"
+            ],
+            "raw_data_type" : "h5"
+        }
     }
-}
+
+
 
 variables = products[args.product]["variables"]
 short_name = products[args.product]["short_name"]
+raw_data_type = products[args.product]["raw_data_type"]
 
-# Initialize logger
-logger = init_logging(log_file="modis_downloader.log", verbose=False)
+start = args.start_date
+end = args.end_date
+batch_days = args.batch_days
 
-# Generate bounding boxes
 bboxes = generate_bboxes_fixed(
-    lon_min=args.lon_min,
-    lon_max=args.lon_max,
-     lat_min=args.lat_min, 
-    lat_max=args.lat_max,
-    n_lon=args.n_lon, n_lat=args.n_lat
+        lon_min=args.lon_min,
+        lon_max=args.lon_max,
+         lat_min=args.lat_min, 
+        lat_max=args.lat_max,
+        n_lon=args.n_lon, n_lat=args.n_lat,
+        # n_pixels = 256
 )
 
+logger.info(f"Generated {len(bboxes)} total tiles for the area of interest.")
+
+
+if os.path.exists(Path(DATA_DIR) / "water_min.npy"):
+    logger.info("Loading precomputed filtered bounding boxes from water_min.npy")
+    water_min = np.load(Path(DATA_DIR) / "water_min.npy", allow_pickle=True).tolist()
+
+else:    
+    # Generate bounding boxes
+
+    # # Debug: print info for first 3 tiles
+    # logger.info(f"Testing first 3 bboxes with debug=True to understand filtering...")
+    # for i, tile in enumerate(bboxes[:3]):
+    #     result = tile_has_min_land_fraction(tile, scale=250, min_percentage=0.5, debug=True)
+    #     logger.info(f"Tile {i}: {result}")
+
+    water_min = [
+        tile
+        for tile in tqdm(bboxes, desc="Filtering tiles")
+        if tile_has_min_land_fraction(tile, scale=250, min_percentage=30)
+    ]
+    np.save("water_min.npy", np.array(water_min))
+
+logger.info(f"Selected {len(water_min)} tiles out of {len(bboxes)} total tiles")
+plot_boxes_on_map(water_min)
+
 # Loop over each bounding box and download
-for i, bbox in enumerate(bboxes):
-    logger.info(f"Processing tile {i+1}/{len(bboxes)}: {bbox}")
+for i, bbox in enumerate(water_min):
+    logger.info(f"Processing tile {i+1}/{len(water_min)}: {bbox}")
+
     try:
+        
         downloader = EarthAccessDownloader(
             short_name=short_name,
-            bbox=bbox,
+            bbox= bbox,
             variables=variables,
-            date_range=(args.start_date, args.end_date),
+            date_range=(start, end),
             collection_name=f"{short_name}_061",
             reproj_lib=args.reproj_lib,
             reproj_method=args.reproj_method,
-            output_format="tiff"
-        )
-
-        downloader.run()
-
+            output_format="tiff",
+            raw_data_type=raw_data_type
+    )   
         if args.delete_temp and downloader.temp_dir.exists():
             logger.warning("Deleting temporary directory as per user request.")
-            shutil.rmtree(downloader.temp_dir)
+            shutil.rmtree( downloader.temp_dir)
 
-        downloader.cleanup()
+        downloader.run(batch_days=batch_days)
 
     except Exception as e:
-        logger.error(f"Error processing tile {i+1}: {e}")
-        downloader.cleanup()
+        # downloader.cleanup()
+        # if downloader.granule_dir.exists():
+        #     shutil.rmtree( downloader.granule_dir)
+        logger.error(e)
+        raise e
