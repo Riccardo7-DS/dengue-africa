@@ -1,7 +1,7 @@
 from eo_data.modis import EarthAccessDownloader
 from utils import generate_bboxes_fixed, init_logging, tile_has_min_land_fraction, plot_boxes_on_map, generate_bboxes_from_resolution
 from osgeo import gdal
-from definitions import ROOT_DIR, DATA_DIR
+from definitions import ROOT_DIR, DATA_PATH
 from pathlib import Path
 from dotenv import load_dotenv
 import argparse
@@ -103,9 +103,9 @@ bboxes = generate_bboxes_fixed(
 logger.info(f"Generated {len(bboxes)} total tiles for the area of interest.")
 
 
-if os.path.exists(Path(DATA_DIR) / "water_min.npy"):
+if os.path.exists(Path(DATA_PATH) / "water_min.npy"):
     logger.info("Loading precomputed filtered bounding boxes from water_min.npy")
-    water_min = np.load(Path(DATA_DIR) / "water_min.npy", allow_pickle=True).tolist()
+    water_min = np.load(Path(DATA_PATH) / "water_min.npy", allow_pickle=True).tolist()
 
 else:    
     # Generate bounding boxes
@@ -127,8 +127,8 @@ logger.info(f"Selected {len(water_min)} tiles out of {len(bboxes)} total tiles")
 plot_boxes_on_map(water_min)
 
 # Loop over each bounding box and download
-for i, bbox in enumerate(water_min):
-    logger.info(f"Processing tile {i+1}/{len(water_min)}: {bbox}")
+for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", total=len(water_min)):
+    # logger.info(f"Processing tile {i+1}/{len(water_min)}: {bbox}")
 
     try:
         

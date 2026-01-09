@@ -771,6 +771,13 @@ class EarthAccessDownloader:
         transform = first.rio.transform()
         crs = first.rio.crs
 
+        # Determine appropriate predictor based on data type
+        # PREDICTOR=3 (float prediction) only for float dtypes
+        # PREDICTOR=2 (horizontal differencing) for integer dtypes
+        is_float = np.issubdtype(np.dtype(dtype), np.floating)
+        predictor = 3 if is_float else 2
+
+        # Optimized profile for better compression and reduced file size
         profile = {
             "driver": "GTiff",
             "height": height,
@@ -779,7 +786,13 @@ class EarthAccessDownloader:
             "dtype": dtype,
             "crs": crs,
             "transform": transform,
-            "compress": "LZW"
+            "compress": "DEFLATE",        # DEFLATE generally compresses better than LZW
+            "ZLEVEL": 5,                  # Balance compression vs speed (~2-3x faster than ZLEVEL=9)
+            "TILED": True,                # Enable tiling for better compression and access patterns
+            "BLOCKXSIZE": 256,            # Optimal block size for compression
+            "BLOCKYSIZE": 256,
+            "PREDICTOR": predictor,       # 3 for float, 2 for integer (horizontal differencing)
+            "BIGTIFF": "YES" if (height * width * len(var_names) * 2 > 4e9) else "NO"  # Use BigTIFF if >4GB
         }
 
         with rasterio.open(out_tif, "w", **profile) as dst:
@@ -792,12 +805,27 @@ class EarthAccessDownloader:
     def _export_single_bands(self, ds_date, date, tile_dir):
         for var in ds_date.data_vars:
             out_tif = Path(tile_dir) / f"{self.short_name}_{var}_{date:%Y%m%d}.tif"  
-            da = ds_date[var]             
-            da.rio.to_raster( str(out_tif), 
-                            driver="GTiff", 
-                            # standard GeoTIFF 
-                            compress="LZW", 
-                            dtype="int16" ) 
+            da = ds_date[var]
+            
+            # Determine appropriate predictor based on data type
+            # PREDICTOR=3 (float prediction) only for float dtypes
+            # PREDICTOR=2 (horizontal differencing) for integer dtypes
+            is_float = np.issubdtype(da.dtype, np.floating)
+            predictor = 3 if is_float else 2
+            
+            # Optimized GeoTIFF options for single-band export
+            rio_kwargs = {
+                "driver": "GTiff",
+                "compress": "DEFLATE",
+                "ZLEVEL": 5,              # Balance compression vs speed (~2-3x faster than ZLEVEL=9)
+                "TILED": True,
+                "BLOCKXSIZE": 256,
+                "BLOCKYSIZE": 256,
+                "PREDICTOR": predictor,   # 3 for float, 2 for integer
+                "dtype": str(da.dtype)
+            }
+            
+            da.rio.to_raster(str(out_tif), **rio_kwargs) 
 
     # ------------------------
     # Helper: export dataset according to arg.output
