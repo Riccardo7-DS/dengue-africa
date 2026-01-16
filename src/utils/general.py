@@ -12,11 +12,59 @@ import geopandas as gpd
 from pathlib import Path
 import itertools
 import math
-
+import os 
+from urllib.parse import urlparse
+from minio import Minio
 logger = logging.getLogger(__name__)
 
 
+def minio_client():
+    endpoint = os.getenv("AWS_S3_ENDPOINT")
+    if endpoint is None:
+        raise ValueError("AWS_S3_ENDPOINT is not set")
 
+    parsed = urlparse(endpoint)
+
+    host = parsed.netloc if parsed.netloc else parsed.path
+
+    return Minio(
+        host,
+        access_key=os.getenv("AWS_ACCESS_KEY_ID"),
+        secret_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        secure=(parsed.scheme == "https"),
+    )
+
+def extract_object_from_minio(temp_path:Union[str, Path]):
+    path = temp_path.lstrip("/").removeprefix("vsis3/")
+    _, key = path.split("/", 1)
+    key = key.rsplit("/", 1)[0]
+    return key 
+
+def setup_minio_config():
+    """
+    Setup MinIO/S3 configuration from environment variables.
+    Expects: MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET
+    """
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    minio_endpoint = os.getenv('AWS_ENDPOINT_URL')
+    minio_access_key = os.getenv('AWS_ACCESS_KEY_ID')
+    minio_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+    
+    if not minio_endpoint:
+        raise ValueError(
+            "MinIO endpoint not configured. Please set MINIO_ENDPOINT environment variable."
+        )
+    
+    # Configure GDAL for S3/MinIO access
+    os.environ['AWS_S3_ENDPOINT'] = minio_endpoint
+    os.environ['AWS_ACCESS_KEY_ID'] = minio_access_key or ''
+    os.environ['AWS_SECRET_ACCESS_KEY'] = minio_secret_key or ''
+    os.environ['AWS_VIRTUAL_HOSTING'] = 'FALSE'
+    os.environ['AWS_NO_SIGN_REQUEST'] = 'NO'
+    
+    logger.info(f"MinIO correctly configured")
 
 def meters_to_degrees_lat(meters):
     """Convert meters to degrees latitude."""

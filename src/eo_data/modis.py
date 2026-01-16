@@ -20,11 +20,11 @@ import numpy as np
 import xarray as xr
 from typing import Literal
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from utils import prepare
+from utils import prepare, minio_client, setup_minio_config, extract_object_from_minio
 from pyproj import Transformer
 import ee, geemap 
 from datetime import datetime, timedelta
-
+from rasterio.errors import RasterioError 
 
 
 logger = logging.getLogger(__name__)
@@ -280,15 +280,14 @@ class EarthAccessDownloader:
 
     def __init__(
         self,
+        args,
         short_name="MOD11A1",
         variables="MODIS_Grid_Daily_1km_LST:LST_Day_1km",
         date_range=None,
         bbox=None,
-        data_dir=Path(DATA_PATH) / "modis",
+        data_dir=None,
         collection_name="lst_061",
         zarr_path=None,
-        reproj_lib:Literal["rioxarray","xesmf"]="xesmf",
-        reproj_method:Literal["nearest","bilinear"]="nearest",
         output_format:Literal["tiff","zarr"]="zarr",
         raw_data_type=".hdf"
     ):
@@ -298,24 +297,71 @@ class EarthAccessDownloader:
         self.short_name = short_name
         self.variable = variables
         self.bbox = bbox
-        self.data_dir = Path(data_dir)
         self.collection_name = collection_name
-
-        base_path = self.data_dir / self.collection_name
-        bbox_path = base_path / '_'.join(format(x, ".1f") for x in self.bbox) if self.bbox else base_path
-        self.granule_dir = bbox_path / "raw_data"
-
-        self.zarr_path = zarr_path or (self.data_dir / f"{self.short_name}_dataset.zarr")
-        self._reproj_lib = self._check_reproj_lib(reproj_lib)
-        self._reproj_method = self._check_reproj_method(reproj_method)
+        
+        self._check_cloud_or_local(data_dir, args.store_cloud)
+        
+        
+        self._reproj_lib = self._check_reproj_lib(args.reproj_lib)
+        self._reproj_method = self._check_reproj_method(args.reproj_method)
+        
         self.raw_data_type = raw_data_type
-
         self._output_format = output_format
 
-        self.granule_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = Path(tempfile.mkdtemp())
+        
+        # Initialize MinIO configuration if cloud storage is enabled
+        if self._store_cloud and os.getenv('AWS_ACCESS_KEY_ID') is None:
+            setup_minio_config()
+        
         self._login_earthaccess()
 
+    def _check_cloud_or_local(self, data_dir, store_cloud, zarr_path=None):
+        """
+        Set up data directories for local or cloud storage.
+
+        Parameters
+        ----------
+        data_dir : str | Path | None
+            Local path or /vsis3/ path for cloud storage.s
+        store_cloud : bool
+            True for cloud storage, False for local filesystem.
+        """
+        self._store_cloud = store_cloud
+
+        # Set data_dir
+        if store_cloud:
+            if not data_dir:
+                raise ValueError("For cloud storage, data_dir must be provided as a /vsis3/ path.")
+            self.data_dir = str(data_dir)  # keep as string for GDAL
+        else:
+            self.data_dir = Path(data_dir) if data_dir else Path(DATA_PATH) / "modis"
+
+        logger.info(f"Data directory set to: {self.data_dir} with cloud option {self._store_cloud}")
+
+        # Build granule_dir
+        collection_path = (
+            f"{self.data_dir}/{self.collection_name}" if store_cloud else self.data_dir / self.collection_name
+        )
+
+        if self.bbox:
+            bbox_str = "_".join(format(x, ".1f") for x in self.bbox)
+            collection_path = f"{collection_path}/{bbox_str}" if store_cloud else collection_path / bbox_str
+
+        self.granule_dir = f"{collection_path}/raw_data" if store_cloud else collection_path / "raw_data"
+
+        if not store_cloud:
+            self.granule_dir.mkdir(parents=True, exist_ok=True) 
+
+        if zarr_path and not store_cloud:
+            self.zarr_path = zarr_path
+        elif not store_cloud:
+            self.zarr_path = self.data_dir / f"{self.short_name}_dataset.zarr"
+        elif store_cloud and zarr_path:
+            raise NotImplementedError("Zarr output not implemented for cloud storage.")
+        
+        self._minio_client = minio_client() if store_cloud else None
+        
     def _check_reproj_lib(self, reproj_lib):
         valid_libs = ["rioxarray", "xesmf"]
         if reproj_lib not in valid_libs:
@@ -429,10 +475,16 @@ class EarthAccessDownloader:
             logger.info(f"⬇️ Downloading {len(results)} files to {self.granule_dir}")
     
             if results:
-                earthaccess.download(results, str(self.granule_dir))
+                if self._store_cloud:
+                    earthaccess.download(results, self.temp_dir)
+                else:
+                    earthaccess.download(results, str(self.granule_dir))
 
-        # After download, refresh file list 
-        self.files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.{self.raw_data_type}")))
+        # After download, refresh file list
+        if not self._store_cloud:
+            self.files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.{self.raw_data_type}")))
+        else:
+            self.files = sorted(glob.glob(str(self.temp_dir / f"{self.short_name}*.{self.raw_data_type}")))
 
 
     def _custom_preprocess(self, da):
@@ -582,16 +634,41 @@ class EarthAccessDownloader:
         return ds_regridded
     
     def _get_processed_tiffs(self):
-        tif_out_dir = self.granule_dir / ".." / "tiffs"
-        # tile_dir = tif_out_dir / '_'.join(format(x, ".1f") for x in self.bbox)
-
-        # Step 1: Get all processed dates from existing TIFFs
+        """
+        Get all processed TIFF dates from local or cloud storage.
+        Works with both local filesystem and MinIO/S3 storage via /vsis3/.
+        """
         processed_dates = set()
-        for tif_file in tif_out_dir.glob("*.tif"):
-            # Assuming your TIFFs are like: VNP46A3_20120101.tif
-            date_str = tif_file.stem.split('_')[-1]  # Extract the date part
-            date_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
-            processed_dates.add(date_fmt)
+
+        if self._store_cloud:
+            # GDAL /vsis3/ path
+            tif_out_dir = f"{self.granule_dir.rsplit('/', 1)[0]}/tiffs"
+            files = gdal.ReadDir(tif_out_dir)
+            if files:
+                for filename in files:
+                    if filename.endswith(".tif"):
+                        parts = filename.split("_")
+                        if len(parts) >= 2:
+                            date_str = parts[-1].replace(".tif", "")
+                            try:
+                                date_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+                                processed_dates.add(date_fmt)
+                            except ValueError:
+                                logger.debug(f"Skipping S3 file with non-matching date: {filename}")
+            logger.info(f"Found {len(processed_dates)} processed dates in MinIO: {tif_out_dir}")
+
+        else:
+            # Local filesystem
+            tif_out_dir = Path(self.granule_dir).parent / "tiffs"
+            if tif_out_dir.exists():
+                for tif_file in tif_out_dir.glob("*.tif"):
+                    date_str = tif_file.stem.split('_')[-1]
+                    try:
+                        date_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+                        processed_dates.add(date_fmt)
+                    except ValueError:
+                        logger.debug(f"Skipping local file with non-matching date: {tif_file.name}")
+            logger.info(f"Found {len(processed_dates)} processed dates locally: {tif_out_dir}")
 
         return processed_dates
     
@@ -633,8 +710,12 @@ class EarthAccessDownloader:
             files_by_date[self._get_date(f)].append(f)
 
         variables = [self.variable] if isinstance(self.variable, str) else list(self.variable)
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.tif_out_dir = self.granule_dir / ".." / "tiffs"
+
+        if self._store_cloud is False:
+            self.tif_out_dir = self.granule_dir.parent / "tiffs"
+        else:
+            self.tif_out_dir = self.temp_dir / "tiffs"
+
         self.tif_out_dir.mkdir(parents=True, exist_ok=True)
 
         # ------------------------
@@ -761,9 +842,45 @@ class EarthAccessDownloader:
             ds = ds.dropna(dim="y", how="all")
         return ds
 
-    def _export_multiband_raster(self, ds:xr.Dataset | xr.DataArray, date:str,  tile_dir:str, dtype="int16"):
 
-        out_tif = Path(tile_dir) / f"{self.short_name}_{date:%Y%m%d}.tif"  
+    def _export_multiband_raster(
+        self,
+        ds: xr.Dataset | xr.DataArray,
+        date,
+        tile_dir: str = None,
+        dtype: str = "int16",
+    ):
+        """
+        Export a multiband GeoTIFF either locally or directly to MinIO.
+        Storage location is determined by self._store_cloud flag.
+
+        Parameters
+        ----------
+        ds : xr.Dataset or xr.DataArray
+            Dataset to export
+        date : datetime
+            Date for the filename
+        tile_dir : str, optional
+            Local directory path (required if store_cloud=False)
+        dtype : str
+            Data type for output, default "int16"
+        """
+
+        # Construct output path
+        filename = f"{self.short_name}_{date:%Y%m%d}.tif"
+        
+        if self._store_cloud:
+            # Cloud: full /vsis3/ path as string
+            out_tif = f"{self.tif_out_dir}/{filename}"
+        else:
+            # Local filesystem
+            if tile_dir is None:
+                tile_dir = self.tif_out_dir
+
+            tile_dir = Path(tile_dir)
+            tile_dir.mkdir(parents=True, exist_ok=True)
+            out_tif = tile_dir / filename
+
         var_names = list(ds.data_vars)
         first = ds[var_names[0]]
 
@@ -771,13 +888,9 @@ class EarthAccessDownloader:
         transform = first.rio.transform()
         crs = first.rio.crs
 
-        # Determine appropriate predictor based on data type
-        # PREDICTOR=3 (float prediction) only for float dtypes
-        # PREDICTOR=2 (horizontal differencing) for integer dtypes
         is_float = np.issubdtype(np.dtype(dtype), np.floating)
         predictor = 3 if is_float else 2
 
-        # Optimized profile for better compression and reduced file size
         profile = {
             "driver": "GTiff",
             "height": height,
@@ -786,25 +899,43 @@ class EarthAccessDownloader:
             "dtype": dtype,
             "crs": crs,
             "transform": transform,
-            "compress": "DEFLATE",        # DEFLATE generally compresses better than LZW
-            "ZLEVEL": 5,                  # Balance compression vs speed (~2-3x faster than ZLEVEL=9)
-            "TILED": True,                # Enable tiling for better compression and access patterns
-            "BLOCKXSIZE": 256,            # Optimal block size for compression
+            "compress": "DEFLATE",
+            "ZLEVEL": 5,
+            "TILED": True,
+            "BLOCKXSIZE": 256,
             "BLOCKYSIZE": 256,
-            "PREDICTOR": predictor,       # 3 for float, 2 for integer (horizontal differencing)
-            "BIGTIFF": "YES" if (height * width * len(var_names) * 2 > 4e9) else "NO"  # Use BigTIFF if >4GB
+            "PREDICTOR": predictor,
+            "BIGTIFF": "YES" if (height * width * len(var_names) * 2 > 4e9) else "NO",
         }
 
-        with rasterio.open(out_tif, "w", **profile) as dst:
+        with rasterio.open(str(out_tif), "w", **profile) as dst:
             for i, var in enumerate(var_names, start=1):
-                arr = ds[var].data
-                arr = arr.squeeze()     # pulls only one band into RAM
+                arr = ds[var].data.squeeze()
                 dst.write(arr.astype(dtype), i)
                 dst.set_band_description(i, var)
 
-    def _export_single_bands(self, ds_date, date, tile_dir):
+        if self._store_cloud:
+            self._minio_client.fput_object(
+            os.getenv('MINIO_BUCKET'),
+            f"{extract_object_from_minio(self.granule_dir)}/tiffs/{filename}",
+            str(out_tif),
+        )
+                    
+
+    def _export_single_bands(self, ds_date, date, tile_dir=None):
+        """
+        Export single-band rasters, either locally or to MinIO.
+        """
+        if tile_dir is None and not self._store_cloud:
+            tile_dir = self.tif_out_dir
+        
         for var in ds_date.data_vars:
-            out_tif = Path(tile_dir) / f"{self.short_name}_{var}_{date:%Y%m%d}.tif"  
+            filename = f"{self.short_name}_{var}_{date:%Y%m%d}.tif"
+            
+            if not self._store_cloud:
+                out_tif = Path(tile_dir) / filename
+                Path(tile_dir).mkdir(parents=True, exist_ok=True)
+            
             da = ds_date[var]
             
             # Determine appropriate predictor based on data type
@@ -825,17 +956,18 @@ class EarthAccessDownloader:
                 "dtype": str(da.dtype)
             }
             
-            da.rio.to_raster(str(out_tif), **rio_kwargs) 
+            da.rio.to_raster(str(out_tif), **rio_kwargs)
+            
+            storage_type = "MinIO" if self._store_cloud else "local"
+            logger.debug(f"✅ Exported {var} to {storage_type}: {out_tif}") 
 
     # ------------------------
     # Helper: export dataset according to arg.output
     # ------------------------
     def _export_data(self, ds_date:xr.Dataset | xr.DataArray, date:str): 
-        """ Export daily dataset according to self.arg.output """ 
+        """ Export daily dataset according to self._output_format """ 
         if self._output_format.lower() == "tiff": 
-            # tile_dir =  self.tif_out_dir / '_'.join(format(x, ".1f") for x in self.bbox)
-            os.makedirs(self.tif_out_dir, exist_ok=True) 
-            self._export_multiband_raster(ds_date, date, self.tif_out_dir)
+            self._export_multiband_raster(ds_date, date)
         else: 
             raise ValueError(f"Unknown output format '{self._output_format}'")
         
@@ -859,11 +991,22 @@ class EarthAccessDownloader:
                 dst_crs="EPSG:4326",   
                 resampling=reproject,
             )#.chunk({"x": 1024, "y": 1024})
+                
+            ds_tmp = ds_repr.rio.clip_box(
+                    minx=self.bbox[0],
+                    miny=self.bbox[1],
+                    maxx=self.bbox[2],
+                    maxy=self.bbox[3],
+                    allow_one_dimensional_raster=True,
+                )
 
-            ds_repr = ds_repr.rio.clip_box(minx=self.bbox[0], 
-                                           miny=self.bbox[1], 
-                                           maxx=self.bbox[2], 
-                                           maxy=self.bbox[3])
+            # Drop degenerate clips
+            if ds_tmp.sizes.get("x", 0) <= 1 or ds_tmp.sizes.get("y", 0) <= 1:
+                logger.warning(
+                    f"⚠️ Clipped raster collapsed to 1D "
+                    f"(x={ds_tmp.sizes.get('x')}, y={ds_tmp.sizes.get('y')}), skipping."
+                )
+                return ds_repr
 
         elif self._reproj_lib == "xesmf":
             ds_repr = self._regridding_with_xe_modis(
@@ -883,11 +1026,30 @@ class EarthAccessDownloader:
     # Export to Zarr
     # ------------------------
     def _export_to_zarr(self, ds):
-        logger.info(f"💾 Appending data to {self.zarr_path}")
-        if not self.zarr_path.exists():
-            ds.to_zarr(self.zarr_path, mode="w")
+        """
+        Export dataset to Zarr format, either locally or to MinIO.
+        """
+        if self._store_cloud:
+            zarr_path = f"/vsis3/{self.minio_bucket}/{self.minio_prefix}/{self.collection_name}_dataset.zarr"
         else:
-            ds.to_zarr(self.zarr_path, mode="a", append_dim="time")
+            zarr_path = self.zarr_path
+        
+        logger.info(f"💾 Appending data to {zarr_path}")
+        
+        if self._store_cloud:
+            # For cloud storage, we need to check existence differently
+            try:
+                ds_existing = xr.open_zarr(zarr_path)
+                # Append to existing
+                ds.to_zarr(zarr_path, mode="a", append_dim="time")
+            except (FileNotFoundError, KeyError, ValueError):
+                # Create new
+                ds.to_zarr(zarr_path, mode="w")
+        else:
+            if not Path(zarr_path).exists():
+                ds.to_zarr(zarr_path, mode="w")
+            else:
+                ds.to_zarr(zarr_path, mode="a", append_dim="time")
 
     # ------------------------
     # Cleanup
@@ -909,10 +1071,11 @@ class EarthAccessDownloader:
         
         logger.info(f"🧹 Deleted {deleted_count} raw data files from {self.granule_dir}")
 
-    def cleanup(self):
+    def cleanup(self, clean_nontemp=False):
         logger.info(f"🧹 Cleaning up temporary files in {self.temp_dir}")
         shutil.rmtree(self.temp_dir, ignore_errors=True)
-        self._cleanup_raw_files()
+        if clean_nontemp:
+            self._cleanup_raw_files()
 
     # ------------------------
     # Full pipeline with batch support
@@ -962,7 +1125,8 @@ class EarthAccessDownloader:
         """
         start_date, end_date = self.date_range
         batches = self._split_date_range(start_date, end_date, batch_days=batch_days)
-        self._cleanup_raw_files()
+        if not self._store_cloud:
+            self._cleanup_raw_files()
         logger.info(f"📦 Processing {len(batches)} batches of ~{batch_days} days each...")
         
         for i, (batch_start, batch_end) in enumerate(batches, 1):
@@ -975,10 +1139,16 @@ class EarthAccessDownloader:
             else:
                 self._mosaic_daily()
 
-            self._cleanup_raw_files()  # Free disk space after each batch
+            if not self._store_cloud:
+                self._cleanup_raw_files()  # Free disk space after each batch
+            else:
+                # Clear temp_dir for cloud storage
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+                self.temp_dir.mkdir(parents=True, exist_ok=True)
+
             logger.info(f"✅ Batch {i}/{len(batches)} completed!")
         
-        self.cleanup()
+        # self.cleanup()
         logger.info("✅ All batches completed!")
 
 

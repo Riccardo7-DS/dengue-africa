@@ -38,6 +38,7 @@ parser.add_argument('--n_lat', type=int, default=7)
 parser.add_argument('--start_date', type=str, default=os.getenv('start_date', "2025-07-01"))
 parser.add_argument('--end_date', type=str, default=os.getenv('end_date', "2025-07-05"))
 parser.add_argument('--batch_days', type=int, default=os.getenv("batch_days", 30), help='Number of days per download batch')
+parser.add_argument("--store_cloud", action="store_true", help="Store data in cloud storage")
 
 args = parser.parse_args()
 
@@ -81,7 +82,9 @@ products = {
         }
     }
 
-
+print("AWS_ACCESS_KEY_ID:", os.getenv("AWS_ACCESS_KEY_ID"))
+print("AWS_SECRET_ACCESS_KEY:", os.getenv("AWS_SECRET_ACCESS_KEY")[:4] + "****")
+print("AWS_S3_ENDPOINT:", os.getenv("AWS_S3_ENDPOINT"))
 
 variables = products[args.product]["variables"]
 short_name = products[args.product]["short_name"]
@@ -133,13 +136,13 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
     try:
         
         downloader = EarthAccessDownloader(
+            args=args,
+            data_dir="/vsis3/mtg-fci-data/modis" if args.store_cloud else Path(DATA_PATH) / "modis",
             short_name=short_name,
             bbox= bbox,
             variables=variables,
             date_range=(start, end),
             collection_name=f"{short_name}_061",
-            reproj_lib=args.reproj_lib,
-            reproj_method=args.reproj_method,
             output_format="tiff",
             raw_data_type=raw_data_type
     )   
@@ -150,7 +153,7 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
         downloader.run(batch_days=batch_days)
 
     except Exception as e:
-        # downloader.cleanup()
+        downloader.cleanup()
         # if downloader.granule_dir.exists():
         #     shutil.rmtree( downloader.granule_dir)
         logger.error(e)

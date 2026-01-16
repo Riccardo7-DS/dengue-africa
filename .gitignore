@@ -12,6 +12,6 @@ __pycache__/
 *.pyo
 *.pyd
 .venv/
-*.sh
 outputs/
 *.png
+move.sh
