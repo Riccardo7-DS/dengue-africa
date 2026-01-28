@@ -10,7 +10,7 @@ while true; do
     uv run python src/eo_data/pipeline_data.py \
         --product "reflectance_250m" \
         --start_date "2025-06-01" \
-        --end_date "2025-09-30" \
+        --end_date "2025-07-30" \
         --batch_days 5 \
         --store_cloud 
 

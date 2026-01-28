@@ -24,13 +24,14 @@ from utils import prepare, minio_client, setup_minio_config, extract_object_from
 from pyproj import Transformer
 import ee, geemap 
 from datetime import datetime, timedelta
-from rasterio.errors import RasterioError 
-
+from pystac_client import Client
+from odc.stac import load
+import pyproj
+from majortom import Grid
+import shapely.geometry
+import pickle
 
 logger = logging.getLogger(__name__)
-
-
-
 
 class EeModis():
     def __init__(self,
@@ -283,14 +284,21 @@ class EarthAccessDownloader:
         args,
         short_name="MOD11A1",
         variables="MODIS_Grid_Daily_1km_LST:LST_Day_1km",
+        resolution=None,
         date_range=None,
         bbox=None,
         data_dir=None,
         collection_name="lst_061",
+        crs="EPSG:6933",
         zarr_path=None,
         output_format:Literal["tiff","zarr"]="zarr",
         raw_data_type=".hdf"
-    ):
+    ):  
+        
+        if resolution is None:
+            raise ValueError("resolution must be provided.")
+        else:
+            self._resolution = resolution
         
         self.date_range = self._check_dates(date_range)
 
@@ -301,7 +309,9 @@ class EarthAccessDownloader:
         
         self._check_cloud_or_local(data_dir, args.store_cloud)
         
-        
+        self._crs = crs
+        if self.bbox:
+            self._crs = self._get_utm_crs()
         self._reproj_lib = self._check_reproj_lib(args.reproj_lib)
         self._reproj_method = self._check_reproj_method(args.reproj_method)
         
@@ -373,8 +383,21 @@ class EarthAccessDownloader:
         valid_methods = ["nearest", "bilinear"]
         if reproj_method not in valid_methods:
             raise ValueError(f"Invalid reproj_method '{reproj_method}'. Must be one of {valid_methods}.")
-        logger.info(f"Using reproj_method: {reproj_method}")
+        logger.info(f"Using reproj_method: {reproj_method} with {self._crs}")
         return reproj_method
+
+    def _get_utm_crs(self):
+        if not self.bbox:
+            return "EPSG:6933"  # fallback
+        # bbox is [minx, miny, maxx, maxy] in EPSG:4326
+        lon = (self.bbox[0] + self.bbox[2]) / 2
+        lat = (self.bbox[1] + self.bbox[3]) / 2
+        zone = int((lon + 180) / 6) + 1
+        if lat >= 0:
+            epsg = 32600 + zone
+        else:
+            epsg = 32700 + zone
+        return f"EPSG:{epsg}"
 
     def _login_earthaccess(self):
         load_dotenv()
@@ -503,6 +526,8 @@ class EarthAccessDownloader:
             da = da.where(da != 65535, -9999)
         else:
             da.name = "band_data"
+            da = da.rio.write_nodata(-9999)  # Set nodata for int16 data
+            da = da.where(da != 65535, -9999)
         # -------------------------------------------------
 
         return da
@@ -511,6 +536,9 @@ class EarthAccessDownloader:
         match = re.search(r'\.A(\d{7})\.', filename)
         return pd.to_datetime(match.group(1), format="%Y%j")
 
+    def _get_hv(self, filename):
+        match = re.search(r'\.h(\d+)v(\d+)\.', filename)
+        return int(match.group(1)), int(match.group(2))
     
     def _validate_latlon_bounds(self, lat, lon, tol=1e-6):
         """
@@ -570,7 +598,7 @@ class EarthAccessDownloader:
             """
         # Ensure CRS metadata
         if hasattr(ds_src, "rio"):
-            ds_src = ds_src.rio.write_crs("EPSG:6933")
+            ds_src = ds_src.rio.write_crs(self._crs)
 
         # ---- Create 2D lon/lat coordinates for xESMF ----
         if "x" in ds_src.coords and "y" in ds_src.coords:
@@ -588,7 +616,7 @@ class EarthAccessDownloader:
             X, Y = np.meshgrid(x, y, indexing="xy")
 
             # Transform to geographic coordinates
-            transformer = Transformer.from_crs("EPSG:6933", "EPSG:4326", always_xy=True)
+            transformer = Transformer.from_crs("EPSG:6933", self._crs, always_xy=True)
             lon2d, lat2d = transformer.transform(X, Y)
 
             # Optional safety clip
@@ -629,7 +657,7 @@ class EarthAccessDownloader:
         ds_regridded = ds_regridded.where(mask_regridded > 0)
 
         # Attach CRS metadata
-        ds_regridded.attrs["crs"] = "EPSG:4326"
+        ds_regridded.attrs["crs"] = self._crs
 
         return ds_regridded
     
@@ -762,9 +790,9 @@ class EarthAccessDownloader:
             if not variable_data:
                 return None
 
-            ds_date = xr.merge(variable_data.values())
+            ds_date = self._merge_dataarrays(list(variable_data.values()))
             logger.info(f"Reprojecting dataset for {date:%Y-%m-%d}...")
-            ds_date = self._reproject(ds_date)
+            # ds_date = self._reproject(ds_date)
 
             # --- Export tiff---
             if self._output_format.lower() == "tiff":
@@ -811,7 +839,25 @@ class EarthAccessDownloader:
 
         try:
             gdal.UseExceptions()
-            vrt = gdal.BuildVRT(str(vrt_path), subdatasets, creationOptions=["NUM_THREADS=ALL_CPUS"])
+            
+            # Reproject each subdataset to UTM before mosaicking
+            temp_tifs = []
+            for i, subdataset in enumerate(subdatasets):
+                da = rioxarray.open_rasterio(subdataset, chunks=True).squeeze("band", drop=True)
+                dest_crs = self._get_utm_crs(da.rio.bounds())
+                
+                if not dest_crs.startswith("EPSG"):
+                    raise ValueError(f"Invalid UTM CRS returned: {dest_crs}")
+                da_utm = da.rio.reproject(
+                    dst_crs=dest_crs,
+                    resampling=self._reproj_method,
+                    resolution=self._resolution
+                )
+                temp_tif = self.temp_dir / f"temp_{var}_{i}.tif"
+                da_utm.rio.to_raster(str(temp_tif), driver="GTiff")
+                temp_tifs.append(str(temp_tif))
+            
+            vrt = gdal.BuildVRT(str(vrt_path), temp_tifs, creationOptions=["NUM_THREADS=ALL_CPUS"])
             if vrt is None:
                 raise RuntimeError("BuildVRT returned None")
 
@@ -822,8 +868,8 @@ class EarthAccessDownloader:
             )
             vrt = None
 
-            da = rioxarray.open_rasterio(tif_path, chunks=True).squeeze("band", drop=True).astype("int16")
-            return da
+            da_mosaic = rioxarray.open_rasterio(tif_path, chunks=True).squeeze("band", drop=True).astype("int16")
+            return da_mosaic 
 
         except RuntimeError as e:
             logger.warning(f"GDAL mosaic failed for {var}: {e}")
@@ -971,6 +1017,61 @@ class EarthAccessDownloader:
         else: 
             raise ValueError(f"Unknown output format '{self._output_format}'")
         
+    def _merge_dataarrays(self, dataarrays: list[xr.DataArray]) -> xr.Dataset:
+        """
+        Merge a list of xarray DataArrays into a Dataset.
+        Checks for differing spatial resolutions and issues a warning.
+        For MOD09GA, resamples state_1km to match the resolution of other bands (500m).
+        """
+        if not dataarrays:
+            return xr.Dataset()
+        
+        # Check spatial resolutions
+        resolutions = []
+        for da in dataarrays:
+            if hasattr(da, 'rio') and da.rio.crs is not None:
+                res = da.rio.resolution()
+                resolutions.append(res)
+            else:
+                resolutions.append(None)
+        
+        unique_res = set(tuple(r) if r is not None else None for r in resolutions)
+        if len(unique_res) > 1:
+            logger.warning(f"Different spatial resolutions detected among DataArrays: {unique_res}")
+        
+        # For MOD09GA, resample state_1km to 500m if necessary
+        if self.short_name == "MOD09GA":
+            target_da = None
+            for da in dataarrays:
+                if da.name != "state_1km":
+                    target_da = da
+                    break
+            if target_da is not None:
+                for i, da in enumerate(dataarrays):
+                    if da.name == "state_1km":
+                        # Resample state_1km to match target_da resolution
+                        dataarrays[i] = da.rio.reproject_match(target_da, resampling=self._reproj_method)
+                        logger.info("Resampled state_1km to match other bands' resolution.")
+                        break
+        
+        # Merge the DataArrays
+        return xr.merge(dataarrays)
+
+    def _convert_crs(self, ds: xr.Dataset | xr.DataArray, dst_crs: str, bbox_deg: tuple[float, float, float, float]) -> xr.Dataset | xr.DataArray:
+        """
+        Transform bounding box to dataset CRS and clip the dataset.
+        """
+        if isinstance(ds, xr.DataArray):
+            ds_repr = ds.to_dataset(name=ds.name)
+        else:
+            ds_repr = ds
+
+        project = pyproj.Transformer.from_crs("EPSG:4326", dst_crs, always_xy=True).transform
+        minx, miny = project(bbox_deg[0], bbox_deg[1])
+        maxx, maxy = project(bbox_deg[2], bbox_deg[3])
+
+        return [minx, miny, maxx, maxy]
+
     def _reproject(self, ds: xr.Dataset | xr.DataArray) -> xr.Dataset | xr.DataArray:
 
         if isinstance(ds, xr.DataArray):
@@ -988,15 +1089,25 @@ class EarthAccessDownloader:
             reproject = resampling_dict[self._reproj_method]
 
             ds_repr = ds_repr.rio.reproject(
-                dst_crs="EPSG:4326",   
+                dst_crs=self._crs,   
                 resampling=reproject,
+                resolution=self._resolution,
             )#.chunk({"x": 1024, "y": 1024})
-                
+
+            if (self._crs == "EPSG:6933" or self._crs.startswith("EPSG:326") or self._crs.startswith("EPSG:327")) and self.bbox is not None:
+                # Convert bbox to dataset CRS
+                bbox_projected = self._convert_crs(ds_repr, self._crs, self.bbox)
+                minx, miny, maxx, maxy = bbox_projected
+            elif self._crs == "EPSG:4326" and self.bbox is not None:
+                minx, miny, maxx, maxy = self.bbox
+            else:
+                minx, miny, maxx, maxy = ds_repr.rio.bounds()
+
             ds_tmp = ds_repr.rio.clip_box(
-                    minx=self.bbox[0],
-                    miny=self.bbox[1],
-                    maxx=self.bbox[2],
-                    maxy=self.bbox[3],
+                    minx=minx,
+                    miny=miny,
+                    maxx=maxx,
+                    maxy=maxy,
                     allow_one_dimensional_raster=True,
                 )
 
@@ -1020,8 +1131,7 @@ class EarthAccessDownloader:
             return ds_repr[ds.name]
         else:
             return ds_repr
-
-
+        
     # ------------------------
     # Export to Zarr
     # ------------------------
@@ -1111,45 +1221,430 @@ class EarthAccessDownloader:
             current = batch_end + timedelta(days=1)
         
         return batches
+    
+    def build_tile_to_grid_lookup(self, grid, cache_path):
+        """
+        Build mapping:
+            (h, v) -> list of (grid_id, lat, lon)
+        using majortom.Grid points.
+        """
+        import pickle
+        from tqdm import tqdm
+        from transform.majortom import latlon_to_sinu, sinu_to_tile
 
-    def run(self, batch_days=30):
-        """
-        Run the full pipeline with batch downloading.
-        
-        Parameters
-        ----------
-        batch_days : int
-            Number of days per batch. Downloads are performed in batches
-            to manage memory and handle large date ranges efficiently.
-            Raw files are deleted after each batch to free disk space.
-        """
+        tile_lookup = {}
+
+        points = grid.points  # GeoDataFrame
+
+        for _, row in tqdm(points.iterrows(), total=len(points)):
+            grid_id = row["name"]
+            lon = row.geometry.x
+            lat = row.geometry.y
+
+            # lat/lon → MODIS sinusoidal
+            x, y = latlon_to_sinu(lat, lon)
+            h, v = sinu_to_tile(x, y)
+
+            tile_lookup.setdefault((h, v), []).append(
+                (grid_id, lat, lon)
+            )
+
+        with open(cache_path, "wb") as f:
+            pickle.dump(tile_lookup, f)
+
+        return tile_lookup
+
+    def _generate_global_aoi(self, generate_global=False):
+        import pickle
+
+        self.grid = Grid(dist=100)
+
+        if not generate_global:
+            return None
+
+        grid_file = Path(DATA_PATH) / "tile_to_grid_global.pkl"
+
+        if grid_file.exists():
+            with open(grid_file, "rb") as f:
+                return pickle.load(f)
+
+        tile_to_grid = self.build_tile_to_grid_lookup(
+            self.grid,
+            cache_path=grid_file,
+        )
+        return tile_to_grid
+    
+    def run(self, batch_days=30, majortom_grid: bool = False, pixel_size=250):
+        if majortom_grid:
+            from transform import CalculationsMajorTom
+            self.calculations =  CalculationsMajorTom(pixel_size=pixel_size)
+            tile_to_grid = self._generate_global_aoi(generate_global=True)
+        else:
+            tile_to_grid = None
+
         start_date, end_date = self.date_range
         batches = self._split_date_range(start_date, end_date, batch_days=batch_days)
+
         if not self._store_cloud:
             self._cleanup_raw_files()
-        logger.info(f"📦 Processing {len(batches)} batches of ~{batch_days} days each...")
-        
+
+        logger.info(f"📦 Processing {len(batches)} batches of ~{batch_days} days")
+
         for i, (batch_start, batch_end) in enumerate(batches, 1):
-            logger.info(f"Processing batch {i}/{len(batches)}: {batch_start} to {batch_end}")
+            logger.info(f"Batch {i}/{len(batches)}: {batch_start} → {batch_end}")
+
             self._search_and_download(date_range=(batch_start, batch_end))
-            
-            if self.files is None:
-                logger.info(f"✅ No new files to process in batch {i}. Skipping.")
+
+            if not self.files:
+                logger.info("No new files — skipping batch")
                 continue
+
+            if majortom_grid:
+                self.build_or_update_majortom_zarr(
+                    tile_to_grid=tile_to_grid,
+                    patch_size=64,
+                )
             else:
                 self._mosaic_daily()
 
             if not self._store_cloud:
-                self._cleanup_raw_files()  # Free disk space after each batch
+                self._cleanup_raw_files()
             else:
-                # Clear temp_dir for cloud storage
                 shutil.rmtree(self.temp_dir, ignore_errors=True)
                 self.temp_dir.mkdir(parents=True, exist_ok=True)
 
-            logger.info(f"✅ Batch {i}/{len(batches)} completed!")
+        logger.info("✅ All batches completed")
+
+    def _init_or_open_zarr(self, grid_ids, patch_size):
+
+        HALF = patch_size
+        PATCH_SIZE = 2 * HALF
+
+        grid_ids = pd.Index(
+            [str(g) for g in grid_ids],
+            name="grid_id",
+        )
+
+        variables = (
+            self.variable if isinstance(self.variable, (list, tuple))
+            else [self.variable]
+        )
+
+        zarr_path = Path(self.zarr_path)
+
+        if not zarr_path.exists():
+            logger.info("🆕 Creating new MajorTOM Zarr store")
+
+            data_vars = {
+                var: (
+                    ("grid_id", "time", "y", "x"),
+                    np.empty(
+                        (len(grid_ids), 0, PATCH_SIZE, PATCH_SIZE),
+                        dtype=np.float16,
+                    ),
+                )
+                for var in variables
+            }
+
+            ds = xr.Dataset(
+                data_vars=data_vars,
+                coords={
+                    "grid_id": grid_ids,
+                    "time": pd.DatetimeIndex([], name="time"),
+                    "y": np.arange(PATCH_SIZE),
+                    "x": np.arange(PATCH_SIZE),
+                },
+                attrs={
+                    "grid": "MajorTOM",
+                    "projection": "MODIS sinusoidal",
+                    "resolution_m": self._resolution,
+                },
+            )
+
+            encoding = {
+                var: {"chunks": (1, 1, PATCH_SIZE, PATCH_SIZE)}
+                for var in variables
+            }
+
+            ds.to_zarr(zarr_path, mode="w", encoding=encoding)
+            return ds
+
+        logger.info("📦 Opening existing Zarr store")
+        return xr.open_zarr(zarr_path)
+
+    def build_or_update_majortom_zarr(
+        self,
+        tile_to_grid,
+        patch_size=64,
+        ):
+
+        if not tile_to_grid:
+            logger.warning("No MajorTOM tile mapping provided")
+            return
+
+        # collect unique grid_ids
+        grid_ids = sorted({
+            grid_id
+            for cells in tile_to_grid.values()
+            for grid_id, _, _ in cells
+        })
+
+        logger.info(f"📍 Using {len(grid_ids)} MajorTOM grid cells")
+
+        all_times = sorted({self._get_date(fp) for fp in self.files})
+        logger.info(f"📅 Processing {len(all_times)} unique dates")
+
+        ds = self._init_or_open_zarr(
+            grid_ids=grid_ids,
+            patch_size=patch_size,
+        )
+
+        ds, time_index = self._append_times(
+            zarr_path=self.zarr_path,
+            new_times=all_times,
+        )
+
+        if not time_index:
+            logger.info("⏭️ All times already present")
+
+        self._stream_tiles_into_zarr(
+            zarr_path=self.zarr_path,
+            tile_to_grid=tile_to_grid,
+            time_index=time_index,
+            patch_size=patch_size,
+        )
+
+    def _stream_tiles_into_zarr(
+        self,
+        zarr_path,
+        tile_to_grid,
+        time_index,
+        patch_size=64,
+    ):
+
+        HALF = patch_size
+        PATCH_SIZE = 2 * HALF
+
+        variables = (
+            self.variable if isinstance(self.variable, (list, tuple))
+            else [self.variable]
+        )
+
+        ds = xr.open_zarr(zarr_path)
+        grid_index = {gid: i for i, gid in enumerate(ds.grid_id.values)}
+
+        logger.info(f"🧬 Streaming {len(self.files)} MODIS tiles into Zarr")
+
+        for file_path in tqdm(self.files, desc="MODIS tiles"):
+            try:
+                date = self._get_date(file_path)
+                if date not in time_index:
+                    continue
+                t_idx = time_index[date]
+
+                fname = Path(file_path).name
+                m = re.search(r"h(\d+)v(\d+)", fname)
+                if not m:
+                    continue
+                h, v = int(m.group(1)), int(m.group(2))
+
+                cells = tile_to_grid.get((h, v))
+                if not cells:
+                    continue
+
+                hdf = gdal.Open(str(file_path))
+                if hdf is None:
+                    continue
+
+                for var in variables:
+                    var_path = None
+                    for sd_path, sd_name in hdf.GetSubDatasets():
+                        if var in sd_name:
+                            var_path = sd_path
+                            break
+                    if var_path is None:
+                        continue
+
+                    with rasterio.open(var_path) as src:
+                        data = src.read(1).astype(np.float16)
+                        ny, nx = data.shape
+
+                        patches, grid_idxs = [], []
+
+                        for grid_id, lat, lon in cells:
+                            g_idx = grid_index.get(grid_id)
+                            if g_idx is None:
+                                continue
+
+                            x, y = self.calculations.latlon_to_sinu(lat, lon)
+                            px, py = self.calculations.xy_to_pixel(x, y, h, v)
+
+                            if (
+                                py - HALF < 0 or px - HALF < 0 or
+                                py + HALF >= ny or px + HALF >= nx
+                            ):
+                                continue
+
+                            patch = data[
+                                py - HALF : py + HALF,
+                                px - HALF : px + HALF,
+                            ]
+
+                            if patch.shape != (PATCH_SIZE, PATCH_SIZE):
+                                continue
+
+                            patches.append(patch)
+                            grid_idxs.append(g_idx)
+
+                        if not patches:
+                            continue
+
+                        patches = np.stack(patches, axis=0)
+
+                        # SAFE, backend-agnostic write
+                        ds[var].values[
+                            grid_idxs,
+                            t_idx,
+                            :,
+                            :
+                        ] = patches
+
+            except Exception as e:
+                logger.error(f"❌ Error processing {file_path}: {e}", exc_info=True)
+
+        logger.info("✅ MajorTOM Zarr streaming completed")
+
+    def _append_times(self, zarr_path, new_times):
+        # normalize variables
+        variables = (
+            self.variable if isinstance(self.variable, (list, tuple))
+            else [self.variable]
+        )
+
+        ds = xr.open_zarr(zarr_path)
+
+        # normalize time types
+        existing_times = pd.to_datetime(ds.time.values)
+        new_times = pd.to_datetime(new_times)
+
+        times_to_add = [t for t in new_times if t not in set(existing_times)]
+
+        if not times_to_add:
+            logger.info("⏭️ No new times to append")
+            return ds, {}
+
+        logger.info(f"➕ Appending {len(times_to_add)} new timesteps")
+
+        n_grid = len(ds.grid_id)
+        n_time = len(times_to_add)
+        ny = len(ds.y)
+        nx = len(ds.x)
+
+        # build empty data_vars for ALL variables
+        data_vars = {}
+        for var in variables:
+            data_vars[var] = (
+                ("grid_id", "time", "y", "x"),
+                np.full(
+                    (n_grid, n_time, ny, nx),
+                    np.nan,
+                    dtype=np.float16,
+                ),
+            )
+
+        append_ds = xr.Dataset(
+            data_vars=data_vars,
+            coords={
+                "time": times_to_add,
+                "grid_id": ds.grid_id,
+                "y": ds.y,
+                "x": ds.x,
+            },
+        )
+
+        append_ds.to_zarr(
+            zarr_path,
+            append_dim="time",
+        )
+
+        # compute time → index mapping
+        start_idx = len(existing_times)
+        time_index = {
+            t: start_idx + i
+            for i, t in enumerate(times_to_add)
+        }
+
+        return xr.open_zarr(zarr_path), time_index
+
+class StacModisTileProcessor:
+    def __init__(self, 
+                 stac_url, 
+                 collection, 
+                 time_range, 
+                 bands, 
+                 crs="EPSG:6933", 
+                 resolution=1000, 
+                 tile_size=256, 
+                 stride=256, 
+                 max_missing=0.5):
         
-        # self.cleanup()
-        logger.info("✅ All batches completed!")
+        self.stac_url = stac_url
+        self.collection = collection
+        self.time_range = time_range
+        self.bands = bands
+        self.crs = crs
+        self.resolution = resolution
+        self.tile_size = tile_size
+        self.stride = stride
+        self.max_missing = max_missing
+        self.catalog = Client.open(stac_url)
+        self.ds = None
+        self.out_dir = DATA_PATH / "modis"  # Place under data/ per project conventions
+        self.out_dir.mkdir(exist_ok=True)
+
+    def load_data(self):
+        search = self.catalog.search(collections=[self.collection], datetime=self.time_range)
+        items = list(search.get_items())
+        if not items:
+            raise ValueError("No items found for the given search parameters.")
+        
+        self.ds = load(
+            items,
+            bands=self.bands,
+            crs=self.crs,
+            resolution=self.resolution,
+            groupby="solar_day",
+            chunks={"time": 5, "x": 1024, "y": 1024},
+        )
+        logger.info(f"Loaded dataset: {self.ds}")
+
+    def process_tiles(self):
+        if self.ds is None:
+            raise RuntimeError("Data not loaded. Call load_data() first.")
+        
+        x_coords = self.ds.x.values
+        y_coords = self.ds.y.values
+        x_tiles = range(0, len(x_coords) - self.tile_size + 1, self.stride)
+        y_tiles = range(0, len(y_coords) - self.tile_size + 1, self.stride)
+        
+        tile_id = 0
+        for ix in x_tiles:
+            for iy in y_tiles:
+                tile = self.ds.isel(
+                    x=slice(ix, ix + self.tile_size),
+                    y=slice(iy, iy + self.tile_size),
+                )
+                
+                # Skip tiles with too much missing data
+                if tile[self.bands[0]].isnull().mean() > self.max_missing:
+                    continue
+                
+                # Convert to numpy (time, bands, y, x)
+                tile_np = np.stack([tile[band].values for band in self.bands], axis=1)
+                
+                np.save(self.out_dir / f"tile_{tile_id:06d}.npy", tile_np)
+                tile_id += 1
+        logger.info(f"Processed {tile_id} tiles.")
 
 
 if __name__ == "__main__":
@@ -1187,7 +1682,17 @@ if __name__ == "__main__":
                            "sur_refl_b02", 
                            "QC_250m"
             ],
-            "raw_data_type" : "hdf"
+            "raw_data_type" : "hdf",
+            "crs": "EPSG:6933",
+        },
+        "reflectance_1000m": {
+            "short_name": "MOD09GA",
+            "variables": ["sur_refl_b01",
+                          "sur_refl_b02",
+                          "state_1km"
+            ],
+            "raw_data_type" : "hdf",
+            "crs": "EPSG:6933",
         },
         "NDVI_1km_monthly": {
             "short_name": "MOD13A3",
@@ -1195,7 +1700,8 @@ if __name__ == "__main__":
                           "EVI",
                           "SummaryQA"
             ],
-            "raw_data_type" : "hdf"
+            "raw_data_type" : "hdf",
+            "crs": "EPSG:6933",
         },
         "VIIRS_500m_night_monthly": {
             "short_name": "VNP46A3",

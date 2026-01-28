@@ -285,6 +285,65 @@ other_places = [
     'YEMEN'
 ]
 
+
+# -------------------------
+# Function: Download all days for a collection
+# -------------------------
+def download_collection_tiffs(client, 
+                              bucket: str, 
+                              collection_path: str, 
+                              local_dir: str):
+    """
+    Download all available TIFF files for a MinIO collection to a local directory.
+    
+    Args:
+        client: MinIO client
+        bucket (str): MinIO bucket name
+        collection_path (str): path inside the bucket, e.g., "modis/MOD09GQ_061/"
+        local_dir (str): local directory to save TIFFs (will be created if it doesn't exist)
+    
+    Returns:
+        dict: summary of downloaded files organized by tile
+    """
+    import os
+    from pathlib import Path
+    from tqdm import tqdm
+    from utils import get_tiles, get_days_for_tile
+    
+    local_path = Path(local_dir)
+    local_path.mkdir(parents=True, exist_ok=True)
+    
+    # Get all tiles
+    tiles = get_tiles(client, bucket, collection_path)
+    summary = {}
+    
+    for tile in tqdm(tiles, desc="Processing tiles"):
+        tile_dir = local_path / tile
+        tile_dir.mkdir(exist_ok=True)
+        
+        # Get all days for this tile
+        days = get_days_for_tile(client, bucket, collection_path, tile)
+        summary[tile] = []
+        
+        for day in tqdm(days, desc=f"Downloading {tile}", leave=False):
+            object_name = f"{collection_path}{tile}/tiffs/{day}"
+            local_file = tile_dir / day
+            
+            try:
+                client.fget_object(
+                    bucket_name=bucket, 
+                    object_name=object_name, 
+                    file_path=str(local_file)
+                )
+                summary[tile].append(day)
+            except Exception as e:
+                logger.warning(f"Failed to download {object_name}: {e}")
+    
+    logger.info(f"Downloaded TIFFs to {local_dir}")
+    logger.info(f"Summary: {sum(len(days) for days in summary.values())} files across {len(summary)} tiles")
+    
+    return summary
+
 def prepare(dataset:Union[xr.DataArray, xr.Dataset]):
     if "valid_time" in dataset.dims:
         dataset = dataset.rename({"valid_time":"time"})

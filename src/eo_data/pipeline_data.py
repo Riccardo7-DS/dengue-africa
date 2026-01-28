@@ -25,7 +25,7 @@ sys.dont_write_bytecode = True
 
 # Argument parsing
 parser = argparse.ArgumentParser(description="MODIS Downloader")
-parser.add_argument('--product', type=str, default='reflectance_250m', help='MODIS product to download')
+parser.add_argument('--product', type=str, default=os.getenv('product', 'reflectance_250m'), help='MODIS product to download')
 parser.add_argument('--reproj_lib', choices=['rioxarray', 'xesmf'], default=os.getenv('REPROJ_LIB', 'rioxarray'), help='Reprojection library to use')
 parser.add_argument('--reproj_method', choices=['nearest', 'bilinear'], default=os.getenv('REPROJ_METHOD', 'nearest'), help='Reprojection method to use')    
 parser.add_argument('-d', '--delete_temp', action='store_true', default=False, help='Delete temporary files after processing')
@@ -39,7 +39,7 @@ parser.add_argument('--start_date', type=str, default=os.getenv('start_date', "2
 parser.add_argument('--end_date', type=str, default=os.getenv('end_date', "2025-07-05"))
 parser.add_argument('--batch_days', type=int, default=os.getenv("batch_days", 30), help='Number of days per download batch')
 parser.add_argument("--store_cloud", action="store_true", help="Store data in cloud storage")
-
+parser.add_argument("--majortom_grid", action="store_true")
 args = parser.parse_args()
 
 products = {
@@ -53,7 +53,19 @@ products = {
                            "sur_refl_b02", 
                            "QC_250m"
             ],
-            "raw_data_type" : "hdf"
+            "raw_data_type" : "hdf",
+            "crs": "EPSG:6933",
+            "resolution": 250
+        },
+        "reflectance_500m": {
+            "short_name": "MOD09GA",
+            "variables": ["sur_refl_b01",
+                          "sur_refl_b02",
+                          "state_1km"
+            ],
+            "raw_data_type" : "hdf",
+            "crs": "EPSG:6933",
+            "resolution": 500
         },
         "NDVI_1km_monthly": {
             "short_name": "MOD13A3",
@@ -61,7 +73,8 @@ products = {
                           "EVI",
                           "SummaryQA"
             ],
-            "raw_data_type" : "hdf"
+            "raw_data_type" : "hdf",
+            "crs": "EPSG:6933"
         },
         "VIIRS_500m_night_monthly": {
             "short_name": "VNP46A3",
@@ -89,6 +102,7 @@ print("AWS_S3_ENDPOINT:", os.getenv("AWS_S3_ENDPOINT"))
 variables = products[args.product]["variables"]
 short_name = products[args.product]["short_name"]
 raw_data_type = products[args.product]["raw_data_type"]
+resolution = products[args.product].get("resolution", None)
 
 start = args.start_date
 end = args.end_date
@@ -139,6 +153,7 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
             args=args,
             data_dir="/vsis3/mtg-fci-data/modis" if args.store_cloud else Path(DATA_PATH) / "modis",
             short_name=short_name,
+            resolution = resolution,
             bbox= bbox,
             variables=variables,
             date_range=(start, end),
@@ -150,7 +165,7 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
             logger.warning("Deleting temporary directory as per user request.")
             shutil.rmtree( downloader.temp_dir)
 
-        downloader.run(batch_days=batch_days)
+        downloader.run(batch_days=batch_days, majortom_grid = args.majortom_grid)
 
     except Exception as e:
         downloader.cleanup()
