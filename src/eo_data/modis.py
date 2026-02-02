@@ -2,6 +2,7 @@
 import logging
 from pathlib import Path
 from osgeo import gdal
+from requests import patch
 from definitions import DATA_PATH
 import tempfile
 from collections import defaultdict
@@ -28,8 +29,8 @@ from pystac_client import Client
 from odc.stac import load
 import pyproj
 from majortom import Grid
-import shapely.geometry
-import pickle
+import zarr
+
 
 logger = logging.getLogger(__name__)
 
@@ -1315,62 +1316,58 @@ class EarthAccessDownloader:
 
         logger.info("✅ All batches completed")
 
-    def _init_or_open_zarr(self, grid_ids, patch_size):
+    def _init_or_open_sparse_zarr(self, patch_size):
+        PATCH_SIZE = 2 * patch_size
+        zarr_path = Path(self.zarr_path)
 
-        HALF = patch_size
-        PATCH_SIZE = 2 * HALF
+        store = zarr.open_group(zarr_path, mode="a", zarr_format=2)
 
-        grid_ids = pd.Index(
-            [str(g) for g in grid_ids],
-            name="grid_id",
+        from numcodecs import Blosc
+
+        compressor = Blosc(
+            cname="zstd",     # best general-purpose choice
+            clevel=5,         # 1–5 is usually optimal
+            shuffle=Blosc.BITSHUFFLE,
         )
 
         variables = (
-            self.variable if isinstance(self.variable, (list, tuple))
+            self.variable
+            if isinstance(self.variable, (list, tuple))
             else [self.variable]
         )
 
-        zarr_path = Path(self.zarr_path)
+        # --- metadata ---
+        store.attrs.setdefault("grid", "MajorTOM")
+        store.attrs.setdefault("projection", "MODIS sinusoidal")
+        store.attrs.setdefault("resolution_m", self._resolution)
+        store.attrs.setdefault("patch_size", PATCH_SIZE)
 
-        if not zarr_path.exists():
-            logger.info("🆕 Creating new MajorTOM Zarr store")
-
-            data_vars = {
-                var: (
-                    ("grid_id", "time", "y", "x"),
-                    np.empty(
-                        (len(grid_ids), 0, PATCH_SIZE, PATCH_SIZE),
-                        dtype=np.float16,
-                    ),
-                )
-                for var in variables
-            }
-
-            ds = xr.Dataset(
-                data_vars=data_vars,
-                coords={
-                    "grid_id": grid_ids,
-                    "time": pd.DatetimeIndex([], name="time"),
-                    "y": np.arange(PATCH_SIZE),
-                    "x": np.arange(PATCH_SIZE),
-                },
-                attrs={
-                    "grid": "MajorTOM",
-                    "projection": "MODIS sinusoidal",
-                    "resolution_m": self._resolution,
-                },
+        # --- index arrays ---
+        if "grid_id" not in store:
+            store.create(
+                "grid_id",
+                shape=(0,),
+                chunks=(1024,),
+                dtype="int32",
             )
 
-            encoding = {
-                var: {"chunks": (1, 1, PATCH_SIZE, PATCH_SIZE)}
-                for var in variables
-            }
+        if "time" not in store:
+            store.create(
+                "time",
+                shape=(0,),
+                chunks=(1024,),
+                dtype="datetime64[D]",
+            )
 
-            ds.to_zarr(zarr_path, mode="w", encoding=encoding)
-            return ds
+        # --- variable arrays ---
+        patches_grp = store.require_group("patches")
 
-        logger.info("📦 Opening existing Zarr store")
-        return xr.open_zarr(zarr_path)
+        # create sub-groups for variables only once
+        for var in variables:
+            if var not in patches_grp:
+                patches_grp.require_group(var)
+
+        return store, patches_grp, compressor
 
     def build_or_update_majortom_zarr(
         self,
@@ -1382,66 +1379,37 @@ class EarthAccessDownloader:
             logger.warning("No MajorTOM tile mapping provided")
             return
 
-        # collect unique grid_ids
-        grid_ids = sorted({
-            grid_id
-            for cells in tile_to_grid.values()
-            for grid_id, _, _ in cells
-        })
-
-        logger.info(f"📍 Using {len(grid_ids)} MajorTOM grid cells")
-
-        all_times = sorted({self._get_date(fp) for fp in self.files})
-        logger.info(f"📅 Processing {len(all_times)} unique dates")
-
-        ds = self._init_or_open_zarr(
-            grid_ids=grid_ids,
-            patch_size=patch_size,
-        )
-
-        ds, time_index = self._append_times(
-            zarr_path=self.zarr_path,
-            new_times=all_times,
-        )
-
-        if not time_index:
-            logger.info("⏭️ All times already present")
-
-        self._stream_tiles_into_zarr(
-            zarr_path=self.zarr_path,
+        store, patches_grp, compressor = self._init_or_open_sparse_zarr(patch_size)
+        self._stream_tiles_into_sparse_zarr(
+            patches_grp=patches_grp,
+            compressor=compressor,
             tile_to_grid=tile_to_grid,
-            time_index=time_index,
             patch_size=patch_size,
         )
 
-    def _stream_tiles_into_zarr(
+    def _stream_tiles_into_sparse_zarr(
         self,
-        zarr_path,
+        patches_grp,
+        compressor,
         tile_to_grid,
-        time_index,
         patch_size=64,
     ):
-
         HALF = patch_size
         PATCH_SIZE = 2 * HALF
 
         variables = (
-            self.variable if isinstance(self.variable, (list, tuple))
+            self.variable
+            if isinstance(self.variable, (list, tuple))
             else [self.variable]
         )
 
-        ds = xr.open_zarr(zarr_path)
-        grid_index = {gid: i for i, gid in enumerate(ds.grid_id.values)}
-
-        logger.info(f"🧬 Streaming {len(self.files)} MODIS tiles into Zarr")
+        logger.info(f"🧬 Streaming {len(self.files)} MODIS tiles into sparse Zarr")
 
         for file_path in tqdm(self.files, desc="MODIS tiles"):
             try:
-                date = self._get_date(file_path)
-                if date not in time_index:
-                    continue
-                t_idx = time_index[date]
+                date_str = str(np.datetime64(self._get_date(file_path), "D"))
 
+                # --- parse tile indices from filename ---
                 fname = Path(file_path).name
                 m = re.search(r"h(\d+)v(\d+)", fname)
                 if not m:
@@ -1452,129 +1420,284 @@ class EarthAccessDownloader:
                 if not cells:
                     continue
 
+                # --- open HDF and subdatasets ---
                 hdf = gdal.Open(str(file_path))
                 if hdf is None:
                     continue
+                subdatasets = hdf.GetSubDatasets()
 
                 for var in variables:
+                    # --- find subdataset for this variable ---
                     var_path = None
-                    for sd_path, sd_name in hdf.GetSubDatasets():
-                        if var in sd_name:
+                    for sd_path, sd_desc in subdatasets:
+                        if var in sd_desc:
                             var_path = sd_path
                             break
                     if var_path is None:
                         continue
 
-                    with rasterio.open(var_path) as src:
-                        data = src.read(1).astype(np.float16)
-                        ny, nx = data.shape
+                    gdal_ds = gdal.Open(var_path)
+                    if gdal_ds is None:
+                        continue
 
-                        patches, grid_idxs = [], []
+                    data = gdal_ds.ReadAsArray().astype(np.float32)
 
-                        for grid_id, lat, lon in cells:
-                            g_idx = grid_index.get(grid_id)
-                            if g_idx is None:
-                                continue
+                    nodata = gdal_ds.GetRasterBand(1).GetNoDataValue()
+                    if nodata is not None:
+                        data[data == nodata] = np.nan
 
-                            x, y = self.calculations.latlon_to_sinu(lat, lon)
-                            px, py = self.calculations.xy_to_pixel(x, y, h, v)
+                    scale = gdal_ds.GetRasterBand(1).GetScale() or 1.0
+                    offset = gdal_ds.GetRasterBand(1).GetOffset() or 0.0
+                    data = data * scale + offset
 
-                            if (
-                                py - HALF < 0 or px - HALF < 0 or
-                                py + HALF >= ny or px + HALF >= nx
-                            ):
-                                continue
+                    ny, nx = data.shape
+                    gdal_ds = None  # close dataset
 
-                            patch = data[
-                                py - HALF : py + HALF,
-                                px - HALF : px + HALF,
-                            ]
+                    # --- prepare variable/date groups ---
+                    var_grp = patches_grp[var]
+                    date_grp = var_grp.require_group(date_str)
 
-                            if patch.shape != (PATCH_SIZE, PATCH_SIZE):
-                                continue
-
-                            patches.append(patch)
-                            grid_idxs.append(g_idx)
-
-                        if not patches:
+                    for grid_id, lat, lon in cells:
+                        x, y = self.calculations.latlon_to_sinu(lat, lon)
+                        tile_h, tile_v = self.calculations.sinu_to_tile(x, y)
+                        if tile_h != h or tile_v != v:
                             continue
 
-                        patches = np.stack(patches, axis=0)
+                        px, py = self.calculations.xy_to_pixel(x, y, h, v)
+                        if py - HALF < 0 or px - HALF < 0 or py + HALF > ny or px + HALF > nx:
+                            continue
 
-                        # SAFE, backend-agnostic write
-                        ds[var].values[
-                            grid_idxs,
-                            t_idx,
-                            :,
-                            :
-                        ] = patches
+                        patch = data[py - HALF : py + HALF, px - HALF : px + HALF]
+                        if patch.shape != (PATCH_SIZE, PATCH_SIZE):
+                            continue
+
+                        null_fraction = np.isnan(patch).mean()
+                        if null_fraction > 0.1:
+                            continue
+
+                        # --- ensure patch is contiguous float16 ---
+                        patch = np.ascontiguousarray(patch, dtype=np.float16)
+
+                        # --- create array or overwrite if it exists ---
+                        if str(grid_id) in date_grp:
+                            arr = date_grp[str(grid_id)]
+                            arr[:] = patch
+                        else:
+                            arr = date_grp.create(
+                                name=str(grid_id),
+                                shape=patch.shape,
+                                chunks=patch.shape,
+                                dtype="float16",
+                                compressor=compressor,
+                            )
+                            arr[:] = patch
 
             except Exception as e:
                 logger.error(f"❌ Error processing {file_path}: {e}", exc_info=True)
 
-        logger.info("✅ MajorTOM Zarr streaming completed")
+        logger.info("✅ Sparse MajorTOM streaming completed")
 
-    def _append_times(self, zarr_path, new_times):
-        # normalize variables
-        variables = (
-            self.variable if isinstance(self.variable, (list, tuple))
-            else [self.variable]
-        )
+    # def _stream_tiles_into_zarr(
+    #     self,
+    #     zarr_path,
+    #     tile_to_grid,
+    #     time_index=None,
+    #     patch_size=64,
+    # ):
+    #     """
+    #     Stream MODIS tiles into a MajorTOM-indexed Zarr dataset.
+    #     """
 
-        ds = xr.open_zarr(zarr_path)
+    #     HALF = patch_size
+    #     PATCH_SIZE = 2 * HALF
 
-        # normalize time types
-        existing_times = pd.to_datetime(ds.time.values)
-        new_times = pd.to_datetime(new_times)
+    #     variables = (
+    #         self.variable
+    #         if isinstance(self.variable, (list, tuple))
+    #         else [self.variable]
+    #     )
 
-        times_to_add = [t for t in new_times if t not in set(existing_times)]
+    #     zarr_ds = xr.open_zarr(zarr_path)
+    #     grid_index = {gid: i for i, gid in enumerate(zarr_ds.grid_id.values)}
 
-        if not times_to_add:
-            logger.info("⏭️ No new times to append")
-            return ds, {}
+    #     logger.info(f"🧬 Streaming {len(self.files)} MODIS tiles into Zarr")
 
-        logger.info(f"➕ Appending {len(times_to_add)} new timesteps")
+    #     for file_path in tqdm(self.files, desc="MODIS tiles"):
+    #         try:
+    #             # --- date index ---
+    #             date = self._get_date(file_path)
+    #             if time_index is not None:
+    #                 t_idx = time_index.get(date)
+    #             else:
+    #                 t_idx_arr = np.where(
+    #                     zarr_ds.time.values == np.datetime64(date)
+    #                 )[0]
+    #                 if len(t_idx_arr) == 0:
+    #                     logger.debug(f"Date {date} not in Zarr, skipping")
+    #                     continue
+    #                 t_idx = int(t_idx_arr[0])
 
-        n_grid = len(ds.grid_id)
-        n_time = len(times_to_add)
-        ny = len(ds.y)
-        nx = len(ds.x)
+    #             # --- tile indices ---
+    #             fname = Path(file_path).name
+    #             m = re.search(r"h(\d+)v(\d+)", fname)
+    #             if not m:
+    #                 logger.warning(f"Cannot parse tile h,v from {fname}")
+    #                 continue
+    #             h, v = int(m.group(1)), int(m.group(2))
 
-        # build empty data_vars for ALL variables
-        data_vars = {}
-        for var in variables:
-            data_vars[var] = (
-                ("grid_id", "time", "y", "x"),
-                np.full(
-                    (n_grid, n_time, ny, nx),
-                    np.nan,
-                    dtype=np.float16,
-                ),
-            )
+    #             # --- grid cells in this tile ---
+    #             cells = tile_to_grid.get((h, v))
+    #             if not cells:
+    #                 continue
 
-        append_ds = xr.Dataset(
-            data_vars=data_vars,
-            coords={
-                "time": times_to_add,
-                "grid_id": ds.grid_id,
-                "y": ds.y,
-                "x": ds.x,
-            },
-        )
+    #             # --- open HDF container with GDAL ---
+    #             hdf = gdal.Open(str(file_path))
+    #             if hdf is None:
+    #                 logger.warning(f"Cannot open HDF file {file_path}")
+    #                 continue
 
-        append_ds.to_zarr(
-            zarr_path,
-            append_dim="time",
-        )
+    #             subdatasets = hdf.GetSubDatasets()
 
-        # compute time → index mapping
-        start_idx = len(existing_times)
-        time_index = {
-            t: start_idx + i
-            for i, t in enumerate(times_to_add)
-        }
+    #             for var in variables:
+    #                 var_path = None
 
-        return xr.open_zarr(zarr_path), time_index
+    #                 # --- find exact subdataset ---
+    #                 for sd_path, sd_desc in subdatasets:
+    #                     if var in sd_desc:
+    #                         var_path = sd_path
+    #                         break
+
+    #                 if var_path is None:
+    #                     logger.warning(
+    #                         f"Variable '{var}' not found in {file_path}"
+    #                     )
+    #                     continue
+
+    #                 gdal_ds = gdal.Open(var_path)
+    #                 if gdal_ds is None:
+    #                     raise RuntimeError(f"Cannot open subdataset {var_path}")
+
+    #                 data = gdal_ds.ReadAsArray().astype(np.float16)
+
+    #                 # --- handle nodata ---
+    #                 nodata = gdal_ds.GetRasterBand(1).GetNoDataValue()
+    #                 if nodata is not None:
+    #                     data[data == nodata] = np.nan
+
+    #                 # --- apply MODIS scaling ---
+    #                 scale = gdal_ds.GetRasterBand(1).GetScale()
+    #                 offset = gdal_ds.GetRasterBand(1).GetOffset()
+
+    #                 if scale is None:
+    #                     scale = 1.0
+    #                 if offset is None:
+    #                     offset = 0.0
+
+    #                 data = data * scale + offset
+
+    #                 ny, nx = data.shape
+    #                 gdal_ds = None  # close dataset
+
+    #                 patches = []
+    #                 grid_idxs = []
+
+    #                 for grid_id, lat, lon in cells:
+    #                     g_idx = grid_index.get(grid_id)
+    #                     if g_idx is None:
+    #                         continue
+    #                     x, y = self.calculations.latlon_to_sinu(lat, lon)
+    #                     tile_h, tile_v = self.calculations.sinu_to_tile(x, y)
+    #                     if tile_h != h or tile_v != v:
+    #                         continue
+    #                     px, py = self.calculations.xy_to_pixel(x, y, h, v)
+    #                     if (
+    #                         py - HALF < 0 or px - HALF < 0
+    #                         or py + HALF >= ny
+    #                         or px + HALF >= nx
+    #                     ):
+    #                         continue
+    #                     patch = data[
+    #                         py - HALF : py + HALF,
+    #                         px - HALF : px + HALF,
+    #                     ]
+    #                     if patch.shape != (PATCH_SIZE, PATCH_SIZE):
+    #                         continue
+                        
+    #                         # --- check null fraction ---
+    #                     null_fraction = np.isnan(patch).sum() / patch.size
+    #                     if null_fraction > 0.1:  # skip if more than 10% nulls
+    #                         logger.debug(
+    #                             f"Skipping patch for grid {grid_id} in {var} ({null_fraction*100:.1f}% nulls)"
+    #                         )
+    #                         continue
+                        
+    #                     patches.append(patch)
+    #                     grid_idxs.append(g_idx)
+                    
+    #                 if not patches:
+    #                     continue
+
+    #                 patches = np.stack(patches, axis=0)
+
+    #                 # --- write to Zarr ---
+    #                 zarr_ds[var].data[grid_idxs, t_idx, :, :] = patches
+    #                 zarr_ds
+    #         except Exception as e:
+    #             logger.error(
+    #                 f"❌ Error processing {file_path}: {e}",
+    #                 exc_info=True,
+    #             )
+
+    #     logger.info("✅ MajorTOM Zarr streaming completed")
+
+    # def _append_times(self, zarr_path, new_times):
+    #     import pandas as pd
+    #     import xarray as xr
+    #     import numpy as np
+    #     variables = (
+    #         self.variable if isinstance(self.variable, (list, tuple))
+    #         else [self.variable]
+    #     )
+    #     ds = xr.open_zarr(zarr_path)
+    #     existing_times = pd.to_datetime(ds.time.values)
+    #     new_times = pd.to_datetime(new_times)
+    #     # --- times missing from Zarr ---
+    #     times_to_add = [t for t in new_times if t not in set(existing_times)]
+    #     if times_to_add:
+    #         logger.info(f"➕ Appending {len(times_to_add)} new timesteps")
+    #         n_grid = len(ds.grid_id)
+    #         ny, nx = len(ds.y), len(ds.x)
+    #         data_vars = {
+    #             var: (
+    #                 ("grid_id", "time", "y", "x"),
+    #                 np.full(
+    #                     (n_grid, len(times_to_add), ny, nx),
+    #                     np.nan,
+    #                     dtype=np.float32,
+    #                 ),
+    #             )
+    #             for var in variables
+    #         }
+    #         append_ds = xr.Dataset(
+    #             data_vars=data_vars,
+    #             coords={
+    #                 "time": times_to_add,
+    #                 "grid_id": ds.grid_id,
+    #                 "y": ds.y,
+    #                 "x": ds.x,
+    #             },
+    #         )
+    #         append_ds.to_zarr(zarr_path, append_dim="time")
+    #         ds = xr.open_zarr(zarr_path)
+    #     else:
+    #         logger.info("⏭️ No new times to append")
+    #     # 🔑 ALWAYS build full mapping
+    #     full_time_index = {
+    #         pd.Timestamp(t): i
+    #         for i, t in enumerate(pd.to_datetime(ds.time.values))
+    #     }
+    #     return ds, full_time_index
+
 
 class StacModisTileProcessor:
     def __init__(self, 

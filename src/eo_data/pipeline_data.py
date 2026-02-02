@@ -11,7 +11,8 @@ from utils import init_logging
 import sys
 from tqdm import tqdm
 import numpy as np
-
+from dask.diagnostics import ProgressBar
+t = ProgressBar().register()
 
 logger = init_logging(log_file="modis_downloader.log", verbose=False)
 
