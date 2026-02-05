@@ -41,7 +41,11 @@ parser.add_argument('--end_date', type=str, default=os.getenv('end_date', "2025-
 parser.add_argument('--batch_days', type=int, default=os.getenv("batch_days", 30), help='Number of days per download batch')
 parser.add_argument("--store_cloud", action="store_true", help="Store data in cloud storage")
 parser.add_argument("--majortom_grid", action="store_true")
+parser.add_argument("--output_format", type=str, choices=["tiff", "zarr"], default=os.getenv("output_format", "zarr"), help="Output format for downloaded data")
 args = parser.parse_args()
+
+if args.majortom_grid and args.output_format != "zarr":
+    raise ValueError("MajorTom grid is only supported with Zarr output format.")
 
 products = {
         "LST": {
@@ -56,7 +60,8 @@ products = {
             ],
             "raw_data_type" : "hdf",
             "crs": "EPSG:6933",
-            "resolution": 250
+            "resolution": 250,
+            "patch_size": 256
         },
         "reflectance_500m": {
             "short_name": "MOD09GA",
@@ -66,7 +71,8 @@ products = {
             ],
             "raw_data_type" : "hdf",
             "crs": "EPSG:6933",
-            "resolution": 500
+            "resolution": 500,
+            "patch_size": 128
         },
         "NDVI_1km_monthly": {
             "short_name": "MOD13A3",
@@ -104,6 +110,9 @@ variables = products[args.product]["variables"]
 short_name = products[args.product]["short_name"]
 raw_data_type = products[args.product]["raw_data_type"]
 resolution = products[args.product].get("resolution", None)
+patch_size = products[args.product].get("patch_size", 256) 
+
+logger.info(f"Starting download for product: {args.product} ({short_name}) with variables: {variables}, patch_size: {patch_size}")
 
 start = args.start_date
 end = args.end_date
@@ -114,8 +123,8 @@ bboxes = generate_bboxes_fixed(
         lon_max=args.lon_max,
          lat_min=args.lat_min, 
         lat_max=args.lat_max,
-        n_lon=args.n_lon, n_lat=args.n_lat,
-        # n_pixels = 256
+        n_lon=args.n_lon, 
+        n_lat=args.n_lat,
 )
 
 logger.info(f"Generated {len(bboxes)} total tiles for the area of interest.")
@@ -159,14 +168,14 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
             variables=variables,
             date_range=(start, end),
             collection_name=f"{short_name}_061",
-            output_format="tiff",
+            output_format=args.output_format,
             raw_data_type=raw_data_type
     )   
         if args.delete_temp and downloader.temp_dir.exists():
             logger.warning("Deleting temporary directory as per user request.")
             shutil.rmtree( downloader.temp_dir)
 
-        downloader.run(batch_days=batch_days, majortom_grid = args.majortom_grid)
+        downloader.run(batch_days=batch_days, majortom_grid = args.majortom_grid, patch_size=patch_size, pixel_size=resolution)
 
     except Exception as e:
         downloader.cleanup()

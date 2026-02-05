@@ -12,7 +12,7 @@ while true; do
         --start_date "2025-06-01" \
         --end_date "2025-07-30" \
         --batch_days 5 \
-        --store_cloud 
+        --majortom_grid 
 
     exit_code=$?
 

@@ -30,7 +30,16 @@ from odc.stac import load
 import pyproj
 from majortom import Grid
 import zarr
+import json
+import re 
+import time 
+import errno
 
+REFL_BANDS = {
+    "sur_refl_b01", "sur_refl_b02", "sur_refl_b03",
+    "sur_refl_b04", "sur_refl_b05", "sur_refl_b06", "sur_refl_b07"}
+
+QC_BANDS = {"state_1km", "qc_500m", "qc_250m"}
 
 logger = logging.getLogger(__name__)
 
@@ -291,7 +300,6 @@ class EarthAccessDownloader:
         data_dir=None,
         collection_name="lst_061",
         crs="EPSG:6933",
-        zarr_path=None,
         output_format:Literal["tiff","zarr"]="zarr",
         raw_data_type=".hdf"
     ):  
@@ -372,6 +380,77 @@ class EarthAccessDownloader:
             raise NotImplementedError("Zarr output not implemented for cloud storage.")
         
         self._minio_client = minio_client() if store_cloud else None
+        
+        if store_cloud:
+            self.minio_bucket = os.getenv('MINIO_BUCKET')
+            self.minio_prefix = os.getenv('MINIO_PREFIX', 'modis')  # default if not set
+
+    def _zarr_index_path(self):
+        """Return Path to a small JSON index storing processed dates (local only)."""
+        if self._store_cloud:
+            return None
+        try:
+            return self.zarr_path.with_name(f"{self.zarr_path.name}.index.json")
+        except Exception:
+            return None
+
+    def _load_zarr_index(self):
+        p = self._zarr_index_path()
+        if not p:
+            return set()
+        try:
+            if p.exists():
+                with open(p, "r") as fh:
+                    data = json.load(fh)
+                # Handle both old (simple dict) and new (dict with metadata) formats
+                if isinstance(data, dict):
+                    return set(data.get("dates", []))
+                elif isinstance(data, list):
+                    # Backward compat: old format was just dates list
+                    return set(data)
+        except Exception:
+            logger.debug(f"Failed to read zarr index {p}")
+        return set()
+
+    def _save_zarr_index(self, dates_set):
+        p = self._zarr_index_path()
+        if not p:
+            return
+        tmp = p.with_suffix(".tmp")
+        try:
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            # Include bbox and other metadata in index
+            index_data = {
+                "dates": sorted(list(dates_set)),
+                "bbox": list(self.bbox) if hasattr(self, "bbox") and self.bbox else None,
+                "collection": self.collection_name,
+                "product": self.short_name,
+            }
+            with open(tmp, "w") as fh:
+                json.dump(index_data, fh)
+            tmp.replace(p)
+        except Exception as e:
+            logger.debug(f"Failed to write zarr index {p}: {e}")
+
+    def _update_zarr_index(self, dates_set):
+        """Merge new dates into existing index and persist."""
+        if self._store_cloud:
+            return
+        existing = self._load_zarr_index()
+        merged = set(existing) | set(dates_set)
+        self._save_zarr_index(merged)
+        
+    def _check_disk_space(self, min_gb=1, path=None):
+        """Return True if free disk space >= min_gb on the filesystem containing `path`.
+        If `path` is None, use DATA_PATH.
+        """
+        try:
+            target = Path(path) if path else Path(DATA_PATH)
+            stat = shutil.disk_usage(str(target))
+            free_gb = stat.free / (1024 ** 3)
+            return free_gb >= float(min_gb)
+        except Exception:
+            return True
         
     def _check_reproj_lib(self, reproj_lib):
         valid_libs = ["rioxarray", "xesmf"]
@@ -465,11 +544,19 @@ class EarthAccessDownloader:
             date_range = self.date_range
     
         start_date, end_date = date_range
-    
-        processed_dates = self._get_processed_tiffs()
 
-        done_dates_range = [d for d in date_range if d in processed_dates]
-        
+        # Build list of all dates in the requested range (YYYY-MM-DD)
+        d = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        all_dates = []
+        while d <= end_dt:
+            all_dates.append(d.strftime("%Y-%m-%d"))
+            d += timedelta(days=1)
+
+        # Ask the fast path to probe only these dates (MajorTOM stores are fast this way)
+        processed_dates = self._get_processed_dates(dates_to_check=all_dates)
+
+        done_dates_range = [d for d in all_dates if d in processed_dates]
         if len(done_dates_range) > 0:
             logger.info(f"Skipping {len(done_dates_range)} already processed dates.")
     
@@ -662,47 +749,118 @@ class EarthAccessDownloader:
 
         return ds_regridded
     
-    def _get_processed_tiffs(self):
+    def _get_processed_dates(self, dates_to_check=None):
         """
-        Get all processed TIFF dates from local or cloud storage.
-        Works with both local filesystem and MinIO/S3 storage via /vsis3/.
+        Get processed dates. If `dates_to_check` is provided (iterable of YYYY-MM-DD strings),
+        probe only those dates in the Zarr store (fast for MajorTOM sparse stores).
+        Falls back to scanning available dates and persists a small JSON index for local stores.
         """
         processed_dates = set()
 
-        if self._store_cloud:
-            # GDAL /vsis3/ path
-            tif_out_dir = f"{self.granule_dir.rsplit('/', 1)[0]}/tiffs"
-            files = gdal.ReadDir(tif_out_dir)
-            if files:
-                for filename in files:
-                    if filename.endswith(".tif"):
-                        parts = filename.split("_")
-                        if len(parts) >= 2:
-                            date_str = parts[-1].replace(".tif", "")
-                            try:
-                                date_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
-                                processed_dates.add(date_fmt)
-                            except ValueError:
-                                logger.debug(f"Skipping S3 file with non-matching date: {filename}")
-            logger.info(f"Found {len(processed_dates)} processed dates in MinIO: {tif_out_dir}")
+        if self._output_format.lower() == "zarr":
+            zarr_path = self.zarr_path
+            if self._store_cloud:
+                zarr_path = f"/vsis3/{self.minio_bucket}/{self.minio_prefix}/{self.collection_name}_dataset.zarr"
 
-        else:
-            # Local filesystem
-            tif_out_dir = Path(self.granule_dir).parent / "tiffs"
-            if tif_out_dir.exists():
-                for tif_file in tif_out_dir.glob("*.tif"):
-                    date_str = tif_file.stem.split('_')[-1]
+            try:
+                # Use index if up-to-date
+                index_path = self._zarr_index_path()
+                if index_path and index_path.exists() and not self._store_cloud:
                     try:
-                        date_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
-                        processed_dates.add(date_fmt)
-                    except ValueError:
-                        logger.debug(f"Skipping local file with non-matching date: {tif_file.name}")
-            logger.info(f"Found {len(processed_dates)} processed dates locally: {tif_out_dir}")
+                        z_arr_path = Path(zarr_path)
+                        z_mtime = z_arr_path.stat().st_mtime if z_arr_path.exists() else 0
+                        if index_path.stat().st_mtime >= z_mtime:
+                            cached = self._load_zarr_index()
+                            if dates_to_check:
+                                processed_dates.update(d for d in dates_to_check if d in cached)
+                                if set(dates_to_check).issubset(cached):
+                                    logger.debug("Using up-to-date zarr index for processed dates")
+                                    return processed_dates
+                            else:
+                                processed_dates.update(cached)
+                                logger.info(f"Loaded {len(processed_dates)} processed dates from index: {index_path}")
+                                return processed_dates
+                    except Exception:
+                        logger.debug("Failed to use zarr index, will probe store")
+
+                # Open Zarr using consolidated metadata if available
+                store = None
+                try:
+                    if (not self._store_cloud) and (Path(zarr_path) / ".zmetadata").exists():
+                        store = zarr.open_consolidated(str(zarr_path))
+                    else:
+                        store = zarr.open_group(str(zarr_path), mode="r")
+                except Exception:
+                    store = None
+
+                if store is not None and "patches" in store:
+                    # MajorTOM sparse store: probe only the requested dates (fast)
+                    patches_grp = store["patches"]
+                    first_var = next(iter(patches_grp), None)
+                    if first_var:
+                        var_grp = patches_grp[first_var]
+                        if dates_to_check:
+                            for d in dates_to_check:
+                                if d in var_grp:
+                                    processed_dates.add(d)
+                        else:
+                            processed_dates.update(list(var_grp.group_keys()))
+                    # Save index for faster future lookups
+                    if not self._store_cloud and processed_dates:
+                        self._update_zarr_index(processed_dates)
+                else:
+                    # Regular consolidated Zarr with a time dimension — use xarray
+                    try:
+                        ds = xr.open_zarr(str(zarr_path))
+                        if "time" in ds.dims:
+                            dates = pd.to_datetime(ds.time.values).strftime("%Y-%m-%d")
+                            if dates_to_check:
+                                processed_dates.update(d for d in dates if d in dates_to_check)
+                            else:
+                                processed_dates.update(dates)
+                            if not self._store_cloud and processed_dates:
+                                self._update_zarr_index(processed_dates)
+                    except Exception:
+                        logger.info(f"No existing Zarr file found at {zarr_path}, starting fresh.")
+            except Exception:
+                logger.info(f"No existing Zarr file found at {zarr_path}, starting fresh.")
+        
+        else:
+            # Original TIFF logic
+            if self._store_cloud:
+                # GDAL /vsis3/ path
+                tif_out_dir = f"{self.granule_dir.rsplit('/', 1)[0]}/tiffs"
+                files = gdal.ReadDir(tif_out_dir)
+                if files:
+                    for filename in files:
+                        if filename.endswith(".tif"):
+                            parts = filename.split("_")
+                            if len(parts) >= 2:
+                                date_str = parts[-1].replace(".tif", "")
+                                try:
+                                    date_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+                                    processed_dates.add(date_fmt)
+                                except ValueError:
+                                    logger.debug(f"Skipping S3 file with non-matching date: {filename}")
+                logger.info(f"Found {len(processed_dates)} processed dates in MinIO: {tif_out_dir}")
+
+            else:
+                # Local filesystem
+                tif_out_dir = Path(self.granule_dir).parent / "tiffs"
+                if tif_out_dir.exists():
+                    for tif_file in tif_out_dir.glob("*.tif"):
+                        date_str = tif_file.stem.split('_')[-1]
+                        try:
+                            date_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+                            processed_dates.add(date_fmt)
+                        except ValueError:
+                            logger.debug(f"Skipping local file with non-matching date: {tif_file.name}")
+                logger.info(f"Found {len(processed_dates)} processed dates locally: {tif_out_dir}")
 
         return processed_dates
     
     def _exclude_processed_files(self, files):
-        processed_dates = self._get_processed_tiffs()
+        processed_dates = self._get_processed_dates()
 
         # Step 2: Filter self.files
         filtered_files = []
@@ -1139,13 +1297,15 @@ class EarthAccessDownloader:
     def _export_to_zarr(self, ds):
         """
         Export dataset to Zarr format, either locally or to MinIO.
+        Handles both creating new stores and appending to existing ones.
+        Logs bbox and collection metadata.
         """
         if self._store_cloud:
             zarr_path = f"/vsis3/{self.minio_bucket}/{self.minio_prefix}/{self.collection_name}_dataset.zarr"
         else:
             zarr_path = self.zarr_path
         
-        logger.info(f"💾 Appending data to {zarr_path}")
+        logger.info(f"💾 Exporting data to {zarr_path} for bbox {self.bbox if hasattr(self, 'bbox') else 'N/A'}")
         
         if self._store_cloud:
             # For cloud storage, we need to check existence differently
@@ -1157,10 +1317,52 @@ class EarthAccessDownloader:
                 # Create new
                 ds.to_zarr(zarr_path, mode="w")
         else:
-            if not Path(zarr_path).exists():
-                ds.to_zarr(zarr_path, mode="w")
-            else:
-                ds.to_zarr(zarr_path, mode="a", append_dim="time")
+            # Ensure some free space before attempting write
+            if not self._check_disk_space(min_gb=1):
+                logger.warning("Low disk space before exporting Zarr — attempting cleanup")
+                self._cleanup_raw_files()
+
+            # Determine if store already exists to choose the right mode
+            zarr_exists = Path(zarr_path).exists()
+            target_mode = "a" if zarr_exists else "w"
+            logger.debug(f"Zarr store at {zarr_path} exists={zarr_exists}, using mode='{target_mode}'")
+
+            # Retry on ENOSPC a few times after attempting cleanup
+            for attempt in range(3):
+                try:
+                    if zarr_exists:
+                        ds.to_zarr(zarr_path, mode="a", append_dim="time")
+                    else:
+                        ds.to_zarr(zarr_path, mode="w")
+                    break
+                except OSError as e:
+                    if getattr(e, 'errno', None) == errno.ENOSPC:
+                        logger.warning(f"ENOSPC encountered while writing zarr (attempt {attempt+1})")
+                        self._cleanup_raw_files()
+                        try:
+                            shutil.rmtree(self.temp_dir, ignore_errors=True)
+                            self.temp_dir.mkdir(parents=True, exist_ok=True)
+                        except Exception:
+                            logger.debug("Failed to recreate temp_dir after cleanup")
+                        time.sleep(2)
+                        continue
+                    else:
+                        raise
+
+            # Consolidate metadata for faster opens next time
+            try:
+                zarr.consolidate_metadata(str(zarr_path))
+            except Exception:
+                logger.debug("Failed to consolidate zarr metadata; continuing")
+
+            # Update small index of dates for fast lookups
+            try:
+                if hasattr(ds, "time") and not self._store_cloud:
+                    dates = pd.to_datetime(ds.time.values).strftime("%Y-%m-%d")
+                    self._update_zarr_index(dates)
+                    logger.debug(f"Updated zarr index with {len(dates)} new dates for bbox {self.bbox if hasattr(self, 'bbox') else 'N/A'}")
+            except Exception:
+                logger.debug("Failed to update zarr index after export")
 
     # ------------------------
     # Cleanup
@@ -1231,8 +1433,8 @@ class EarthAccessDownloader:
         """
         import pickle
         from tqdm import tqdm
-        from transform.majortom import latlon_to_sinu, sinu_to_tile
-
+        from transform.majortom import CalculationsMajorTom
+        calculations = CalculationsMajorTom()
         tile_lookup = {}
 
         points = grid.points  # GeoDataFrame
@@ -1243,8 +1445,8 @@ class EarthAccessDownloader:
             lat = row.geometry.y
 
             # lat/lon → MODIS sinusoidal
-            x, y = latlon_to_sinu(lat, lon)
-            h, v = sinu_to_tile(x, y)
+            x, y = calculations.latlon_to_sinu(lat, lon)
+            h, v = calculations.sinu_to_tile(x, y)
 
             tile_lookup.setdefault((h, v), []).append(
                 (grid_id, lat, lon)
@@ -1255,17 +1457,43 @@ class EarthAccessDownloader:
 
         return tile_lookup
 
-    def _generate_global_aoi(self, generate_global=False):
+    def _generate_global_aoi(self, 
+            pixel_resolution_m:int, 
+            patch_size_px:int, 
+            target_grid_km:bool=None, 
+            generate_global:bool=False
+        ):
+        
         import pickle
 
-        self.grid = Grid(dist=100)
+        L = patch_size_px * pixel_resolution_m  # patch size in meters
+
+        if target_grid_km is None:
+            D = L
+        else:
+            D = target_grid_km * 1_000
+
+        overlap_m = max(0, L - D)
+        gap_m = max(0, D - L)
+
+        calculations = {
+            "patch_size_km": L / 1_000,
+            "grid_spacing_km": D / 1_000,
+            "overlap_km": overlap_m / 1_000,
+            "gap_km": gap_m / 1_000,
+        }
+
+        logger.info(f"🗺️ Generating global AOI with patch size {calculations['patch_size_km']:.2f} km, grid spacing {calculations['grid_spacing_km']:.2f} km, overlap {calculations['overlap_km']:.2f} km, gap {calculations['gap_km']:.2f} km")
+
+        self.grid = Grid(dist=calculations["grid_spacing_km"])
 
         if not generate_global:
             return None
 
-        grid_file = Path(DATA_PATH) / "tile_to_grid_global.pkl"
+        grid_file = Path(DATA_PATH) / f"tile_to_grid_global_{pixel_resolution_m}_{patch_size_px}_{target_grid_km}.pkl"
 
         if grid_file.exists():
+            logger.info(f"Loading cached global tile-to-grid mapping from {grid_file}")
             with open(grid_file, "rb") as f:
                 return pickle.load(f)
 
@@ -1275,11 +1503,11 @@ class EarthAccessDownloader:
         )
         return tile_to_grid
     
-    def run(self, batch_days=30, majortom_grid: bool = False, pixel_size=250):
+    def run(self, batch_days=30, majortom_grid: bool = False, pixel_size=250, patch_size=64):
         if majortom_grid:
             from transform import CalculationsMajorTom
             self.calculations =  CalculationsMajorTom(pixel_size=pixel_size)
-            tile_to_grid = self._generate_global_aoi(generate_global=True)
+            tile_to_grid = self._generate_global_aoi(generate_global=True, pixel_resolution_m=pixel_size, patch_size_px=patch_size, target_grid_km=100)
         else:
             tile_to_grid = None
 
@@ -1303,7 +1531,7 @@ class EarthAccessDownloader:
             if majortom_grid:
                 self.build_or_update_majortom_zarr(
                     tile_to_grid=tile_to_grid,
-                    patch_size=64,
+                    patch_size=patch_size,
                 )
             else:
                 self._mosaic_daily()
@@ -1319,6 +1547,16 @@ class EarthAccessDownloader:
     def _init_or_open_sparse_zarr(self, patch_size):
         PATCH_SIZE = 2 * patch_size
         zarr_path = Path(self.zarr_path)
+
+        # Remove stale consolidated metadata if it exists, so zarr doesn't try to use
+        # outdated metadata when adding new dates in subsequent batches
+        zmetadata_path = zarr_path / ".zmetadata"
+        if zmetadata_path.exists():
+            try:
+                zmetadata_path.unlink()
+                logger.debug(f"Removed stale consolidated metadata at {zmetadata_path}")
+            except Exception as e:
+                logger.debug(f"Could not remove .zmetadata: {e}")
 
         store = zarr.open_group(zarr_path, mode="a", zarr_format=2)
 
@@ -1369,6 +1607,26 @@ class EarthAccessDownloader:
 
         return store, patches_grp, compressor
 
+    def _gdal_band_preprocess(self, data, band, description:str):
+
+        raw_name = description.split(":")[-1].lower()
+        band_name = re.sub(r"_\d+$", "", raw_name)
+        
+        if band_name in REFL_BANDS:
+            data = data.astype(np.float16)
+            nodata = band.GetNoDataValue() 
+            if nodata is not None:
+                data[data == nodata] = np.nan
+            scale = band.GetScale() or 1.0
+            offset = band.GetOffset() or 0.0
+            data = data * scale + offset
+
+        elif band_name in QC_BANDS:
+            data = data.astype(np.uint8)
+            data = self._modis_qc_mask(data, band_name)
+
+        return data, band_name
+
     def build_or_update_majortom_zarr(
         self,
         tile_to_grid,
@@ -1380,12 +1638,21 @@ class EarthAccessDownloader:
             return
 
         store, patches_grp, compressor = self._init_or_open_sparse_zarr(patch_size)
-        self._stream_tiles_into_sparse_zarr(
+        written_dates = self._stream_tiles_into_sparse_zarr(
             patches_grp=patches_grp,
             compressor=compressor,
             tile_to_grid=tile_to_grid,
             patch_size=patch_size,
+            reference_band="sur_refl_b01",
         )
+
+        # Update index and consolidate metadata for faster subsequent opens
+        if written_dates and not self._store_cloud:
+            try:
+                self._update_zarr_index(written_dates)
+                zarr.consolidate_metadata(str(self.zarr_path))
+            except Exception:
+                logger.debug("Failed to update zarr index or consolidate metadata")
 
     def _stream_tiles_into_sparse_zarr(
         self,
@@ -1393,312 +1660,367 @@ class EarthAccessDownloader:
         compressor,
         tile_to_grid,
         patch_size=64,
+        reference_band="sur_refl_b01",  # 👈 choose your gatekeeper band
+        max_null_fraction=0.1,
     ):
+        """
+        Stream raw MODIS tiles into a sparse MajorTOM Zarr store.
+
+        High-level steps:
+        1. Prepare constants and variable list.
+        2. Loop over downloaded HDF files and parse the acquisition date and tile indices.
+        3. For each HDF, open subdatasets and load needed bands into memory once.
+        4. For every MajorTOM grid cell that falls inside the HDF tile, compute the pixel
+           coordinates and extract a PATCH centered at that location.
+        5. Use a reference band (typically a reflectance band) to gate writes based on
+           null-fraction and spatial coverage.
+        6. Write patches into the sparse Zarr `patches` group under [variable][date][grid_id].
+           Writes include retry-on-ENOSPC logic and per-date success counts.
+        7. Return the set of dates that received at least one successful write.
+
+        Notes on performance and reliability:
+        - Bands are loaded once per HDF to avoid repeated I/O.
+        - Writing is retried a small number of times on ENOSPC after attempting cleanup.
+        - Per-date summary logging (instead of listing grid ids) reduces log noise and I/O.
+        """
+
         HALF = patch_size
         PATCH_SIZE = 2 * HALF
 
+        # Normalize variables to a list
         variables = (
             self.variable
             if isinstance(self.variable, (list, tuple))
             else [self.variable]
         )
 
-        logger.info(f"🧬 Streaming {len(self.files)} MODIS tiles into sparse Zarr")
+        if reference_band not in variables:
+            raise ValueError(
+                f"Reference band '{reference_band}' must be in variables list {variables}"
+            )
 
+        logger.info(
+            f"🧬 Streaming {len(self.files)} MODIS tiles into sparse Zarr "
+            f"(reference band = {reference_band})"
+        )
+
+        # Track which dates we wrote to and counts per date for lightweight logging
+        written_dates = set()
+        from collections import defaultdict as _defaultdict
+        written_counts = _defaultdict(int)
+
+        # Process each downloaded HDF file sequentially (keeps memory usage bounded)
         for file_path in tqdm(self.files, desc="MODIS tiles"):
             try:
+                # Convert MODIS granule filename -> calendar date string YYYY-MM-DD
                 date_str = str(np.datetime64(self._get_date(file_path), "D"))
 
-                # --- parse tile indices from filename ---
+                # --- parse MODIS tile indices from filename (hXXvYY) ---
                 fname = Path(file_path).name
                 m = re.search(r"h(\d+)v(\d+)", fname)
                 if not m:
+                    # Skip files that don't match expected naming convention
                     continue
                 h, v = int(m.group(1)), int(m.group(2))
 
+                # Map MODIS tile -> list of MajorTOM grid cells
                 cells = tile_to_grid.get((h, v))
                 if not cells:
                     continue
 
-                # --- open HDF and subdatasets ---
+                # --- open HDF and read available subdatasets ---
                 hdf = gdal.Open(str(file_path))
                 if hdf is None:
                     continue
-                subdatasets = hdf.GetSubDatasets()
+
+                subdatasets = dict(hdf.GetSubDatasets())
+
+                # --- load each requested band once into memory ---
+                band_data = {}
+                band_types = {}
+                ny = nx = None
 
                 for var in variables:
-                    # --- find subdataset for this variable ---
-                    var_path = None
-                    for sd_path, sd_desc in subdatasets:
-                        if var in sd_desc:
-                            var_path = sd_path
-                            break
+                    var_path = next(
+                        (p for p, d in subdatasets.items() if var in d),
+                        None,
+                    )
                     if var_path is None:
+                        band_data[var] = None
                         continue
 
-                    gdal_ds = gdal.Open(var_path)
-                    if gdal_ds is None:
+                    ds = gdal.Open(var_path)
+                    if ds is None:
+                        band_data[var] = None
                         continue
 
-                    data = gdal_ds.ReadAsArray().astype(np.float32)
+                    # Read array and metadata, then apply product-specific transforms
+                    desc = ds.GetDescription()
+                    data = ds.ReadAsArray()
+                    band = ds.GetRasterBand(1)
 
-                    nodata = gdal_ds.GetRasterBand(1).GetNoDataValue()
-                    if nodata is not None:
-                        data[data == nodata] = np.nan
-
-                    scale = gdal_ds.GetRasterBand(1).GetScale() or 1.0
-                    offset = gdal_ds.GetRasterBand(1).GetOffset() or 0.0
-                    data = data * scale + offset
+                    data, band_name = self._gdal_band_preprocess(data, band, desc)
 
                     ny, nx = data.shape
-                    gdal_ds = None  # close dataset
+                    band_data[var] = data
+                    band_types[var] = band_name
+                    ds = None
 
-                    # --- prepare variable/date groups ---
-                    var_grp = patches_grp[var]
-                    date_grp = var_grp.require_group(date_str)
+                # Safety: ensure reference band is reflectance (used to gate writes)
+                if band_types.get(reference_band) not in REFL_BANDS:
+                    raise RuntimeError(
+                        f"Reference band {reference_band} is not reflectance: {band_types.get(reference_band)}"
+                    )
 
-                    for grid_id, lat, lon in cells:
-                        x, y = self.calculations.latlon_to_sinu(lat, lon)
-                        tile_h, tile_v = self.calculations.sinu_to_tile(x, y)
-                        if tile_h != h or tile_v != v:
-                            continue
+                # Ensure date groups exist for each variable in the Zarr `patches` group.
+                # Use require_group but catch if group already exists (safe on append).
+                for var in variables:
+                    var_grp = patches_grp.require_group(var)
+                    try:
+                        var_grp.require_group(date_str)
+                    except Exception as e:
+                        # If date group already exists, we can safely open it for writing new grid_ids
+                        logger.debug(f"Date group {date_str} already exists for {var}, will append: {e}")
 
-                        px, py = self.calculations.xy_to_pixel(x, y, h, v)
-                        if py - HALF < 0 or px - HALF < 0 or py + HALF > ny or px + HALF > nx:
+                # Mark this date as being written to (we may later filter by successful writes)
+                written_dates.add(date_str)
+
+                # --- iterate candidate MajorTOM grid cells that fall within this MODIS tile ---
+                for grid_id, lat, lon in cells:
+                    # Convert grid lat/lon -> sinusoidal x,y -> tile indices and pixel coords
+                    x, y = self.calculations.latlon_to_sinu(lat, lon)
+                    tile_h, tile_v = self.calculations.sinu_to_tile(x, y)
+                    if tile_h != h or tile_v != v:
+                        # Grid point does not fall into this MODIS tile
+                        continue
+
+                    px, py = self.calculations.xy_to_pixel(x, y, h, v)
+
+                    # Skip cells where patch would exceed tile bounds
+                    if (
+                        py - HALF < 0 or px - HALF < 0
+                        or py + HALF > ny or px + HALF > nx
+                    ):
+                        continue
+
+                    # --- reference band gating: reject patches with too many nulls ---
+                    ref_data = band_data.get(reference_band)
+                    if ref_data is None:
+                        continue
+
+                    ref_patch = ref_data[py - HALF : py + HALF, px - HALF : px + HALF]
+                    if ref_patch.shape != (PATCH_SIZE, PATCH_SIZE):
+                        continue
+
+                    null_fraction = np.isnan(ref_patch).mean()
+                    if null_fraction > max_null_fraction:
+                        # Reject this grid cell for being mostly invalid
+                        continue
+
+                    # Debug info for first cell in this tile
+                    if grid_id == cells[0][0]:
+                        logger.debug(
+                            f"DEBUG {reference_band}: nan_frac={np.isnan(ref_patch).mean():.3f}, band_type={band_types[reference_band]}"
+                        )
+
+                    # --- write patches for all requested variables ---
+                    for var in variables:
+                        data = band_data.get(var)
+                        if data is None:
                             continue
 
                         patch = data[py - HALF : py + HALF, px - HALF : px + HALF]
                         if patch.shape != (PATCH_SIZE, PATCH_SIZE):
                             continue
 
-                        null_fraction = np.isnan(patch).mean()
-                        if null_fraction > 0.1:
-                            continue
-
-                        # --- ensure patch is contiguous float16 ---
                         patch = np.ascontiguousarray(patch, dtype=np.float16)
 
-                        # --- create array or overwrite if it exists ---
-                        if str(grid_id) in date_grp:
-                            arr = date_grp[str(grid_id)]
-                            arr[:] = patch
+                        date_grp = patches_grp[var][date_str]
+                        gid = str(grid_id)
+
+                        band_name = band_types[var]
+                        if band_name in REFL_BANDS:
+                            dtype = "float16"
+                            patch = np.ascontiguousarray(patch, dtype=np.float16)
+                        elif band_name in QC_BANDS:
+                            # QC bands stored as uint8
+                            patch = np.ascontiguousarray(patch.astype(np.uint8))
+                            dtype = "uint8"
                         else:
-                            arr = date_grp.create(
-                                name=str(grid_id),
-                                shape=patch.shape,
-                                chunks=patch.shape,
-                                dtype="float16",
-                                compressor=compressor,
-                            )
-                            arr[:] = patch
+                            # Unsupported band type for writing
+                            continue
+
+                        # Perform write with a short retry loop on ENOSPC (disk full).
+                        # On ENOSPC we attempt lightweight cleanup and retry a few times.
+                        success = False
+                        for attempt_write in range(3):
+                            try:
+                                if gid in date_grp:
+                                    date_grp[gid][:] = patch
+                                else:
+                                    arr = date_grp.create(
+                                        name=gid,
+                                        shape=patch.shape,
+                                        chunks=patch.shape,
+                                        dtype=dtype,
+                                        compressor=compressor,
+                                    )
+                                    arr[:] = patch
+                                success = True
+                                written_counts[date_str] += 1
+                                break
+                            except OSError as e:
+                                # Only handle ENOSPC here; other errors should surface
+                                if getattr(e, "errno", None) == errno.ENOSPC:
+                                    logger.warning(
+                                        f"ENOSPC while writing patch {gid} for {date_str} (attempt {attempt_write+1})"
+                                    )
+                                    # Try to free some space and retry
+                                    try:
+                                        self._cleanup_raw_files()
+                                        shutil.rmtree(self.temp_dir, ignore_errors=True)
+                                        self.temp_dir.mkdir(parents=True, exist_ok=True)
+                                    except Exception:
+                                        logger.debug("Cleanup attempt failed during ENOSPC handling")
+                                    time.sleep(2)
+                                    continue
+                                else:
+                                    raise
+                        if not success:
+                            logger.error(f"Failed to write patch {gid} for {date_str} after retries")
 
             except Exception as e:
+                # Log and continue with next file — do not stop the entire streaming process
                 logger.error(f"❌ Error processing {file_path}: {e}", exc_info=True)
 
+        # Summarize writes per date (keeps logs compact and informative)
+        for d, cnt in written_counts.items():
+            logger.info(f"Written {cnt} patches for date {d}")
+
         logger.info("✅ Sparse MajorTOM streaming completed")
+        # Return the set of dates that received at least one successful write
+        return set(written_counts.keys())
 
-    # def _stream_tiles_into_zarr(
-    #     self,
-    #     zarr_path,
-    #     tile_to_grid,
-    #     time_index=None,
-    #     patch_size=64,
-    # ):
-    #     """
-    #     Stream MODIS tiles into a MajorTOM-indexed Zarr dataset.
-    #     """
-
-    #     HALF = patch_size
-    #     PATCH_SIZE = 2 * HALF
-
-    #     variables = (
-    #         self.variable
-    #         if isinstance(self.variable, (list, tuple))
-    #         else [self.variable]
-    #     )
-
-    #     zarr_ds = xr.open_zarr(zarr_path)
-    #     grid_index = {gid: i for i, gid in enumerate(zarr_ds.grid_id.values)}
-
-    #     logger.info(f"🧬 Streaming {len(self.files)} MODIS tiles into Zarr")
-
-    #     for file_path in tqdm(self.files, desc="MODIS tiles"):
-    #         try:
-    #             # --- date index ---
-    #             date = self._get_date(file_path)
-    #             if time_index is not None:
-    #                 t_idx = time_index.get(date)
-    #             else:
-    #                 t_idx_arr = np.where(
-    #                     zarr_ds.time.values == np.datetime64(date)
-    #                 )[0]
-    #                 if len(t_idx_arr) == 0:
-    #                     logger.debug(f"Date {date} not in Zarr, skipping")
-    #                     continue
-    #                 t_idx = int(t_idx_arr[0])
-
-    #             # --- tile indices ---
-    #             fname = Path(file_path).name
-    #             m = re.search(r"h(\d+)v(\d+)", fname)
-    #             if not m:
-    #                 logger.warning(f"Cannot parse tile h,v from {fname}")
-    #                 continue
-    #             h, v = int(m.group(1)), int(m.group(2))
-
-    #             # --- grid cells in this tile ---
-    #             cells = tile_to_grid.get((h, v))
-    #             if not cells:
-    #                 continue
-
-    #             # --- open HDF container with GDAL ---
-    #             hdf = gdal.Open(str(file_path))
-    #             if hdf is None:
-    #                 logger.warning(f"Cannot open HDF file {file_path}")
-    #                 continue
-
-    #             subdatasets = hdf.GetSubDatasets()
-
-    #             for var in variables:
-    #                 var_path = None
-
-    #                 # --- find exact subdataset ---
-    #                 for sd_path, sd_desc in subdatasets:
-    #                     if var in sd_desc:
-    #                         var_path = sd_path
-    #                         break
-
-    #                 if var_path is None:
-    #                     logger.warning(
-    #                         f"Variable '{var}' not found in {file_path}"
-    #                     )
-    #                     continue
-
-    #                 gdal_ds = gdal.Open(var_path)
-    #                 if gdal_ds is None:
-    #                     raise RuntimeError(f"Cannot open subdataset {var_path}")
-
-    #                 data = gdal_ds.ReadAsArray().astype(np.float16)
-
-    #                 # --- handle nodata ---
-    #                 nodata = gdal_ds.GetRasterBand(1).GetNoDataValue()
-    #                 if nodata is not None:
-    #                     data[data == nodata] = np.nan
-
-    #                 # --- apply MODIS scaling ---
-    #                 scale = gdal_ds.GetRasterBand(1).GetScale()
-    #                 offset = gdal_ds.GetRasterBand(1).GetOffset()
-
-    #                 if scale is None:
-    #                     scale = 1.0
-    #                 if offset is None:
-    #                     offset = 0.0
-
-    #                 data = data * scale + offset
-
-    #                 ny, nx = data.shape
-    #                 gdal_ds = None  # close dataset
-
-    #                 patches = []
-    #                 grid_idxs = []
-
-    #                 for grid_id, lat, lon in cells:
-    #                     g_idx = grid_index.get(grid_id)
-    #                     if g_idx is None:
-    #                         continue
-    #                     x, y = self.calculations.latlon_to_sinu(lat, lon)
-    #                     tile_h, tile_v = self.calculations.sinu_to_tile(x, y)
-    #                     if tile_h != h or tile_v != v:
-    #                         continue
-    #                     px, py = self.calculations.xy_to_pixel(x, y, h, v)
-    #                     if (
-    #                         py - HALF < 0 or px - HALF < 0
-    #                         or py + HALF >= ny
-    #                         or px + HALF >= nx
-    #                     ):
-    #                         continue
-    #                     patch = data[
-    #                         py - HALF : py + HALF,
-    #                         px - HALF : px + HALF,
-    #                     ]
-    #                     if patch.shape != (PATCH_SIZE, PATCH_SIZE):
-    #                         continue
-                        
-    #                         # --- check null fraction ---
-    #                     null_fraction = np.isnan(patch).sum() / patch.size
-    #                     if null_fraction > 0.1:  # skip if more than 10% nulls
-    #                         logger.debug(
-    #                             f"Skipping patch for grid {grid_id} in {var} ({null_fraction*100:.1f}% nulls)"
-    #                         )
-    #                         continue
-                        
-    #                     patches.append(patch)
-    #                     grid_idxs.append(g_idx)
-                    
-    #                 if not patches:
-    #                     continue
-
-    #                 patches = np.stack(patches, axis=0)
-
-    #                 # --- write to Zarr ---
-    #                 zarr_ds[var].data[grid_idxs, t_idx, :, :] = patches
-    #                 zarr_ds
-    #         except Exception as e:
-    #             logger.error(
-    #                 f"❌ Error processing {file_path}: {e}",
-    #                 exc_info=True,
-    #             )
-
-    #     logger.info("✅ MajorTOM Zarr streaming completed")
-
-    # def _append_times(self, zarr_path, new_times):
-    #     import pandas as pd
-    #     import xarray as xr
-    #     import numpy as np
-    #     variables = (
-    #         self.variable if isinstance(self.variable, (list, tuple))
-    #         else [self.variable]
-    #     )
-    #     ds = xr.open_zarr(zarr_path)
-    #     existing_times = pd.to_datetime(ds.time.values)
-    #     new_times = pd.to_datetime(new_times)
-    #     # --- times missing from Zarr ---
-    #     times_to_add = [t for t in new_times if t not in set(existing_times)]
-    #     if times_to_add:
-    #         logger.info(f"➕ Appending {len(times_to_add)} new timesteps")
-    #         n_grid = len(ds.grid_id)
-    #         ny, nx = len(ds.y), len(ds.x)
-    #         data_vars = {
-    #             var: (
-    #                 ("grid_id", "time", "y", "x"),
-    #                 np.full(
-    #                     (n_grid, len(times_to_add), ny, nx),
-    #                     np.nan,
-    #                     dtype=np.float32,
-    #                 ),
-    #             )
-    #             for var in variables
-    #         }
-    #         append_ds = xr.Dataset(
-    #             data_vars=data_vars,
-    #             coords={
-    #                 "time": times_to_add,
-    #                 "grid_id": ds.grid_id,
-    #                 "y": ds.y,
-    #                 "x": ds.x,
-    #             },
-    #         )
-    #         append_ds.to_zarr(zarr_path, append_dim="time")
-    #         ds = xr.open_zarr(zarr_path)
-    #     else:
-    #         logger.info("⏭️ No new times to append")
-    #     # 🔑 ALWAYS build full mapping
-    #     full_time_index = {
-    #         pd.Timestamp(t): i
-    #         for i, t in enumerate(pd.to_datetime(ds.time.values))
-    #     }
-    #     return ds, full_time_index
+    def _modis_qc_mask(self, QA: np.ndarray, band_name: str) -> np.ndarray:
+        # ----------------------------
+        # QC_250m / QC_500m
+        # ----------------------------
+        if band_name in {"qc_250m", "qc_500m"}:
 
 
+            # MODLAND + band quality
+            mask = (
+                (QA & 0b0000000000000011) == 0  # bits 0–1
+            ) & (
+                (QA & 0b0000000000001100) == 0  # bits 2–3
+            ) & (
+                (QA & 0b0000000000110000) == 0  # bits 4–5
+            )
+
+            return mask  # boolean array
+
+        # ----------------------------
+        # state_1km
+        # ----------------------------
+        if band_name == "state_1km":
+
+            mask = (
+                ((QA >> 0) & 0b11) == 0 &     # confident clear
+                ((QA >> 2) & 0b1) == 0 &      # no shadow
+                ((QA >> 3) & 0b111) == 1 &    # land
+                ((QA >> 6) & 0b11) <= 1 &     # low aerosol
+                ((QA >> 8) & 0b1) == 0 &      # no cirrus
+                ((QA >> 10) & 0b1) == 0 &     # no internal cloud
+                ((QA >> 12) & 0b1) == 0       # no snow/ice
+            )
+
+            return mask  # boolean array
+
+
+"""
+Helper function to create bitmask for a range of bits (inclusive)
+"""
+
+def bit_range_mask(start: int, end: int) -> int:
+    return sum(1 << i for i in range(start, end + 1))
+
+def decode_qc_250m(QA: xr.DataArray) -> xr.DataArray:
+    """
+    MOD09GA QC_250m
+    Keep only pixels with:
+    - MODLAND QA = 00 (ideal)
+    - Band 1 quality = 00
+    - Band 2 quality = 00
+    """
+    mask = (
+        bit_range_mask(0, 1) |  # MODLAND
+        bit_range_mask(2, 3) |  # Band 1 quality
+        bit_range_mask(4, 5)    # Band 2 quality
+    )
+
+    filters = (
+        (0b00 << 0) |
+        (0b00 << 2) |
+        (0b00 << 4)
+    )
+
+    QA = QA.astype(np.int32)
+    return QA.where((QA & mask) == filters)
+
+
+def decode_state_1km(QA: xr.DataArray) -> xr.DataArray:
+    """
+    MOD09GA state_1km
+    Clear-sky, land, low aerosol, no snow/ice
+    """
+    mask = (
+        bit_range_mask(0, 1) |   # cloud state
+        bit_range_mask(2, 2) |   # cloud shadow
+        bit_range_mask(3, 5) |   # land/water
+        bit_range_mask(6, 7) |   # aerosol
+        bit_range_mask(8, 8) |   # cirrus
+        bit_range_mask(10,10) |  # internal cloud
+        bit_range_mask(12,12)    # snow/ice
+    )
+
+    filters = (
+        (0b00 << 0) |   # confident clear
+        (0b0  << 2) |
+        (0b001 << 3) |  # land
+        (0b01 << 6) |   # low aerosol
+        (0b0  << 8) |
+        (0b0  << 10) |
+        (0b0  << 12)
+    )
+
+    QA = QA.astype(np.int32)
+    return QA.where((QA & mask) == filters)
+
+
+def apply_modis_qa_mask(
+        QA: xr.DataArray,
+        description: str
+    ) -> xr.DataArray:
+        """
+        Dispatch MODIS QA decoding based on GDAL subdataset description.
+        """
+        band_name = description.split(":")[-1].lower()
+
+        if band_name == "qc_250m":
+            return decode_qc_250m(QA)
+
+        if band_name == "qc_500m":
+            # Same logic as QC_250m, just different resolution
+            return decode_qc_250m(QA)
+
+        if band_name == "state_1km":
+            return decode_state_1km(QA)
+
+        raise ValueError(f"Unsupported MODIS QA band: {band_name}")
+
+"""
+This function has not been tested yet
+"""
 class StacModisTileProcessor:
     def __init__(self, 
                  stac_url, 
