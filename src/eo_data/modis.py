@@ -1622,7 +1622,7 @@ class EarthAccessDownloader:
             data = data * scale + offset
 
         elif band_name in QC_BANDS:
-            data = data.astype(np.uint8)
+            data = data.astype(np.uint16)
             data = self._modis_qc_mask(data, band_name)
 
         return data, band_name
@@ -1922,17 +1922,17 @@ class EarthAccessDownloader:
         # ----------------------------
         # state_1km
         # ----------------------------
-        if band_name == "state_1km":
+        elif band_name == "state_1km":
 
-            mask = (
-                ((QA >> 0) & 0b11) == 0 &     # confident clear
-                ((QA >> 2) & 0b1) == 0 &      # no shadow
-                ((QA >> 3) & 0b111) == 1 &    # land
-                ((QA >> 6) & 0b11) <= 1 &     # low aerosol
-                ((QA >> 8) & 0b1) == 0 &      # no cirrus
-                ((QA >> 10) & 0b1) == 0 &     # no internal cloud
-                ((QA >> 12) & 0b1) == 0       # no snow/ice
-            )
+            clear      = ((QA >> 0)  & 0b11) == 0
+            shadow     = ((QA >> 2)  & 0b1)  == 0
+            land       = ((QA >> 3)  & 0b111) == 1
+            aerosol    = ((QA >> 6)  & 0b11) <= 1
+            cirrus     = ((QA >> 8)  & 0b1)  == 0
+            int_cloud  = ((QA >> 10) & 0b1)  == 0
+            snow_ice   = ((QA >> 12) & 0b1)  == 0
+
+            mask = clear & shadow & land & aerosol & cirrus & int_cloud & snow_ice
 
             return mask  # boolean array
 

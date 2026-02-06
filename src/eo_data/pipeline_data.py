@@ -135,14 +135,6 @@ if os.path.exists(Path(DATA_PATH) / "water_min.npy"):
     water_min = np.load(Path(DATA_PATH) / "water_min.npy", allow_pickle=True).tolist()
 
 else:    
-    # Generate bounding boxes
-
-    # # Debug: print info for first 3 tiles
-    # logger.info(f"Testing first 3 bboxes with debug=True to understand filtering...")
-    # for i, tile in enumerate(bboxes[:3]):
-    #     result = tile_has_min_land_fraction(tile, scale=250, min_percentage=0.5, debug=True)
-    #     logger.info(f"Tile {i}: {result}")
-
     water_min = [
         tile
         for tile in tqdm(bboxes, desc="Filtering tiles")
@@ -155,7 +147,6 @@ plot_boxes_on_map(water_min)
 
 # Loop over each bounding box and download
 for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", total=len(water_min)):
-    # logger.info(f"Processing tile {i+1}/{len(water_min)}: {bbox}")
 
     try:
         
@@ -179,7 +170,5 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
 
     except Exception as e:
         downloader.cleanup()
-        # if downloader.granule_dir.exists():
-        #     shutil.rmtree( downloader.granule_dir)
         logger.error(e)
         raise e

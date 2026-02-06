@@ -46,6 +46,7 @@ dependencies = [
     "minio>=7.2.20",
     "ultralytics>=8.4.4",
     "joblib>=1.5.3",
+    "huggingface-hub>=1.2.3",
 ]
 
 [dependency-groups]

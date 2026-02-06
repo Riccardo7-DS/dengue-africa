@@ -8,7 +8,7 @@ while true; do
     source .venv/bin/activate
 
     uv run python src/eo_data/pipeline_data.py \
-        --product "reflectance_250m" \
+        --product "reflectance_500m" \
         --start_date "2025-06-01" \
         --end_date "2025-07-30" \
         --batch_days 5 \

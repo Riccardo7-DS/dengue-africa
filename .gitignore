@@ -15,3 +15,5 @@ __pycache__/
 outputs/
 *.png
 move.sh
+
+*.tar.gz
