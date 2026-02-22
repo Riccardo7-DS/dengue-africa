@@ -1,134 +1,191 @@
 import torch
 import torch.nn as nn
 import timm
+import torch.nn.functional as F
 
 # -------------------------
 # High-res branch (patch-based Swin Transformer)
 # -------------------------
-
 class HighResBranch(nn.Module):
-    def __init__(self, in_ch=3, out_dim=128, patch_size=224, pretrained=True):
+    def __init__(self, in_ch=3, out_dim=128, patch_size=256, pretrained=True):
         super().__init__()
         self.patch_size = patch_size
 
-        # Load Swin-T pretrained on ImageNet-1k as a feature extractor
         self.swin = timm.create_model(
             'swin_tiny_patch4_window7_224.ms_in1k',
             pretrained=pretrained,
             in_chans=in_ch,
-            num_classes=0  # remove classifier head
+            num_classes=0,
+            img_size=patch_size  # 256 divides 1024 cleanly → 4x4 = 16 patches
         )
-        self.feat_dim = self.swin.num_features
+        self.swin.set_grad_checkpointing(True) # save memory by recomputing activations during backward pass
+        self.feat_dim = self.swin.num_features  # 768 for swin_tiny
 
-        # Project Swin features to desired output dimension
+        # Attention pooling over patches instead of mean pooling
+        self.patch_attn = nn.Sequential(
+            nn.Linear(self.feat_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1)
+        )
         self.proj = nn.Linear(self.feat_dim, out_dim)
 
     def forward(self, x):
-        # x: [B, C, H, W] e.g., [4, 3, 1024, 1024]
         B, C, H, W = x.shape
         p = self.patch_size
 
-        # Compute number of patches along height and width
-        num_patches_H = H // p
-        num_patches_W = W // p
+        num_H = H // p
+        num_W = W // p
 
-        # Extract non-overlapping patches using unfold
-        patches = x.unfold(2, p, p).unfold(3, p, p)  # [B, C, num_H, num_W, p, p]
-        patches = patches.contiguous().view(B, C, -1, p, p)  # [B, C, num_patches, p, p]
-        patches = patches.permute(0, 2, 1, 3, 4).reshape(-1, C, p, p)  # [B*num_patches, C, p, p]
+        # Extract non-overlapping patches
+        patches = x.unfold(2, p, p).unfold(3, p, p)          # [B, C, num_H, num_W, p, p]
+        patches = patches.contiguous().view(B, C, -1, p, p)  # [B, C, N, p, p]
+        patches = patches.permute(0, 2, 1, 3, 4).reshape(-1, C, p, p)  # [B*N, C, p, p]
 
-        # Forward each patch through Swin
-        patch_feats = self.swin(patches)  # [B*num_patches, feat_dim]
+        # Forward through Swin
+        patch_feats = self.swin(patches)                      # [B*N, feat_dim]
+        N = num_H * num_W
+        patch_feats = patch_feats.view(B, N, self.feat_dim)  # [B, N, feat_dim]
 
-        # Reshape back to batch
-        patch_feats = patch_feats.view(B, num_patches_H * num_patches_W, -1)  # [B, num_patches, feat_dim]
+        # Attention pooling over patches (learns which patches matter more)
+        attn_w = self.patch_attn(patch_feats)                 # [B, N, 1]
+        attn_w = torch.softmax(attn_w, dim=1)                 # [B, N, 1]
+        image_feat = (attn_w * patch_feats).sum(dim=1)        # [B, feat_dim]
 
-        # Aggregate patch features (mean pooling)
-        image_feat = patch_feats.mean(dim=1)  # [B, feat_dim]
+        return self.proj(image_feat)                          # [B, out_dim]
 
-        # Project to desired output dimension
-        out = self.proj(image_feat)  # [B, out_dim]
-        return out
 
-# -------------------------
-# Medium-res branch (CNN + patch pooling)
-# -------------------------
-class MediumResBranch(nn.Module):
-    def __init__(self, in_ch=2, out_dim=128, patch_size=16):
-        super().__init__()
-        self.patch_size = patch_size
-        self.cnn = nn.Sequential(
-            nn.Conv2d(in_ch, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU()
-        )
-        self.pool = nn.AdaptiveAvgPool2d((1,1))
-        self.fc = nn.Linear(128, out_dim)
-
-    def forward(self, x):
-        # x: (B, C, H, W)
-        feat = self.cnn(x)
-        feat = self.pool(feat).squeeze(-1).squeeze(-1)  # (B, 128)
-        feat = self.fc(feat)                             # (B, out_dim)
-        return feat
-    
 class MediumResBranchAttention(nn.Module):
-    def __init__(self, in_ch=8, out_dim=128, hidden_dim=128, num_heads=4):
+    def __init__(self, in_ch=2, out_dim=128, hidden_dim=128, num_heads=4):
         super().__init__()
-        # Spatial CNN
+
+        # Spatial CNN encoder — extracts local spatial features per timestep
         self.cnn = nn.Sequential(
             nn.Conv2d(in_ch, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, hidden_dim, 3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
             nn.ReLU()
         )
-        # Temporal attention
-        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
-        # Final projection
+
+        # Spatial attention: learns which spatial locations matter
+        # Applied per timestep before temporal aggregation
+        self.spatial_attn = nn.Sequential(
+            nn.Conv2d(hidden_dim, 1, kernel_size=1),  # [B*T, 1, H, W]
+            nn.Sigmoid()
+        )
+
+        self.pre_norm = nn.LayerNorm(hidden_dim)
+
+        # Temporal attention across timesteps
+        self.temporal_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, num_heads=num_heads, batch_first=True
+        )
+        self.post_norm = nn.LayerNorm(hidden_dim)
         self.fc = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, x):
         # x: [B, T, C, H, W]
         B, T, C, H, W = x.shape
 
-        # Flatten batch and time to process with CNN
-        x_2d = x.view(B*T, C, H, W)          # [B*T, C, H, W]
-        feat2d = self.cnn(x_2d)              # [B*T, hidden_dim, H, W]
+        # CNN per timestep
+        x_2d = x.view(B * T, C, H, W)
+        feat2d = self.cnn(x_2d)                        # [B*T, hidden_dim, H, W]
 
-        # Global average pooling over spatial dims
-        feat2d = feat2d.mean(dim=[2,3])      # [B*T, hidden_dim]
+        # Spatial attention: weight spatial locations before pooling
+        spatial_w = self.spatial_attn(feat2d)          # [B*T, 1, H, W]
+        feat2d = (feat2d * spatial_w).sum(dim=[2, 3])  # [B*T, hidden_dim] — weighted spatial pool
 
-        # Restore batch and time dims
-        feat2d = feat2d.view(B, T, -1)       # [B, T, hidden_dim]
+        # Restore time dimension
+        feat2d = feat2d.view(B, T, -1)                 # [B, T, hidden_dim]
+        
+        residual = feat2d
+        feat2d = self.pre_norm(feat2d)                # LayerNorm before attention
+        # Temporal self-attention with residual
+        attn_out, _ = self.temporal_attn(feat2d, feat2d, feat2d)  # [B, T, hidden_dim]
+        feat2d = residual + attn_out          # residual connection
 
-        # Temporal attention
-        attn_out, _ = self.attn(feat2d, feat2d, feat2d)  # [B, T, hidden_dim]
-
+        feat2d = self.post_norm(feat2d)
         # Pool over time
-        feat = attn_out.mean(dim=1)          # [B, hidden_dim]
+        feat = feat2d.mean(dim=1)                      # [B, hidden_dim]
 
-        # Project to output dimension
-        out = self.fc(feat)                  # [B, out_dim]
-        return out
+        return self.fc(feat)                           # [B, out_dim]
 
-# -------------------------
-# Coarse/static branch (linear embedding)
-# -------------------------
+
 class StaticBranch(nn.Module):
     def __init__(self, in_ch=1, out_dim=128):
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d((1,1))   # pool spatial map to 1x1
-        self.fc = nn.Sequential(
-            nn.Flatten(),                          # [B, C]
-            nn.Linear(in_ch, out_dim),
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_ch, 16, 3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(32, out_dim),
             nn.ReLU()
         )
 
     def forward(self, x):
-        x = self.pool(x)   # [B, C, 1, 1]
-        out = self.fc(x)   # [B, out_dim]
-        return out
+        return self.encoder(x)                         # [B, out_dim]
+
+
+class DenguePredictor(nn.Module):
+    def __init__(self,
+                 high_in_ch=3,
+                 med_in_ch=2,
+                 static_in_ch=1,
+                 high_out=128,
+                 med_out=128,
+                 static_out=128,
+                 hidden_dim=256,
+                 output_size=(86, 86),
+                 output_channels=1,
+                 decoder_channels=64):
+        super().__init__()
+        self.high_branch = HighResBranch(out_dim=high_out, in_ch=high_in_ch)
+        self.med_branch = MediumResBranchAttention(out_dim=med_out, in_ch=med_in_ch)
+        self.static_branch = StaticBranch(out_dim=static_out, in_ch=static_in_ch)
+
+        self.output_size = output_size
+        self.decoder_channels = decoder_channels
+
+        total_in = high_out + med_out + static_out
+
+        # Project to small spatial grid then upsample — avoids giant linear layer
+        self.fc = nn.Sequential(
+            nn.Linear(total_in, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, decoder_channels * 8 * 8),  # 8x8 bottleneck
+            nn.ReLU()
+        )
+
+        # Upsample + refine to output_size
+        self.decoder = nn.Sequential(
+            nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1),
+            nn.BatchNorm2d(decoder_channels),
+            nn.ReLU(),
+            nn.Conv2d(decoder_channels, output_channels, 1)
+        )
+
+    def forward(self, x_high, x_med, x_static):
+        f_high = self.high_branch(x_high)
+        f_med = self.med_branch(x_med)
+        f_static = self.static_branch(x_static)
+
+        fusion = torch.cat([f_high, f_med, f_static], dim=1)  # [B, total_in]
+
+        out = self.fc(fusion)                                  # [B, decoder_channels * 64]
+
+        B = out.shape[0]
+        out = out.view(B, self.decoder_channels, 8, 8)         # [B, decoder_channels, 8, 8]
+
+        # Upsample to target output size
+        out = F.interpolate(out, size=self.output_size, mode='bilinear', align_corners=False)
+
+        return self.decoder(out)                               # [B, 1, 86, 86]
 
 # -------------------------
 # Fusion + Prediction

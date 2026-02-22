@@ -1,6 +1,6 @@
 from eo_data.modis import EarthAccessDownloader
 from utils import generate_bboxes_fixed, init_logging, tile_has_min_land_fraction, plot_boxes_on_map, generate_bboxes_from_resolution
-from osgeo import gdal
+# from osgeo import gdal
 from definitions import ROOT_DIR, DATA_PATH
 from pathlib import Path
 from dotenv import load_dotenv
@@ -17,11 +17,11 @@ t = ProgressBar().register()
 logger = init_logging(log_file="modis_downloader.log", verbose=False)
 
 # Load environment variables
-load_dotenv(Path(ROOT_DIR)/ ".env")
+load_dotenv()
 
-# GDAL tuning
-gdal.SetConfigOption('GDAL_CACHEMAX', '512')    # MB, tune to memory
-gdal.SetConfigOption('GDAL_DISABLE_READDIR_ON_OPEN', 'EMPTY_DIR')
+# # GDAL tuning
+# gdal.SetConfigOption('GDAL_CACHEMAX', '512')    # MB, tune to memory
+# gdal.SetConfigOption('GDAL_DISABLE_READDIR_ON_OPEN', 'EMPTY_DIR')
 sys.dont_write_bytecode = True
 
 # Argument parsing
@@ -128,7 +128,6 @@ bboxes = generate_bboxes_fixed(
 )
 
 logger.info(f"Generated {len(bboxes)} total tiles for the area of interest.")
-
 
 if os.path.exists(Path(DATA_PATH) / "water_min.npy"):
     logger.info("Loading precomputed filtered bounding boxes from water_min.npy")

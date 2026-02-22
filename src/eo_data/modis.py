@@ -1,7 +1,7 @@
 # import ee
 import logging
 from pathlib import Path
-from osgeo import gdal
+# from osgeo import gdal
 from requests import patch
 from definitions import DATA_PATH
 import tempfile
@@ -26,7 +26,6 @@ from pyproj import Transformer
 import ee, geemap 
 from datetime import datetime, timedelta
 from pystac_client import Client
-from odc.stac import load
 import pyproj
 from majortom import Grid
 import zarr

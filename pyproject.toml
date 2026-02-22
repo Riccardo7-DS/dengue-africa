@@ -27,7 +27,6 @@ dependencies = [
     "numpy>=2.3.3",
     "earthaccess>=0.15.1",
     "satpy>=0.58.0",
-    "gdal==3.10.3",
     "dotenv>=0.9.9",
     "ipywidgets>=8.1.8",
     "h5netcdf>=1.7.3",
@@ -47,9 +46,13 @@ dependencies = [
     "ultralytics>=8.4.4",
     "joblib>=1.5.3",
     "huggingface-hub>=1.2.3",
+    "majortom",
 ]
 
 [dependency-groups]
 dev = [
     "py-spy>=0.4.1",
 ]
+
+[tool.uv.sources]
+majortom = { git = "https://github.com/ESA-PhiLab/Major-TOM.git" }

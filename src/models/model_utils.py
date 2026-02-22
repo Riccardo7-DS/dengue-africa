@@ -8,8 +8,108 @@ import numpy as np
 import torch
 from torch.utils.data import Subset
 import pandas as pd
+from torchgeo.samplers import GridGeoSampler
+import xarray as xr
+import torch
+import torch.nn.functional as F
+
+from torchgeo.datasets import RasterDataset
+from torchgeo.samplers import GridGeoSampler
+
+from tqdm import tqdm
+
+from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+def nan_checks_replace(datasets, replace_nan=0.0, skip_normalize=False):
+    processed = []
+    for i, data in enumerate(datasets):
+        logger.debug(f"\n=== Dataset {i} ===")
+        logger.debug(f"Before clone: isnan={torch.isnan(datasets[i]).sum().item()}")
+    
+        data = data.clone().float()
+        logger.debug(f"After clone: isnan={torch.isnan(data).sum().item()}")
+        logger.debug(f"min={data.min().item()}, max={data.max().item()}, mean={data.mean().item()}")
+    
+        logger.debug(f"Dataset {i}: ptr={data.data_ptr()}")
+
+        n_nan = torch.isnan(data).sum().item()
+        n_inf = torch.isinf(data).sum().item()
+        if n_nan > 0:
+            logger.warning(f"Dataset {i}: {n_nan} NaNs replaced with {replace_nan}")
+        if n_inf > 0:
+            logger.warning(f"Dataset {i}: {n_inf} Infs replaced with {replace_nan}")
+        
+        data = torch.nan_to_num(data, nan=replace_nan, posinf=replace_nan, neginf=replace_nan)
+
+        logger.debug(f"After nan_to_num: isnan={torch.isnan(data).sum().item()}")
+
+        # Sanity check: nan_to_num should have cleaned everything
+        assert not torch.isnan(data).any(), f"Dataset {i} still has NaNs after nan_to_num"
+        assert not torch.isinf(data).any(), f"Dataset {i} still has Infs after nan_to_num"
+
+        if not skip_normalize:
+            ndim = data.ndim
+
+            if ndim == 5:      # [B, T, C, H, W]
+                channel_dim = 2
+                reduce_dims = (0, 1, 3, 4)
+            elif ndim == 4:    # [B, C, H, W]
+                channel_dim = 1
+                reduce_dims = (0, 2, 3)
+            else:              # [B, D] or anything else — global normalization
+                channel_dim = None
+                reduce_dims = None
+
+            if channel_dim is not None:
+                # Compute per-channel mean and std
+                # keepdim=True so we can broadcast back over all dims
+                mean = data.mean(dim=reduce_dims, keepdim=True)  # [1,1,C,1,1] or [1,C,1,1]
+                std = data.std(dim=reduce_dims, keepdim=True)
+
+                # Normalize only channels with sufficient variance
+                safe_std = torch.where(std > 1e-6, std, torch.ones_like(std))
+                data = (data - mean) / safe_std
+
+                # Log any zero-variance channels
+                zero_var = (std <= 1e-6).squeeze()
+                if zero_var.any():
+                    logger.debug(f"Dataset {i}: channels {zero_var.nonzero().squeeze().tolist()} have zero variance")
+            else:
+                mean = data.mean()
+                std = data.std()
+                if std > 1e-6:
+                    data = (data - mean) / std
+
+            # Final NaN check after normalization
+            if torch.isnan(data).any():
+                logger.warning(f"Dataset {i}: NaNs introduced during normalization, replacing")
+                data = torch.nan_to_num(data, nan=replace_nan)
+
+        processed.append(data)
+
+    return processed
+
+
+def debug_nan(tensors, names):
+    for t, name in zip(tensors, names):
+        nan_count = torch.isnan(t).sum().item()
+        inf_count = torch.isinf(t).sum().item()
+        
+        if nan_count > 0:
+            valid_vals = t[~torch.isnan(t)]
+            if len(valid_vals) > 0:
+                logger.debug(f"NaN detected in {name} ({nan_count}/{t.numel()} = {100*nan_count/t.numel():.1f}%) — valid min: {valid_vals.min()}, max: {valid_vals.max()}, mean: {valid_vals.mean()}")
+            else:
+                logger.warning(f"NaN detected in {name} — ALL VALUES ARE NAN!")
+        
+        if inf_count > 0:
+            valid_vals = t[~torch.isinf(t)]
+            if len(valid_vals) > 0:
+                logger.debug(f"Inf detected in {name} ({inf_count}/{t.numel()} = {100*inf_count/t.numel():.1f}%) — valid min: {valid_vals.min()}, max: {valid_vals.max()}, mean: {valid_vals.mean()}")
+            else:
+                logger.warning(f"Inf detected in {name} — ALL VALUES ARE INF!")
 
 
 def rolling_split(dataset, train_end, horizon_days=365):
@@ -82,7 +182,7 @@ class EarlyStopping:
         Args:
             patience (int): How long to wait after last time validation loss improved.
                             Default: 7
-            verbose (bool): If True, prints a message for each validation loss improvement. 
+            verbose (bool): If True, logger.infos a message for each validation loss improvement. 
                             Default: False
         """
         self.patience = patience if patience is not None else config.patience
@@ -162,7 +262,31 @@ class EarlyStopping:
         torch.save(metadata, dest_path)
         
         # Cleanup old checkpoints
-        # self._cleanup_checkpoints(save_path, n_save)
+        self._cleanup_checkpoints(save_path, n_save)
+    
+    def _cleanup_checkpoints(self, save_path, n_save=3):
+        """Remove older checkpoints, keeping only the n_save most recent ones."""
+        try:
+            # Get all checkpoint directories
+            checkpoint_dirs = [
+                d for d in os.listdir(save_path)
+                if os.path.isdir(os.path.join(save_path, d)) and d.startswith("checkpoint_epoch_")
+            ]
+            
+            if len(checkpoint_dirs) <= n_save:
+                return
+            
+            # Sort by epoch number
+            checkpoint_dirs.sort(key=lambda x: int(x.split("_")[-1]))
+            
+            # Remove oldest checkpoints
+            for old_dir in checkpoint_dirs[:-n_save]:
+                old_path = os.path.join(save_path, old_dir)
+                import shutil
+                shutil.rmtree(old_path)
+                logger.info(f"Removed old checkpoint: {old_dir}")
+        except Exception as e:
+            logger.warning(f"Error cleaning up checkpoints: {e}")
 
 
 def collate_skip_none(batch):
@@ -173,8 +297,7 @@ def collate_skip_none(batch):
     return torch.utils.data.default_collate(batch)
 
 
-import torch
-import torch.nn.functional as F
+
 
 def pad_tensor(x, target_h, target_w):
     """
@@ -601,28 +724,48 @@ def mask_mse(preds, labels, mask, return_value=True):
             return loss
             
 
-def masked_custom_loss(criterion, preds, labels, mask=None, return_value=True):
-    loss = criterion(preds, labels)
+def masked_custom_loss(criterion, preds, labels, mask=None, eps=1e-8, return_value=True):
+    # Remove NaNs and Infs from predictions and labels before loss computation
+    # Create mask for finite values (not NaN or Inf)
+    finite_mask = torch.isfinite(preds) & torch.isfinite(labels)
+    
+    if not finite_mask.any():
+        logger.warning("[masked_custom_loss] All predictions/labels are NaN or Inf! Returning zero loss.")
+        return torch.tensor(0.0, device=preds.device, requires_grad=True)
+    
+    # Filter out non-finite values
+    preds_clean = preds[finite_mask]
+    labels_clean = labels[finite_mask]
+    
+    loss = criterion(preds_clean, labels_clean)
+    
     if isinstance(mask, torch.Tensor):
-        full_mask = torch.broadcast_to(mask, loss.shape)
-        null_loss = (loss * full_mask)
-        null_loss = torch.where(torch.isnan(mask), torch.tensor(0.0), null_loss)
-    elif isinstance(mask, np.ndarray):
-        full_mask = np.broadcast_to(mask, loss.shape)
-        null_loss = (loss * full_mask)
-        null_loss = np.where(np.isnan(mask), 0, null_loss)
-    elif not mask:
-        null_loss = loss
-        full_mask = torch.ones(loss.shape)
-
+        mask = mask.to(loss.device)
+        # Broadcast and filter mask
+        if mask.shape != finite_mask.shape:
+            try:
+                mask = torch.broadcast_to(mask, finite_mask.shape)
+            except RuntimeError:
+                logger.warning(f"[masked_custom_loss] Could not broadcast mask shape {mask.shape} to finite_mask shape {finite_mask.shape}")
+                mask = None
+        
+        if mask is not None:
+            mask_clean = mask[finite_mask]
+            masked_loss = loss * mask_clean
+            
+            if return_value:
+                denom = mask_clean.sum()
+                if denom == 0:
+                    return torch.tensor(0.0, device=loss.device, requires_grad=True)
+                return masked_loss.sum() / (denom + eps)
+            else:
+                return masked_loss
+    
+    # No mask case (or mask broadcasting failed)
     if return_value:
-        non_zero_elements = full_mask.sum()
-        return null_loss.sum() / non_zero_elements
+        return loss.mean()
     else:
-        if len(loss.shape)>2:
-            return loss.mean(0)
-        else:
-            return loss
+        return loss
         
 def mask_mbe(preds, labels, mask, return_value=True):
     loss = (preds-labels)
@@ -639,3 +782,766 @@ def mask_mbe(preds, labels, mask, return_value=True):
             return loss.mean(0)
         else:
             return loss
+        
+
+
+
+
+# -----------------------------------------------------------------------------
+# Datasets
+# -----------------------------------------------------------------------------
+class VIIRSData(RasterDataset):
+    filename_glob = "VNP*.tif"
+    filename_regex = r"^VNP46A3_(?P<date>\d{8})\.tif$"
+    date_format = "%Y%m%d"
+    is_image = True
+    separate_files = False
+
+    def __init__(
+        self,
+        root: str,
+        min_date: Optional[str] = None,
+        max_date: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(root, **kwargs)
+
+        # Only filter if at least one bound is provided
+        if min_date is not None or max_date is not None:
+
+            min_date = pd.Timestamp(min_date) if min_date else None
+            max_date = pd.Timestamp(max_date) if max_date else None
+
+            intervals = self.index.index  # IntervalIndex
+            dates = intervals.left        # start of each interval (daily rasters)
+
+            mask = pd.Series(True, index=self.index.index)
+
+            if min_date is not None:
+                mask &= dates >= min_date
+
+            if max_date is not None:
+                mask &= dates <= max_date
+
+            self.index = self.index[mask]
+
+
+class StaticLayer(RasterDataset):
+    filename_glob = "DEN_riskmap_wmean_masked.tif"
+    is_image = True
+    separate_files = False
+    nodata = -3.3999999521443642e+38
+
+    def __init__(self, paths, crs=None, res=None, transforms=None, nodata=None):
+        super().__init__(paths=paths, crs=crs, res=res, transforms=transforms)
+        if nodata is not None:
+            self.nodata = nodata
+
+    def _merge_files(self, filepaths, query, band_indexes=None):
+        tensor = super()._merge_files(filepaths, query, band_indexes)
+        
+        # Mask nodata sentinel values to NaN
+        if self.nodata is not None:
+            tensor = tensor.float()
+            # Use tolerance to handle float32 precision issues
+            nodata_mask = torch.abs(tensor - self.nodata) < torch.abs(torch.tensor(self.nodata)) * 1e-3
+            tensor[nodata_mask] = float('nan')
+        
+        return tensor
+
+
+
+
+
+class XarraySpatioTemporalDataset(RasterDataset):
+    """
+    Generic xarray-backed dataset.
+
+    Returns:
+        image: Tensor[T, C, H, W]  (or [T, C] if no spatial dims)
+    """
+
+    is_image = True
+    separate_files = False
+
+    def __init__(
+        self,
+        ds:xr.Dataset | xr.DataArray,                      # xarray Dataset or DataArray
+        variables=None,
+        T_max=32,
+        transform=None,
+    ):  
+        
+        self.ds = self._normalize_coords(ds)
+        self.variables = variables
+        self.T_max = T_max
+        self.transform = transform
+
+        self.times = self.ds.time.values
+
+    def _normalize_coords(self, ds):
+        rename = {}
+        for k in ("lon", "longitude"):
+            if k in ds.coords:
+                rename[k] = "x"
+        for k in ("lat", "latitude"):
+            if k in ds.coords:
+                rename[k] = "y"
+        if rename:
+            ds = ds.rename(rename)
+
+        return ds
+    
+
+    def __len__(self):
+        return len(self.times)
+
+    def __getitem__(self, query):
+        """
+        query can be:
+            - idx (int)
+            - (x_slice, y_slice, t_slice)
+        """
+        
+
+        # -----------------------------
+        # Case B: temporal-only access
+        # -----------------------------
+        if isinstance(query, int):
+            t = pd.Timestamp(self.times[query])
+            # Clip time inside dataset bounds
+            min_t = pd.Timestamp(self.ds.time.min().values)
+            max_t = pd.Timestamp(self.ds.time.max().values)
+
+            if t < min_t or t > max_t:
+                return {"image": torch.empty(0)}
+
+            ds = self.ds.sel(time=t)
+
+        # -----------------------------
+        # Case A: spatiotemporal access
+        # -----------------------------
+        else:
+            x_slice, y_slice, t_slice = query
+
+            start_time = pd.Timestamp(t_slice.start)
+            stop_time  = pd.Timestamp(t_slice.stop)
+
+            # Clip time range to dataset bounds
+            min_t = pd.Timestamp(self.ds.time.min().values)
+            max_t = pd.Timestamp(self.ds.time.max().values)
+
+            start_time = max(start_time, min_t)
+            stop_time  = min(stop_time, max_t)
+
+            if start_time > max_t or stop_time < min_t:
+                return {"image": torch.empty(0)}
+
+            ds = self.ds.sel(time=slice(start_time, stop_time))
+
+            if ds.time.size == 0:
+                return {"image": torch.empty(0)}
+
+            # ---- Spatial selection (robust to axis order) ----
+            sel_dict = {}
+            for axis, s in zip(["x", "y"], [x_slice, y_slice]):
+                if axis in ds.coords:
+                    coord_vals = ds[axis].values
+                    if coord_vals[0] < coord_vals[-1]:
+                        sel_dict[axis] = slice(s.start, s.stop)
+                    else:
+                        sel_dict[axis] = slice(s.stop, s.start)
+
+            if sel_dict:
+                ds = ds.sel(**sel_dict)
+
+        # -------------------------------------------------
+        # Extract variables
+        # -------------------------------------------------
+        if hasattr(ds, "data_vars"):
+            vars_ = self.variables or list(ds.data_vars)
+            arrays = [ds[v].values for v in vars_]
+        else:
+            arrays = [ds.values]
+
+        if len(arrays) == 0:
+            return {"image": torch.empty(0)}
+
+        # -------------------------------------------------
+        # Build tensor [T, C, H, W]
+        # -------------------------------------------------
+        tensors = []
+        for arr in arrays:
+            t = torch.from_numpy(arr).float()
+
+            if t.ndim == 2:       # [H, W]
+                t = t.unsqueeze(0).unsqueeze(0)
+            elif t.ndim == 3:     # [T, H, W]
+                t = t.unsqueeze(1)
+
+            tensors.append(t)
+
+        patch = torch.cat(tensors, dim=1)
+
+        # -------------------------------------------------
+        # Temporal padding/truncation
+        # -------------------------------------------------
+        T = patch.shape[0]
+        if T > self.T_max:
+            patch = patch[-self.T_max:]
+        elif T < self.T_max:
+            pad = torch.zeros((self.T_max - T, *patch.shape[1:]), dtype=patch.dtype)
+            patch = torch.cat([pad, patch], dim=0)
+
+        if self.transform:
+            patch = self.transform(patch)
+
+        return {"image": patch}
+
+# class ERA5Daily:
+#     """
+#     ERA5 preloaded tensor cube with TorchGeo-style [query] interface
+#     Returns patches as: {"image": Tensor[T, C, H, W]}
+#     """
+
+#     def __init__(self, root, variables=None, T_max=32, transform=None, min_date=None, max_date=None):
+#         import xarray as xr
+#         from pathlib import Path
+#         import torch
+
+#         self.root = Path(root)
+#         self.variables = variables
+#         self.T_max = T_max
+#         self.transform = transform
+
+#         # --- load dataset ---
+#         files = sorted(self.root.glob("era5land_latin_america*.nc"))
+#         if not files:
+#             raise RuntimeError("No ERA5 files found")
+
+#         ds = xr.open_mfdataset([str(f) for f in files], combine="by_coords")
+#         ds = self._normalize_coords(ds)
+
+#         if min_date is not None and max_date is not None:
+#             ds = ds.sel(time=slice(min_date, max_date))
+
+#         vars_ = variables or list(ds.data_vars)
+#         ds = ds[vars_].load()  # 🔥 fully in RAM
+
+#         # --- tensor cube ---
+#         da = ds.to_array()  # [T,C,H,W]
+#         self.data = torch.from_numpy(da.values).contiguous()
+#         self.data = self.data.permute(1, 0, 2, 3).contiguous()  # [T,C,H,W]
+
+#         # --- coords for slicing ---
+#         self.time_index = ds.time.values
+#         self.x_coords = ds.x.values
+#         self.y_coords = ds.y.values
+
+#         logger.info("ERA5 loaded into memory:", self.data.shape)
+
+#     def _normalize_coords(self, ds):
+#         rename = {}
+#         for k in ("lon", "longitude"):
+#             if k in ds.coords:
+#                 rename[k] = "x"
+#         for k in ("lat", "latitude"):
+#             if k in ds.coords:
+#                 rename[k] = "y"
+#         for k in ("valid_time", "date"):
+#             if k in ds.coords:
+#                 rename[k] = "time"
+#         if rename:
+#             ds = ds.rename(rename)
+
+#         if "x" in ds.coords:
+#             x = ds.x.values
+#             if x.max() > 180:
+#                 ds = ds.assign_coords(x=((ds.x + 180) % 360) - 180).sortby("x")
+
+#         if "y" in ds.coords:
+#             if ds.y[0] > ds.y[-1]:
+#                 ds = ds.sortby("y")
+
+#         return ds
+
+#     # --- THIS MAKES THE CLASS SUBSCRIPTABLE ---
+#     def __getitem__(self, query):
+#         """
+#         query: tuple of slices (x_slice, y_slice, t_slice)
+#         returns: {"image": Tensor[T,C,H,W]}
+#         """
+#         x_slice, y_slice, t_slice = query
+
+#         # --- get time indices ---
+#         t_mask = (self.time_index >= t_slice.start) & (self.time_index <= t_slice.stop)
+#         t_idx = torch.from_numpy(t_mask.nonzero()[0])
+
+#         if len(t_idx) == 0:
+#             return {"image": torch.empty(0)}
+
+#         # --- get spatial indices ---
+#         x_idx = torch.from_numpy(((self.x_coords >= x_slice.start) & (self.x_coords <= x_slice.stop)).nonzero()[0])
+#         y_idx = torch.from_numpy(((self.y_coords >= y_slice.start) & (self.y_coords <= y_slice.stop)).nonzero()[0])
+
+#         patch = self.data[t_idx][:, :, y_idx][:, :, :, x_idx]  # [T,C,H,W]
+
+#         # --- temporal padding ---
+#         T = patch.shape[0]
+#         if T > self.T_max:
+#             patch = patch[-self.T_max :]
+#         elif T < self.T_max:
+#             pad = torch.zeros((self.T_max - T, *patch.shape[1:]), dtype=patch.dtype)
+#             patch = torch.cat([pad, patch], dim=0)
+
+#         if self.transform:
+#             patch = self.transform(patch)
+
+#         return {"image": patch}
+
+#     def __len__(self):
+#         return len(self.time_index)
+
+
+class ERA5Daily:
+    """
+    ERA5 lazy loader with TorchGeo-style [query] interface.
+    Loads only requested time slices on the fly.
+    Returns: {"image": Tensor[T, C, H, W]}
+    """
+
+    def __init__(
+        self,
+        root,
+        variables=None,
+        T_max=32,
+        transform=None,
+        min_date=None,
+        max_date=None,
+    ):
+        import xarray as xr
+        from pathlib import Path
+
+        self.root = Path(root)
+        self.variables = variables
+        self.T_max = T_max
+        self.transform = transform
+
+        files = sorted(self.root.glob("era5land_latin_america*.nc"))
+        if not files:
+            raise RuntimeError("No ERA5 files found")
+
+        # 🔹 open lazily with chunking
+        self.ds = xr.open_mfdataset(
+            [str(f) for f in files],
+            combine="by_coords",
+            chunks={"time": 1},  # <- key for daily loading
+        )
+
+        self.ds = self._normalize_coords(self.ds)
+
+        if min_date is not None and max_date is not None:
+            self.ds = self.ds.sel(time=slice(min_date, max_date))
+
+        self.vars_ = variables or list(self.ds.data_vars)
+
+        # store coords only (cheap)
+        self.time_index = self.ds.time.values
+        self.x_coords = self.ds.x.values
+        self.y_coords = self.ds.y.values
+
+        logger.info("ERA5 opened lazily.")
+
+    def _normalize_coords(self, ds):
+        rename = {}
+        for k in ("lon", "longitude"):
+            if k in ds.coords:
+                rename[k] = "x"
+        for k in ("lat", "latitude"):
+            if k in ds.coords:
+                rename[k] = "y"
+        for k in ("valid_time", "date"):
+            if k in ds.coords:
+                rename[k] = "time"
+        if rename:
+            ds = ds.rename(rename)
+
+        if "x" in ds.coords:
+            x = ds.x.values
+            if x.max() > 180:
+                ds = ds.assign_coords(x=((ds.x + 180) % 360) - 180).sortby("x")
+
+        if "y" in ds.coords:
+            if ds.y[0] > ds.y[-1]:
+                ds = ds.sortby("y")
+
+        return ds
+
+    def __getitem__(self, query):
+        import torch
+        import numpy as np
+
+        x_slice, y_slice, t_slice = query
+
+        # --- Select subset lazily ---
+        ds_sel = (
+            self.ds[self.vars_]
+            .sel(
+                time=slice(t_slice.start, t_slice.stop),
+                x=slice(x_slice.start, x_slice.stop),
+                y=slice(y_slice.start, y_slice.stop),
+            )
+        )
+
+        # --- Convert to array lazily ---
+        da = ds_sel.to_array()  # [C,T,H,W] lazy
+
+        # --- Move time first ---
+        da = da.transpose("time", "variable", "y", "x")
+
+        # --- Compute ONLY this subset ---
+        arr = da.compute().values  # 🔥 loads only selected window
+
+        if arr.size == 0:
+            return {"image": torch.empty(0)}
+
+        patch = torch.from_numpy(arr).float()  # [T,C,H,W]
+
+        # --- Temporal padding ---
+        T = patch.shape[0]
+
+        if T > self.T_max:
+            patch = patch[-self.T_max :]
+        elif T < self.T_max:
+            pad = torch.zeros((self.T_max - T, *patch.shape[1:]), dtype=patch.dtype)
+            patch = torch.cat([pad, patch], dim=0)
+
+        if self.transform:
+            patch = self.transform(patch)
+
+        return {"image": patch}
+
+    def __len__(self):
+        return len(self.time_index)
+
+
+# -----------------------------------------------------------------------------
+# Multi-resolution dataset
+# -----------------------------------------------------------------------------
+class DengueDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        viirs,
+        era5,
+        static,
+        y,
+        patch_sizes={
+            "viirs": (1024, 1024),
+            "era5": (43, 43),
+            "static": (102, 102),
+            "y": (86, 86)
+        },
+        y_valid_threshold = 0.3,
+        bbox=None,
+        skip_era5_bounds=False,
+        cache_dir=None):
+
+
+        self.viirs = viirs
+        self.era5 = era5
+        self.static = static
+        self.y = y
+        self.cache_dir = cache_dir
+        self.skip_era5_bounds = skip_era5_bounds
+
+        from utils import latin_box
+
+        self.patch_size = patch_sizes.get("viirs", (1024, 1024))
+        self.patch_size_era5 = patch_sizes.get("era5", (43, 43))
+        self.patch_size_static = patch_sizes.get("static", (512, 512))
+        self.patch_size_y = patch_sizes.get("y", (86, 86))
+
+        self.y_valid_threshold = y_valid_threshold
+
+        user_bbox = bbox if bbox is not None else latin_box()
+
+        if not isinstance(user_bbox, (list, tuple, np.ndarray)) or len(user_bbox) != 4:
+            raise ValueError("bbox must be a list/tuple of 4 values")
+
+        a, b, c, d = map(float, user_bbox)
+
+        # Detect if bbox is [miny, minx, maxy, maxx] (lat-first)
+        if abs(a) <= 90 and abs(b) <= 180:
+            # Likely [lat_min, lon_min, lat_max, lon_max]
+            ub_miny, ub_minx, ub_maxy, ub_maxx = a, b, c, d
+        else:
+            # Assume [lon_min, lat_min, lon_max, lat_max]
+            ub_minx, ub_miny, ub_maxx, ub_maxy = a, b, c, d
+
+        logger.info(
+            f"[DengueDataset] Normalized bbox -> "
+            f"(minx={ub_minx}, miny={ub_miny}, maxx={ub_maxx}, maxy={ub_maxy})"
+        )
+
+
+        # Compute ERA5 valid data bounds (optionally using fast metadata-only approach)
+        era5_bounds = None
+        try:
+            if self.skip_era5_bounds:
+                # FAST: Use coordinate metadata without loading data
+                logger.info("[DengueDataset] Using fast metadata-based ERA5 bounds (skipping data load)")
+                if hasattr(self.era5.ds, 'x') and hasattr(self.era5.ds, 'y'):
+                    x_coords = self.era5.ds.x.values
+                    y_coords = self.era5.ds.y.values
+                    
+                    if len(x_coords) > 0 and len(y_coords) > 0:
+                        era_minx = float(x_coords.min())
+                        era_maxx = float(x_coords.max())
+                        era_miny = float(y_coords.min())
+                        era_maxy = float(y_coords.max())
+                        
+                        era5_bounds = (era_minx, era_miny, era_maxx, era_maxy)
+                        logger.info(f"[DengueDataset] ERA5 bounds from metadata: {era5_bounds}")
+            else:
+                # SLOW: Load data to compute bounds (original behavior)
+                logger.info("[DengueDataset] Computing ERA5 bounds by loading data...")
+                var0 = list(self.era5.ds.data_vars)[0]
+                da = self.era5.ds[var0]
+
+                # Remove any time-like dimension
+                if "time" in da.dims:
+                    da = da.isel(time=0)
+
+                # Drop non-spatial dims safely
+                spatial_dims = [d for d in da.dims if d in ("y", "x")]
+                da = da.transpose(*spatial_dims)
+
+                arr = da.values
+
+                # If still >2D (e.g., pressure level), reduce
+                while arr.ndim > 2:
+                    arr = arr[0]
+
+                valid_mask = ~np.isnan(arr)
+
+                if valid_mask.any():
+                    ys, xs = np.where(valid_mask)
+
+                    x_coords = self.era5.ds.x.values[xs]
+                    y_coords = self.era5.ds.y.values[ys]
+
+                    era_minx, era_maxx = float(x_coords.min()), float(x_coords.max())
+                    era_miny, era_maxy = float(y_coords.min()), float(y_coords.max())
+
+                    era5_bounds = (era_minx, era_miny, era_maxx, era_maxy)
+
+                    logger.info(f"[DengueDataset] ERA5 valid bounds computed: {era5_bounds}")
+
+        except Exception as e:
+            logger.warning(f"[DengueDataset] Could not compute ERA5 bounds: {e}")
+            era5_bounds = None
+
+        self.era5_bounds = era5_bounds
+
+        # ---- Intersect user bbox with ERA5 valid bounds ----
+        if era5_bounds is not None:
+            minx = max(ub_minx, era5_bounds[0])
+            miny = max(ub_miny, era5_bounds[1])
+            maxx = min(ub_maxx, era5_bounds[2])
+            maxy = min(ub_maxy, era5_bounds[3])
+
+            if minx >= maxx or miny >= maxy:
+                logger.warning("[DengueDataset] No overlap with ERA5 bounds. Using user bbox.")
+                self.bbox = [ub_minx, ub_miny, ub_maxx, ub_maxy]
+            else:
+                self.bbox = [minx, miny, maxx, maxy]
+                logger.info(
+                    f"[DengueDataset] Intersected bbox: "
+                    f"(minx: {minx}, miny: {miny}, maxx: {maxx}, maxy: {maxy})"
+                )
+        else:
+            logger.info("[DengueDataset] ERA5 bounds not available, using user bbox.")
+            self.bbox = [ub_minx, ub_miny, ub_maxx, ub_maxy]
+
+
+        # ---- Weekly → Monthly mapping ----
+        self.time_pairs = []
+        for t in self.y.times:
+            t_week = pd.Timestamp(t)
+            t_viirs = t_week.to_period("M").to_timestamp()
+            self.time_pairs.append((t_week, t_viirs))
+
+        # ---- Build spatial grid ONCE using first time ----
+        sample_idx = 1
+
+        sampler = GridGeoSampler(
+            self.viirs,
+            size=self.patch_size,
+            roi=self.bbox,
+            toi=pd.Interval(self.time_pairs[sample_idx][1], 
+                            self.time_pairs[sample_idx][0]),
+        )
+
+        logger.info("VIIRS x,y range: (%f, %f, %f, %f)", viirs.bounds[0].start, viirs.bounds[0].stop, viirs.bounds[1].start, viirs.bounds[1].stop)
+        logger.info("ERA5 x,y range: (%f, %f, %f, %f)", float(self.era5.x_coords.min()), float(self.era5.x_coords.max()), float(self.era5.y_coords.min()), float(self.era5.y_coords.max()))
+        logger.info("Output x,y range: (%f, %f, %f, %f)", float(self.y.ds.x.min()), float(self.y.ds.x.max()), float(self.y.ds.y.min()), float(self.y.ds.y.max()))
+        logger.info("Sample time: %s", self.time_pairs[sample_idx][0])
+
+        self.spatial_queries = list(sampler)
+
+        if len(self.spatial_queries) == 0:
+            raise RuntimeError("No spatial patches found!")
+        
+        self._compute_valid_patches()
+
+
+    def __len__(self):
+        return len(self.valid_indices)
+    
+    def is_mostly_nan(self, tensor, threshold=0.9):
+        nan_ratio = torch.isnan(tensor).float().mean()
+        return nan_ratio > threshold
+    
+    def _is_patch_valid(self, tensor, threshold=None):
+        """Check if a patch has enough valid (non-NaN) pixels"""
+        if tensor.numel() == 0:
+            return False
+        if threshold is None:
+            threshold = self.y_valid_threshold
+        valid_ratio = (~torch.isnan(tensor)).float().mean()
+        return valid_ratio >= threshold
+
+
+    def _pad_to_size(self, tensor, target_h, target_w):
+        """
+        Pads tensor [T, C, H, W] to target spatial size.
+        Pads on the right and bottom only.
+        """
+        if tensor.ndim == 5:
+            _, _, _, h, w = tensor.shape
+        elif tensor.ndim == 4:
+            _, _, h, w = tensor.shape
+        elif tensor.ndim == 3:
+            _, h, w = tensor.shape
+        else:
+            raise ValueError(f"Unexpected tensor shape {tensor.shape}")
+
+        pad_h = target_h - h
+        pad_w = target_w - w
+
+        if pad_h < 0 or pad_w < 0:
+            # If larger (should not happen), crop
+            if tensor.ndim == 5:
+                tensor = tensor[:, :, :, :target_h, :target_w]
+            elif tensor.ndim == 4:
+                tensor = tensor[:, :, :target_h, :target_w]
+            elif tensor.ndim == 3:
+                tensor = tensor[:, :target_h, :target_w]
+            return tensor
+
+        # pad format: (left, right, top, bottom)
+        padding = (0, pad_w, 0, pad_h)
+        tensor = F.pad(tensor, padding, mode="constant", value=0)
+
+        return tensor
+        
+
+    def _compute_valid_patches(self):
+        """Compute and cache valid patch indices for faster subsequent runs"""
+        import pickle
+        from pathlib import Path
+        
+        # Determine cache file path
+        cache_file = None
+        if self.cache_dir:
+            cache_file = Path(self.cache_dir) / "valid_patches_cache.pkl"
+        
+        # Try to load from cache first
+        if cache_file and cache_file.exists():
+            try:
+                logger.info(f"[DengueDataset] Loading cached valid patches from {cache_file}...")
+                with open(cache_file, 'rb') as f:
+                    self.valid_indices = pickle.load(f)
+                logger.info(f"[DengueDataset] Loaded {len(self.valid_indices)} cached patches")
+                return self.valid_indices
+            except Exception as e:
+                logger.warning(f"[DengueDataset] Failed to load cache: {e}. Computing patches...")
+        
+        # Compute valid patches (same logic as before)
+        logger.info("[DengueDataset] Computing valid spatiotemporal patches...")
+        self.valid_indices = []
+
+        for spatial_idx, bbox in tqdm(enumerate(self.spatial_queries), total=len(self.spatial_queries), desc="Checking valid patches over space and time"):
+
+            x_slice, y_slice = bbox[0], bbox[1]
+
+            for time_idx, (t_week, _) in enumerate(self.time_pairs):
+
+                query_xarray = (x_slice, y_slice, slice(t_week, t_week))
+                y_patch = self.y[query_xarray]["image"].float()
+
+                if y_patch.numel() == 0:
+                    continue
+
+                valid_ratio = (~torch.isnan(y_patch)).float().mean()
+
+                if valid_ratio >= self.y_valid_threshold:
+                    self.valid_indices.append((spatial_idx, time_idx))
+
+        if len(self.valid_indices) == 0:
+            raise RuntimeError("No valid spatiotemporal patches found!")
+        
+        # Save to cache for future runs
+        if cache_file:
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(self.valid_indices, f)
+                logger.info(f"[DengueDataset] Cached {len(self.valid_indices)} patches to {cache_file}")
+            except Exception as e:
+                logger.warning(f"[DengueDataset] Failed to save cache: {e}")
+        
+        return self.valid_indices
+
+    def __getitem__(self, idx):
+        
+        spatial_idx, time_idx = self.valid_indices[idx]
+
+        bbox = self.spatial_queries[spatial_idx]
+
+        x_slice, y_slice = bbox[0], bbox[1]
+        t_week, t_viirs = self.time_pairs[time_idx]
+
+        static_query = (x_slice, y_slice)
+        query_viirs = (x_slice, y_slice, slice(t_viirs, t_viirs))
+        query_xarray = (x_slice, y_slice, slice(t_week, t_week))
+
+        # # logger.info("ERA5 x,y range:", float(self.era5.ds.x.min()), float(self.era5.ds.x.max()), float(self.era5.ds.y.min()), float(self.era5.ds.y.max()))
+        # logger.info("ERA5 y first/last:", self.era5.ds.y.values[0], self.era5.ds.y.values[-1])
+
+        # logger.info("VIIRS x,y range:", viirs.bounds[0].start, viirs.bounds[0].stop, viirs.bounds[1].start, viirs.bounds[1].stop)
+        # logger.info("Output x,y range:", float(self.y.ds.x.min()), float(self.y.ds.x.max()), float(self.y.ds.y.min()), float(self.y.ds.y.max()))
+        # logger.info("Query x:", x_slice.start, x_slice.stop)
+        # logger.info("Query y:", y_slice.start, y_slice.stop)
+
+        try:
+            x_high = self._pad_to_size(self.viirs[query_viirs]["image"].float(), *self.patch_size)
+            x_med = self._pad_to_size(self.era5[query_xarray]["image"].float(), *self.patch_size_era5)
+            x_static = self._pad_to_size(self.static[static_query]["image"].float(), *self.patch_size_static)
+            y_val = self._pad_to_size(self.y[query_xarray]["image"].float(), *self.patch_size_y)
+            return x_high, x_med, x_static, y_val
+        
+        except Exception as e:
+            return None
+
+
+# -----------------------------------------------------------------------------
+# Collate function (skip None)
+# -----------------------------------------------------------------------------
+def collate_skip_none(batch):
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None
+    return torch.utils.data.default_collate(batch)
+
+

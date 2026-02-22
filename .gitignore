@@ -1,4 +1,6 @@
 notebooks/
+checkpoints/
+solutions/
 data/
 *.pyc
 .env
