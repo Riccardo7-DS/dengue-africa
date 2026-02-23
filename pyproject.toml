@@ -47,6 +47,7 @@ dependencies = [
     "joblib>=1.5.3",
     "huggingface-hub>=1.2.3",
     "majortom",
+    "transformers>=5.2.0",
 ]
 
 [dependency-groups]

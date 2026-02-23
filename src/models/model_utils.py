@@ -22,75 +22,93 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-def nan_checks_replace(datasets, replace_nan=0.0, skip_normalize=False):
+def export_batches(batch_idx, epoch, batch_data, run_dir, logger, n_export_batches=3, export_epoch=1):
+    """
+    Export the first n batches of training data for inspection.
+    
+    Args:
+        batch_idx: current batch index
+        epoch: current epoch
+        batch_data: dict of tensors to export
+        run_dir: Path to run directory
+        logger: logger instance
+        n_export_batches: how many batches to export
+        export_epoch: which epoch to export from
+    """
+    if epoch != export_epoch or batch_idx >= n_export_batches:
+        return
+
+    export_dir = run_dir / "batch_exports" / f"epoch_{epoch:03d}"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    np.save(
+        export_dir / f"batch_{batch_idx:03d}.npy",
+        {k: v.cpu().numpy() for k, v in batch_data.items()}
+    )
+    logger.info(f"Exported batch {batch_idx} → {export_dir}")
+
+def nan_checks_replace(datasets, replace_nan=0.0):
     processed = []
     for i, data in enumerate(datasets):
-        logger.debug(f"\n=== Dataset {i} ===")
-        logger.debug(f"Before clone: isnan={torch.isnan(datasets[i]).sum().item()}")
-    
-        data = data.clone().float()
-        logger.debug(f"After clone: isnan={torch.isnan(data).sum().item()}")
-        logger.debug(f"min={data.min().item()}, max={data.max().item()}, mean={data.mean().item()}")
-    
-        logger.debug(f"Dataset {i}: ptr={data.data_ptr()}")
+        data = data.clone().float()  # no clone — already cloned before calling this
 
-        n_nan = torch.isnan(data).sum().item()
-        n_inf = torch.isinf(data).sum().item()
-        if n_nan > 0:
-            logger.warning(f"Dataset {i}: {n_nan} NaNs replaced with {replace_nan}")
-        if n_inf > 0:
-            logger.warning(f"Dataset {i}: {n_inf} Infs replaced with {replace_nan}")
-        
-        data = torch.nan_to_num(data, nan=replace_nan, posinf=replace_nan, neginf=replace_nan)
+        # Single-pass sentinel + nan + inf replacement
+        # Handles -3.4e38 ESRI nodata, NaN, and Inf in one operation
+        sentinel_mask = data.abs() > 3.3e38
+        if sentinel_mask.any():  # .any() stays on GPU, no .item() sync
+            data = data.masked_fill(sentinel_mask, replace_nan)
 
-        logger.debug(f"After nan_to_num: isnan={torch.isnan(data).sum().item()}")
-
-        # Sanity check: nan_to_num should have cleaned everything
-        assert not torch.isnan(data).any(), f"Dataset {i} still has NaNs after nan_to_num"
-        assert not torch.isinf(data).any(), f"Dataset {i} still has Infs after nan_to_num"
-
-        if not skip_normalize:
-            ndim = data.ndim
-
-            if ndim == 5:      # [B, T, C, H, W]
-                channel_dim = 2
-                reduce_dims = (0, 1, 3, 4)
-            elif ndim == 4:    # [B, C, H, W]
-                channel_dim = 1
-                reduce_dims = (0, 2, 3)
-            else:              # [B, D] or anything else — global normalization
-                channel_dim = None
-                reduce_dims = None
-
-            if channel_dim is not None:
-                # Compute per-channel mean and std
-                # keepdim=True so we can broadcast back over all dims
-                mean = data.mean(dim=reduce_dims, keepdim=True)  # [1,1,C,1,1] or [1,C,1,1]
-                std = data.std(dim=reduce_dims, keepdim=True)
-
-                # Normalize only channels with sufficient variance
-                safe_std = torch.where(std > 1e-6, std, torch.ones_like(std))
-                data = (data - mean) / safe_std
-
-                # Log any zero-variance channels
-                zero_var = (std <= 1e-6).squeeze()
-                if zero_var.any():
-                    logger.debug(f"Dataset {i}: channels {zero_var.nonzero().squeeze().tolist()} have zero variance")
-            else:
-                mean = data.mean()
-                std = data.std()
-                if std > 1e-6:
-                    data = (data - mean) / std
-
-            # Final NaN check after normalization
-            if torch.isnan(data).any():
-                logger.warning(f"Dataset {i}: NaNs introduced during normalization, replacing")
-                data = torch.nan_to_num(data, nan=replace_nan)
+        # One call handles all remaining NaN/Inf
+        data = torch.nan_to_num(data, nan=replace_nan, 
+                                posinf=replace_nan, neginf=replace_nan)
 
         processed.append(data)
 
     return processed
 
+def standardize_tensor(datasets, replace_nan=0.0):
+    processed = []
+
+    for i, data in enumerate(datasets):
+        ndim = data.ndim
+
+        if ndim == 5:      # [B, T, C, H, W]
+            channel_dim = 2
+            reduce_dims = (0, 1, 3, 4)
+        elif ndim == 4:    # [B, C, H, W]
+            channel_dim = 1
+            reduce_dims = (0, 2, 3)
+        else:              # [B, D] or anything else — global normalization
+            channel_dim = None
+            reduce_dims = None
+
+        if channel_dim is not None:
+            mean = data.mean(dim=reduce_dims, keepdim=True)
+            std = data.std(dim=reduce_dims, keepdim=True)
+
+            safe_std = torch.where(std > 1e-6, std, torch.ones_like(std))
+            data = (data - mean) / safe_std
+
+            zero_var = (std <= 1e-6).squeeze()
+            if zero_var.any():
+                logger.debug(
+                    f"Dataset {i}: channels "
+                    f"{zero_var.nonzero().squeeze().tolist()} have zero variance"
+                )
+        else:
+            mean = data.mean()
+            std = data.std()
+            if std > 1e-6:
+                data = (data - mean) / std
+
+        # Safety check after normalization
+        if torch.isnan(data).any():
+            logger.warning(f"Dataset {i}: NaNs introduced during normalization, replacing")
+            data = torch.nan_to_num(data, nan=replace_nan)
+
+        processed.append(data)
+
+    return processed
 
 def debug_nan(tensors, names):
     for t, name in zip(tensors, names):
@@ -1152,6 +1170,73 @@ class ERA5Daily:
 
         logger.info("ERA5 opened lazily.")
 
+
+    def _era5_to_weekly(self, ds, week_freq="1W-MON", week_label="left"):
+        """
+        Convert ERA5 dataset to weekly resolution using
+        physically meaningful aggregations.
+        
+        Fluxes -> weekly sum
+        Temperatures -> weekly mean, min, max
+        
+        Parameters
+        ----------
+        ds : xr.Dataset
+        week_freq : str
+            Resampling frequency (default Monday-based weeks)
+        week_label : str
+            'left' or 'right' for week labeling
+            
+        Returns
+        -------
+        xr.Dataset
+            Weekly aggregated dataset
+        """
+        
+        # Define groups
+        sum_vars = ["tp", "pev", "e"]
+        temp_vars = ["skt", "stl1", "stl2", "stl3", "stl4"]
+        
+        # Keep only variables present
+        sum_vars = [v for v in sum_vars if v in ds]
+        temp_vars = [v for v in temp_vars if v in ds]
+        
+        # --- Fluxes (sum)
+        weekly_sum = (
+            ds[sum_vars]
+            .resample(time=week_freq, label=week_label)
+            .sum()
+        )
+        
+        # --- Temperature statistics
+        weekly_mean = (
+            ds[temp_vars]
+            .resample(time=week_freq, label=week_label)
+            .mean()
+        )
+        
+        weekly_min = (
+            ds[temp_vars]
+            .resample(time=week_freq, label=week_label)
+            .min()
+        )
+        
+        weekly_max = (
+            ds[temp_vars]
+            .resample(time=week_freq, label=week_label)
+            .max()
+        )
+        
+        # Rename to avoid overwriting
+        weekly_mean = weekly_mean.rename({v: f"{v}_mean" for v in temp_vars})
+        weekly_min  = weekly_min.rename({v: f"{v}_min"  for v in temp_vars})
+        weekly_max  = weekly_max.rename({v: f"{v}_max"  for v in temp_vars})
+        
+        # Merge all
+        ds_weekly = xr.merge([weekly_sum, weekly_mean, weekly_min, weekly_max])
+        
+        return ds_weekly
+
     def _normalize_coords(self, ds):
         rename = {}
         for k in ("lon", "longitude"):
@@ -1192,6 +1277,8 @@ class ERA5Daily:
                 y=slice(y_slice.start, y_slice.stop),
             )
         )
+
+        ds_sel = self._era5_to_weekly(ds_sel)  # Resample to weekly on the fly
 
         # --- Convert to array lazily ---
         da = ds_sel.to_array()  # [C,T,H,W] lazy

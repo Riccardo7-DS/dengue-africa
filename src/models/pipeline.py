@@ -1,5 +1,8 @@
 import logging
-logger = logging.getLogger(__name__)
+import sys
+import argparse
+
+from models.model_utils import export_batches
 
 def run_pipeline():
     from models import DengueConvLSTM
@@ -33,7 +36,7 @@ def run_pipeline():
 
 
 
-def dataset_pipeline(sample=False):
+def tabular_dataset_pipeline(sample=False):
     from definitions import DATA_PATH
     from pathlib import Path
     import xarray as xr
@@ -153,8 +156,64 @@ def dataset_pipeline(sample=False):
 
 
 
-def main(config: dict | None = None, sample:bool=False):
+def load_checkpoint(checkpoint_dir, model, optimizer, scheduler, device):
+    """Load checkpoint from specified directory.
+    
+    Args:
+        checkpoint_dir: Path to checkpoint directory (e.g., checkpoints/checkpoint_epoch_5)
+        model: Model to load state into
+        optimizer: Optimizer to load state into
+        scheduler: Scheduler to load state into
+        device: Device to load tensors to
+        
+    Returns:
+        Starting epoch number
+    """
+    import torch
+    import os
+    from pathlib import Path
     import logging
+    logger = logging.getLogger(__name__)
+    
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+    
+    # Find metadata file
+    metadata_files = list(checkpoint_dir.glob("metadata_epoch_*.pth"))
+    if not metadata_files:
+        raise FileNotFoundError(f"No metadata file found in {checkpoint_dir}")
+    
+    metadata_path = metadata_files[0]
+    metadata = torch.load(metadata_path, map_location=device)
+    epoch = metadata['epoch']
+    
+    logger.info(f"Loading checkpoint from epoch {epoch}...")
+    
+    # Load each component
+    for key, path in metadata['components'].items():
+        if not os.path.exists(path):
+            logger.warning(f"Component file not found: {path}")
+            continue
+            
+        state_dict = torch.load(path, map_location=device)
+        
+        if 'model_state' in key:
+            model.load_state_dict(state_dict)
+            logger.info("Loaded model state")
+        elif 'optimizer_state' in key:
+            optimizer.load_state_dict(state_dict)
+            logger.info("Loaded optimizer state")
+        elif 'scheduler_state' in key:
+            scheduler.load_state_dict(state_dict)
+            logger.info("Loaded scheduler state")
+    
+    return epoch
+
+
+def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample: bool = False, fillna: bool = False):
+    import logging
+    import re
     from pathlib import Path
     from types import SimpleNamespace
     from datetime import datetime
@@ -162,6 +221,7 @@ def main(config: dict | None = None, sample:bool=False):
     import torch
     import torch.nn as nn
     from torch.optim import AdamW
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
     from torch.utils.data import DataLoader, random_split
     import xarray as xr
 
@@ -174,9 +234,20 @@ def main(config: dict | None = None, sample:bool=False):
         DenguePredictor,
         collate_skip_none,
     )
-    from models.model_utils import masked_custom_loss, EarlyStopping, nan_checks_replace, debug_nan
+    from models.model_utils import (
+        masked_custom_loss, 
+        EarlyStopping, 
+        nan_checks_replace, 
+        debug_nan,
+        standardize_tensor,
+        export_batches
+    )
     from definitions import DATA_PATH
     from utils import latin_box, init_logging
+    
+    # Create a simple namespace to mimic args for backward compatibility
+    from types import SimpleNamespace
+    args = SimpleNamespace(sample=sample, fillna=fillna)
 
     # ------------------------------------------------------------------
     # Configuration
@@ -200,13 +271,28 @@ def main(config: dict | None = None, sample:bool=False):
 
     device = torch.device(cfg["device"])
     
-    # Create unique run directory with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Handle checkpoint loading or create new run directory
     base_dir = Path(cfg["save_dir"])
-    run_dir = base_dir / f"run_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    start_epoch = 0
     
-    # Create subdirectories for organization
+    if checkpoint_epoch is not None:
+        # Find the most recent run directory
+        run_dirs = sorted([d for d in base_dir.glob("run_*") if d.is_dir()])
+        if not run_dirs:
+            raise FileNotFoundError(f"No previous runs found in {base_dir}")
+        
+        run_dir = run_dirs[-1]  # Use most recent run
+        
+        logger_temp = logging.getLogger(__name__)
+        logger_temp.info(f"Resuming from run: {run_dir}")
+        timestamp = re.search(r"\d{8}_\d{6}", str(run_dir / "logs" / "training.log")).group()
+    else:
+        # Create unique run directory with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = base_dir / f"run_{timestamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        
+
     checkpoint_dir = run_dir / "checkpoints"
     log_dir = run_dir / "logs"
     plot_dir = run_dir / "plots"
@@ -222,12 +308,12 @@ def main(config: dict | None = None, sample:bool=False):
     # Dataset construction
     # ------------------------------------------------------------------
     viirs_data_path = DATA_PATH / "modis" / "VIIRS_nightlight"
-    era5_path = DATA_PATH / "ERA5"
+    era5_path = DATA_PATH / "ERA5" / "Latin_america"
     risk_raster_path = DATA_PATH / "riskmaps_public main data" / "DEN_riskmap_wmean_masked.tif"
     admin_path = DATA_PATH / "weekly_admin2_cases.nc"
 
     ds_cases = xr.open_dataset(admin_path)
-    if sample:
+    if args.sample:
         sample_dates = 20
         ds_cases = ds_cases.isel(time=slice(0, sample_dates))
         first_date = ds_cases.isel(time=0)["time"].values
@@ -236,16 +322,17 @@ def main(config: dict | None = None, sample:bool=False):
         first_date, last_date = None, None
 
     y = XarraySpatioTemporalDataset(ds_cases, T_max=1)
-
-    era5 = ERA5Daily(era5_path, T_max=32, min_date=first_date, max_date=last_date)
+    era5 = ERA5Daily(era5_path, T_max=63, min_date=first_date, max_date=last_date)
     viirs = VIIRSData(viirs_data_path, min_date=first_date, max_date=last_date)
     static = StaticLayer(risk_raster_path, nodata=-3.3999999521443642e+38)
 
     full_dataset = DengueDataset(viirs, era5, static, y, bbox=latin_box(), 
                                  skip_era5_bounds=True, cache_dir=str(run_dir / "cache"))
 
+
     logger.info(f"Dataset bbox clipped to ERA5 valid extent: {full_dataset.bbox}")
     logger.info(f"Full dataset size: {len(full_dataset)}")
+
 
     # Train/val split
     train_size = int(cfg["train_split"] * len(full_dataset))
@@ -274,13 +361,29 @@ def main(config: dict | None = None, sample:bool=False):
     # Model, optimizer, loss
     # ------------------------------------------------------------------
     model = DenguePredictor(
+        pretrained_autoencoder="swin_tiny_patch4_window7_224.ms_in1k",
         high_in_ch=3,
-        med_in_ch=8,
+        med_in_ch=18,
         static_in_ch=1
     ).to(device)
 
     criterion = nn.MSELoss(reduction="none")
     optimizer = AdamW(model.parameters(), lr=cfg["learning_rate"])
+    
+    # Learning rate scheduler
+    scheduler = ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=0.5, 
+        patience=3, 
+        min_lr=1e-6
+    )
+
+    # Load checkpoint if specified
+    if checkpoint_epoch is not None:
+        checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{checkpoint_epoch}"
+        start_epoch = load_checkpoint(checkpoint_path, model, optimizer, scheduler, device)
+        logger.info(f"Resuming training from epoch {start_epoch + 1}")
 
     es_config = SimpleNamespace(patience=cfg["patience"], min_patience=0)
     early_stopper = EarlyStopping(es_config, verbose=True)
@@ -305,21 +408,42 @@ def main(config: dict | None = None, sample:bool=False):
             preds = preds.squeeze(1)
 
         return preds.squeeze(), targets.squeeze()
+    
+    def process_datasets(datasets, replace_nan=0.0, fill_nans=False, skip_normalize=False):
+        
+        if fill_nans:
+            cleaned = nan_checks_replace(datasets, replace_nan=replace_nan)
+        else:
+            cleaned = datasets
 
-    def train_one_epoch():
+        if skip_normalize:
+            return cleaned
+        else:
+            return standardize_tensor(cleaned, replace_nan=replace_nan)
+
+    def train_one_epoch(args):
         model.train()
         running_loss = 0.0
         n_batches = 0
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             if batch is None:
                 continue
+
+            export_batches(
+                batch_idx, epoch,
+                {'x_high': x_high, 'x_med': x_med, 'x_static': x_static, 'y_batch': y_batch},
+                run_dir, logger
+            )
 
             x_high, x_med, x_static, y_batch = [
                 b.to(device, non_blocking=True) for b in batch
             ]
-            datasets = [t.clone().contiguous() for t in [x_high, x_med, x_static, y_batch]]
-            x_high, x_med, x_static, y_batch = nan_checks_replace(datasets, replace_nan=-99)
+            x_high, x_med, x_static, y_batch = process_datasets(
+                [x_high, x_med, x_static, y_batch], 
+                replace_nan=-99, 
+                fill_nans=args.fillna
+            )
 
             optimizer.zero_grad()
 
@@ -353,7 +477,7 @@ def main(config: dict | None = None, sample:bool=False):
 
         return running_loss / max(1, n_batches)
 
-    def validate_one_epoch():
+    def validate_one_epoch(args):
         model.eval()
         running_loss = 0.0
         n_batches = 0
@@ -364,8 +488,7 @@ def main(config: dict | None = None, sample:bool=False):
                     continue
 
                 x_high, x_med, x_static, y_batch = [b.to(device) for b in batch]
-
-                x_high, x_med, x_static, y_batch = nan_checks_replace([x_high, x_med, x_static, y_batch], replace_nan=-99)
+                x_high, x_med, x_static, y_batch = process_datasets([x_high, x_med, x_static, y_batch], replace_nan=-99, fill_nans=args.fillna)
 
                 with torch.amp.autocast(enabled=cfg["amp"], device_type=cfg["device"]):
                     y_pred = model(x_high, x_med, x_static)
@@ -387,10 +510,11 @@ def main(config: dict | None = None, sample:bool=False):
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    for epoch in range(1, cfg["num_epochs"] + 1):
-        logger.info("Starting training...")
-        train_loss = train_one_epoch()
-        val_loss = validate_one_epoch()
+    logger.info(f"Starting training from epoch {start_epoch + 1}...")
+    
+    for epoch in range(start_epoch + 1, cfg["num_epochs"] + 1):
+        train_loss = train_one_epoch(args)
+        val_loss = validate_one_epoch(args)
         
         # Track losses for plotting
         train_losses.append(train_loss)
@@ -455,7 +579,9 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience (epochs without improvement)")
     parser.add_argument("--num_epochs", type=int, default=100, help="Maximum number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for optimizer")
-    
+    parser.add_argument("--fillna", action="store_true", help="Whether to fill NaN values in the dataset with a specified value (e.g., -99)")
+    parser.add_argument("--checkpoint", type=int, default=None, help="Epoch number to resume from (loads from most recent run directory)")
+        
     args = parser.parse_args()
     # dataset_pipeline(sample=args.sample)
     config = {
@@ -473,4 +599,4 @@ if __name__ == "__main__":
 
     # tb = ProgressBar().register()
 
-    main(config=config, sample=args.sample)
+    main(config=config, checkpoint_epoch=args.checkpoint, sample=args.sample, fillna=args.fillna)

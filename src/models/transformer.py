@@ -7,19 +7,19 @@ import torch.nn.functional as F
 # High-res branch (patch-based Swin Transformer)
 # -------------------------
 class HighResBranch(nn.Module):
-    def __init__(self, in_ch=3, out_dim=128, patch_size=256, pretrained=True):
+    def __init__(self, in_ch=3, out_dim=128, patch_size=256, pretrained=True, pretrained_autoencoder='swin_tiny_patch4_window7_224.ms_in1k'):
         super().__init__()
         self.patch_size = patch_size
 
-        self.swin = timm.create_model(
-            'swin_tiny_patch4_window7_224.ms_in1k',
+        self.encoder = timm.create_model(
+            pretrained_autoencoder,
             pretrained=pretrained,
             in_chans=in_ch,
             num_classes=0,
             img_size=patch_size  # 256 divides 1024 cleanly → 4x4 = 16 patches
         )
-        self.swin.set_grad_checkpointing(True) # save memory by recomputing activations during backward pass
-        self.feat_dim = self.swin.num_features  # 768 for swin_tiny
+        self.encoder.set_grad_checkpointing(True) # save memory by recomputing activations during backward pass
+        self.feat_dim = self.encoder.num_features  # 
 
         # Attention pooling over patches instead of mean pooling
         self.patch_attn = nn.Sequential(
@@ -42,7 +42,7 @@ class HighResBranch(nn.Module):
         patches = patches.permute(0, 2, 1, 3, 4).reshape(-1, C, p, p)  # [B*N, C, p, p]
 
         # Forward through Swin
-        patch_feats = self.swin(patches)                      # [B*N, feat_dim]
+        patch_feats = self.encoder(patches)                      # [B*N, feat_dim]
         N = num_H * num_W
         patch_feats = patch_feats.view(B, N, self.feat_dim)  # [B, N, feat_dim]
 
@@ -192,6 +192,7 @@ class DenguePredictor(nn.Module):
 # -------------------------
 class DenguePredictor(nn.Module):
     def __init__(self,
+                pretrained_autoencoder="swin_tiny_patch4_window7_224.ms_in1k",
                  high_in_ch=3,
                  med_in_ch=2,
                  static_in_ch=1,
@@ -203,7 +204,7 @@ class DenguePredictor(nn.Module):
                  output_channels=1,
                  decoder_channels=64):
         super().__init__()
-        self.high_branch = HighResBranch(out_dim=high_out, in_ch=high_in_ch)
+        self.high_branch = HighResBranch(out_dim=high_out, in_ch=high_in_ch, pretrained_autoencoder=pretrained_autoencoder)
         self.med_branch = MediumResBranchAttention(out_dim=med_out, in_ch=med_in_ch)
         self.static_branch = StaticBranch(out_dim=static_out, in_ch=static_in_ch)
 
