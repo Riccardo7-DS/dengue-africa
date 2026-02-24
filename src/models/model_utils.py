@@ -22,29 +22,37 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-def export_batches(batch_idx, epoch, batch_data, run_dir, logger, n_export_batches=3, export_epoch=1):
+def export_batches(batch_idx, epoch, batch, run_dir,
+                   n_export_batches=3, export_epoch=1):
     """
     Export the first n batches of training data for inspection.
-    
+
     Args:
         batch_idx: current batch index
         epoch: current epoch
-        batch_data: dict of tensors to export
+        batch: tuple from dataloader (x_high, x_med, x_static, y_batch)
         run_dir: Path to run directory
-        logger: logger instance
         n_export_batches: how many batches to export
         export_epoch: which epoch to export from
     """
     if epoch != export_epoch or batch_idx >= n_export_batches:
         return
 
+    x_high, x_med, x_static, y_batch = batch
+
     export_dir = run_dir / "batch_exports" / f"epoch_{epoch:03d}"
     export_dir.mkdir(parents=True, exist_ok=True)
 
     np.save(
         export_dir / f"batch_{batch_idx:03d}.npy",
-        {k: v.cpu().numpy() for k, v in batch_data.items()}
+        {
+            "x_high": x_high.cpu().numpy(),
+            "x_med": x_med.cpu().numpy(),
+            "x_static": x_static.cpu().numpy(),
+            "y_batch": y_batch.cpu().numpy(),
+        }
     )
+
     logger.info(f"Exported batch {batch_idx} → {export_dir}")
 
 def nan_checks_replace(datasets, replace_nan=0.0):

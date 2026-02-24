@@ -432,8 +432,8 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
 
             export_batches(
                 batch_idx, epoch,
-                {'x_high': x_high, 'x_med': x_med, 'x_static': x_static, 'y_batch': y_batch},
-                run_dir, logger
+                 batch, 
+                 run_dir
             )
 
             x_high, x_med, x_static, y_batch = [
@@ -581,16 +581,16 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for optimizer")
     parser.add_argument("--fillna", action="store_true", help="Whether to fill NaN values in the dataset with a specified value (e.g., -99)")
     parser.add_argument("--checkpoint", type=int, default=None, help="Epoch number to resume from (loads from most recent run directory)")
-        
+    parser.add_argument("--workers", type=int, default=int(os.getenv("NUM_WORKERS", 4)), help="Number of workers for data loading")
     args = parser.parse_args()
-    # dataset_pipeline(sample=args.sample)
+    
     config = {
         "batch_size": args.batch_size,
         "num_epochs": args.num_epochs,
         "learning_rate": args.learning_rate,
         "train_split": 0.8,
         "patience": args.patience,
-        "num_workers": 8,
+        "num_workers": args.workers,
         "amp": True,
         "grad_clip": 1.0,
         "save_dir": ROOT_DIR / "checkpoints",
