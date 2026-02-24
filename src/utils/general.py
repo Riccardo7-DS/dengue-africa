@@ -15,6 +15,8 @@ import math
 import os 
 from urllib.parse import urlparse
 from minio import Minio
+
+from definitions import DATA_PATH
 logger = logging.getLogger(__name__)
 
 
@@ -353,105 +355,11 @@ def prepare(dataset:Union[xr.DataArray, xr.Dataset]):
         dataset = dataset.rename({"y":"lat", "x":"lon"})
     if "X" in dataset.dims:
         dataset = dataset.rename({"Y":"lat", "X":"lon"})
-    dataset.rio.write_crs("EPSG:4326", inplace=True)
-    dataset.rio.set_spatial_dims(x_dim='lon', y_dim='lat', inplace=True)
+    dataset = dataset.rio.write_crs("EPSG:4326")
+    dataset = dataset.rio.set_spatial_dims(x_dim='lon', y_dim='lat')
     return dataset
 
-def rasterize_timeseries(da:xr.DataArray, shapefile:gpd.GeoDataFrame, region_col:str="region_id", res:float=0.05):
-    from rasterio.features import rasterize
-    """
-    Convert xarray DataArray (time x region) into raster cube (time x H x W).
-    
-    da: xarray.DataArray with dims (time, region)
-    shapefile: GeoDataFrame with polygons for admin2
-    region_col: column in shapefile matching da.region
-    res: grid resolution in degrees (~0.05 ≈ 5km)
-    """
-    # Compute bounds from shapefile
-    lat_min, lat_max, lon_min, lon_max = shapefile.total_bounds[[1,3,0,2]]
-    lats = np.arange(lat_max, lat_min, -res)
-    lons = np.arange(lon_min, lon_max, res)
-    H, W = len(lats), len(lons)
-    
-    # Create transform
-    transform = rasterio.transform.from_bounds(lon_min, lat_min, lon_max, lat_max, W, H)
-    
-    rasters = []
-    for t in tqdm(range(da.time.size)):
-        week_vals = {region: da.isel(time=t).sel(region=region).item() 
-                     for region in da.region.values}
-        # Filter out regions not in shapefile
-        week_vals = {k: v for k, v in week_vals.items() if k in shapefile[region_col].values}
-        
-        shapes = [(geom, val) for geom, val in zip(shapefile.geometry, shapefile[region_col].map(week_vals.get)) 
-                  if not np.isnan(val)]
-        
-        raster = rasterize(
-            shapes,
-            out_shape=(H, W),
-            transform=transform,
-            fill=np.nan,
-            dtype='float32'
-        )
-        rasters.append(raster)
-    
-    # Stack into xarray
-    raster_da = xr.DataArray(
-        np.stack(rasters),
-        coords={"time": da.time.values, "lat": lats, "lon": lons},
-        dims=("time", "lat", "lon"),
-        name="dengue_raster"
-    )
-    return raster_da
 
-
-
-# -----------------
-# Preprocessing
-# -----------------
-
-
-
-
-
-def df_to_xarray(df, freq="W-MON", countries:str=None, fill_value=0):
-
-    # Convert to datetime
-    df["start_dt"] = pd.to_datetime(df["start_dt"])
-
-    df["adm_0_name"] = df["adm_0_name"].str.title()  # Standardize country names
-    df["adm_2_name"] = df["adm_2_name"].str.title()  # Standardize Admin2 names
-
-    if countries is not None:
-        df = df[df["adm_0_name"].isin(countries)]
-            
-    # Collapse duplicates by mean
-    temp_df = df.groupby(["adm_0_name", "adm_2_name", "start_dt"]).agg({"dengue_total":"mean"}).reset_index()
-    
-    # Create a unique region ID
-    temp_df["region_id"] = temp_df["adm_0_name"] + "_" + temp_df["adm_2_name"]
-
-    # Pivot directly: time x region
-    pivoted_0 = temp_df.pivot(index="start_dt", columns="region_id", values="dengue_total")
-
-    pivoted_0.index = pd.to_datetime(pivoted_0.index)
-    pivoted_0.index = pivoted_0.index.to_period("W").to_timestamp()
-
-    # Reindex to full weekly timeline
-    full_index = pd.date_range(
-        pivoted_0.index.min(), pivoted_0.index.max(), freq="W-MON"
-    )
-
-    pivoted = pivoted_0.reindex(full_index, fill_value=fill_value)
-    
-    # Convert to xarray
-    da = xr.DataArray(
-        pivoted.values,
-        coords={"time": full_index, "region": pivoted.columns.values},
-        dims=("time", "region"),
-        name="dengue_total"
-    )
-    return da
 
 def build_timeseries(da, n_weeks=12):
 
@@ -496,11 +404,8 @@ def process_gdf(zip_path, countries:list=None):
     else:
         return gdf
 
-
-
 def convert_data_to_yearly_presence(data:pd.DataFrame, filter_year:int=2000, spatial_resolution:str="Admin2"):
     
-
     data["start_dt"] = pd.to_datetime(data["calendar_start_date"])
     data["year"] = data["start_dt"].dt.year
 
