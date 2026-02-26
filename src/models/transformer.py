@@ -112,6 +112,35 @@ class MediumResBranchAttention(nn.Module):
         return self.fc(feat)                           # [B, out_dim]
 
 
+class RearrangeToChannelFirst(nn.Module):
+    def forward(self, x):
+        return x.permute(0, 3, 1, 2).contiguous()
+    
+class ZoneEmbeddingBlock(nn.Module):
+    def __init__(self, num_zones, embed_dim):
+        super().__init__()
+        # +1 to reserve index 0 as padding token for out-of-zone pixels
+        self.embedding = nn.Embedding(num_zones + 1, embed_dim, padding_idx=0)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.flatten = nn.Flatten(1)
+
+    def forward(self, x):
+        # x: [B, 1, 1, H, W],[B, 1, H, W] or [B, H, W]
+        if x.dim() == 5:
+            x = x.squeeze(1).squeeze(1).long() # [B, H, W]
+        
+        if x.dim() == 4:
+            x = x.squeeze(1)           # [B, H, W]
+        
+        x = x.long()
+        x = (x + 1).clamp(0, self.embedding.num_embeddings - 1)  # -1 → 0 (padding)
+
+        out = self.embedding(x)        # [B, H, W, embed_dim]
+        out = out.permute(0, 3, 1, 2)  # [B, embed_dim, H, W]
+        out = self.pool(out)           # [B, embed_dim, 1, 1]
+        return self.flatten(out)       # [B, embed_dim]
+
+
 class StaticBranch(nn.Module):
     def __init__(self, in_ch=1, out_dim=128):
         super().__init__()
@@ -131,62 +160,6 @@ class StaticBranch(nn.Module):
     def forward(self, x):
         return self.encoder(x)                         # [B, out_dim]
 
-
-class DenguePredictor(nn.Module):
-    def __init__(self,
-                 high_in_ch=3,
-                 med_in_ch=2,
-                 static_in_ch=1,
-                 high_out=128,
-                 med_out=128,
-                 static_out=128,
-                 hidden_dim=256,
-                 output_size=(86, 86),
-                 output_channels=1,
-                 decoder_channels=64):
-        super().__init__()
-        self.high_branch = HighResBranch(out_dim=high_out, in_ch=high_in_ch)
-        self.med_branch = MediumResBranchAttention(out_dim=med_out, in_ch=med_in_ch)
-        self.static_branch = StaticBranch(out_dim=static_out, in_ch=static_in_ch)
-
-        self.output_size = output_size
-        self.decoder_channels = decoder_channels
-
-        total_in = high_out + med_out + static_out
-
-        # Project to small spatial grid then upsample — avoids giant linear layer
-        self.fc = nn.Sequential(
-            nn.Linear(total_in, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, decoder_channels * 8 * 8),  # 8x8 bottleneck
-            nn.ReLU()
-        )
-
-        # Upsample + refine to output_size
-        self.decoder = nn.Sequential(
-            nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1),
-            nn.BatchNorm2d(decoder_channels),
-            nn.ReLU(),
-            nn.Conv2d(decoder_channels, output_channels, 1)
-        )
-
-    def forward(self, x_high, x_med, x_static):
-        f_high = self.high_branch(x_high)
-        f_med = self.med_branch(x_med)
-        f_static = self.static_branch(x_static)
-
-        fusion = torch.cat([f_high, f_med, f_static], dim=1)  # [B, total_in]
-
-        out = self.fc(fusion)                                  # [B, decoder_channels * 64]
-
-        B = out.shape[0]
-        out = out.view(B, self.decoder_channels, 8, 8)         # [B, decoder_channels, 8, 8]
-
-        # Upsample to target output size
-        out = F.interpolate(out, size=self.output_size, mode='bilinear', align_corners=False)
-
-        return self.decoder(out)                               # [B, 1, 86, 86]
-
 # -------------------------
 # Fusion + Prediction
 # -------------------------
@@ -202,11 +175,13 @@ class DenguePredictor(nn.Module):
                  hidden_dim=256,
                  output_size=(86, 86),
                  output_channels=1,
-                 decoder_channels=64):
+                 decoder_channels=64,
+                 num_zones=8000):
         super().__init__()
         self.high_branch = HighResBranch(out_dim=high_out, in_ch=high_in_ch, pretrained_autoencoder=pretrained_autoencoder)
         self.med_branch = MediumResBranchAttention(out_dim=med_out, in_ch=med_in_ch)
         self.static_branch = StaticBranch(out_dim=static_out, in_ch=static_in_ch)
+        self.zone_branch = ZoneEmbeddingBlock(num_zones, static_out)
 
         # Output configuration
         self.output_size = output_size
@@ -215,7 +190,7 @@ class DenguePredictor(nn.Module):
 
         # Fusion head (MLP) that projects to a small spatial feature map,
         # which is then decoded by convolutional layers to produce the final image.
-        total_in = high_out + med_out + static_out
+        total_in = high_out + med_out + static_out + static_out  
         H, W = output_size
         proj_pixels = decoder_channels * H * W
         self.fc = nn.Sequential(
@@ -232,13 +207,13 @@ class DenguePredictor(nn.Module):
             nn.Conv2d(decoder_channels, output_channels, kernel_size=1)
         )
 
-    def forward(self, x_high, x_med, x_static):
+    def forward(self, x_high, x_med, x_static, x_cond):
         f_high = self.high_branch(x_high)
         f_med = self.med_branch(x_med)
         f_static = self.static_branch(x_static)
-
+        f_embed = self.zone_branch(x_cond.long())
         # Concatenate embeddings
-        fusion = torch.cat([f_high, f_med, f_static], dim=1)
+        fusion = torch.cat([f_high, f_med, f_static, f_embed], dim=1)
 
         # Predict dengue risk / cases: project to spatial feature-map then decode
         out = self.fc(fusion)

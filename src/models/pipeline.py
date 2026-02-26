@@ -217,7 +217,7 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
     from pathlib import Path
     from types import SimpleNamespace
     from datetime import datetime
-
+    import numpy as np
     import torch
     import torch.nn as nn
     from torch.optim import AdamW
@@ -310,24 +310,33 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
     viirs_data_path = DATA_PATH / "modis" / "VIIRS_nightlight"
     era5_path = DATA_PATH / "ERA5" / "Latin_america"
     risk_raster_path = DATA_PATH / "riskmaps_public main data" / "DEN_riskmap_wmean_masked.tif"
-    admin_path = DATA_PATH / "weekly_admin2_cases.nc"
+    admin_path = DATA_PATH / "dengue_cases" #"weekly_admin2_cases.nc"
 
-    ds_cases = xr.open_dataset(admin_path)
-    if args.sample:
-        sample_dates = 20
-        ds_cases = ds_cases.isel(time=slice(0, sample_dates))
-        first_date = ds_cases.isel(time=0)["time"].values
-        last_date = ds_cases.isel(time=-1)["time"].values
-    else:
-        first_date, last_date = None, None
+    start_date = "2012-01-01"
+    end_date = "2024-12-31"
 
-    y = XarraySpatioTemporalDataset(ds_cases, T_max=1)
-    era5 = ERA5Daily(era5_path, T_max=63, min_date=first_date, max_date=last_date)
-    viirs = VIIRSData(viirs_data_path, min_date=first_date, max_date=last_date)
+    ds_cases = xr.open_mfdataset(os.path.join(admin_path, "*.nc")).sel(time=slice(start_date, end_date))
+    num_zones = len(np.unique(ds_cases["FAO_GAUL_code"].values))
+
+    # if args.sample:
+    #     sample_dates = 20
+    #     ds_cases = ds_cases.isel(time=slice(0, sample_dates))
+        # first_date = ds_cases.isel(time=0)["time"].values
+        # last_date = ds_cases.isel(time=-1)["time"].values
+    # else:
+    #     first_date, last_date = None, None
+
+    y = XarraySpatioTemporalDataset(ds_cases, variables=["dengue_total"], T_max=1)
+    x_spatial = XarraySpatioTemporalDataset(ds_cases, variables=["FAO_GAUL_code"], T_max=1)
+    era5 = ERA5Daily(era5_path, T_max=63, min_date=start_date, max_date=end_date)
+    viirs = VIIRSData(viirs_data_path, min_date=start_date, max_date=end_date)
     static = StaticLayer(risk_raster_path, nodata=-3.3999999521443642e+38)
 
-    full_dataset = DengueDataset(viirs, era5, static, y, bbox=latin_box(), 
-                                 skip_era5_bounds=True, cache_dir=str(run_dir / "cache"))
+    # Use shared cache directory that persists across runs (not inside run-specific directory)
+    shared_cache_dir = base_dir / "dataset_cache"
+    full_dataset = DengueDataset(viirs, era5, static, x_spatial, y, bbox=latin_box(), 
+                                 skip_era5_bounds=True, cache_dir=shared_cache_dir, 
+                                 num_zones=num_zones, loss_fn=cfg["loss_fn"])
 
 
     logger.info(f"Dataset bbox clipped to ERA5 valid extent: {full_dataset.bbox}")
@@ -364,10 +373,24 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
         pretrained_autoencoder="swin_tiny_patch4_window7_224.ms_in1k",
         high_in_ch=3,
         med_in_ch=18,
-        static_in_ch=1
+        static_in_ch=1,
+        num_zones=num_zones 
     ).to(device)
 
-    criterion = nn.MSELoss(reduction="none")
+    
+    if cfg["loss_fn"] == "poisson":
+        from models import MaskedAdmin2Loss
+        criterion = MaskedAdmin2Loss(
+            loss_fn=nn.PoissonNLLLoss(log_input=True, reduction='mean'),
+            num_zones=num_zones,
+            device=device,
+
+        )
+    elif cfg["loss_fn"] == "mse":
+        criterion = nn.MSELoss(reduction="none")
+    else:
+        raise ValueError(f"Unsupported loss function: {cfg['loss_fn']}")
+
     optimizer = AdamW(model.parameters(), lr=cfg["learning_rate"])
     
     # Learning rate scheduler
@@ -436,27 +459,29 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
                  run_dir
             )
 
-            x_high, x_med, x_static, y_batch = [
+            x_high, x_med, x_static, x_cond, y_batch = [
                 b.to(device, non_blocking=True) for b in batch
             ]
-            x_high, x_med, x_static, y_batch = process_datasets(
-                [x_high, x_med, x_static, y_batch], 
+            x_high, x_med, x_static, x_cond, y_batch = process_datasets(
+                [x_high, x_med, x_static, x_cond, y_batch], 
                 replace_nan=-99, 
                 fill_nans=args.fillna
-            )
+            )                
 
             optimizer.zero_grad()
 
             with torch.amp.autocast(enabled=cfg["amp"], device_type=cfg["device"]):
-                y_pred = model(x_high, x_med, x_static)
+                y_pred = model(x_high, x_med, x_static, x_cond) 
                 y_pred, y_batch = align_preds_targets(y_pred, y_batch)
 
-                mask = torch.isfinite(y_batch).float()
+                debug_nan([x_high, x_med, x_static, x_cond, y_pred, y_batch],
+                    ['x_high','x_med','x_static','x_cond','y_pred','y_batch'])
 
-                debug_nan([x_high, x_med, x_static, y_pred, y_batch, mask],
-                    ['x_high','x_med','x_static','y_pred','y_batch','mask'])
-
-                loss = masked_custom_loss(criterion, y_pred, y_batch, mask)
+                if cfg["loss_fn"] == "poisson":
+                    loss = criterion.zone_loss(y_pred, y_batch, x_cond)
+                else:
+                    mask = torch.isfinite(y_batch).float()
+                    loss = masked_custom_loss(criterion, y_pred, y_batch, mask)
                 
                 # Skip batch if loss is NaN
                 if torch.isnan(loss):
@@ -487,15 +512,18 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
                 if batch is None:
                     continue
 
-                x_high, x_med, x_static, y_batch = [b.to(device) for b in batch]
-                x_high, x_med, x_static, y_batch = process_datasets([x_high, x_med, x_static, y_batch], replace_nan=-99, fill_nans=args.fillna)
+                x_high, x_med, x_static, x_cond, y_batch = [b.to(device) for b in batch]
+                x_high, x_med, x_static, x_cond, y_batch = process_datasets([x_high, x_med, x_static, x_cond, y_batch], replace_nan=-99, fill_nans=args.fillna)
 
                 with torch.amp.autocast(enabled=cfg["amp"], device_type=cfg["device"]):
-                    y_pred = model(x_high, x_med, x_static)
+                    y_pred = model(x_high, x_med, x_static, x_cond)
                     y_pred, y_batch = align_preds_targets(y_pred, y_batch)
 
-                    mask = torch.isfinite(y_batch).float()
-                    loss = masked_custom_loss(criterion, y_pred, y_batch, mask)
+                    if cfg["loss_fn"] == "poisson":
+                        loss = criterion.zone_loss(y_pred, y_batch, x_cond)
+                    else:
+                        mask = torch.isfinite(y_batch).float()
+                        loss = masked_custom_loss(criterion, y_pred, y_batch, mask)
                 
                 # Skip batch if loss is NaN
                 if torch.isnan(loss):
@@ -568,6 +596,8 @@ def plot_learning_curves(train_losses, val_losses, plot_dir, logger):
 
 
 if __name__ == "__main__":
+    import os
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     import argparse
     from definitions import ROOT_DIR
     import os
@@ -575,15 +605,18 @@ if __name__ == "__main__":
     import torch
     parser = argparse.ArgumentParser(description="Run the dataset preparation pipeline.")
     parser.add_argument("--sample", action="store_true", help="Whether to run in sample mode with fewer points and times for quick testing.")
-    parser.add_argument("--batch_size", type=int, default=int(os.getenv("BATCH_SIZE", 32)), help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience (epochs without improvement)")
     parser.add_argument("--num_epochs", type=int, default=100, help="Maximum number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for optimizer")
     parser.add_argument("--fillna", action="store_true", help="Whether to fill NaN values in the dataset with a specified value (e.g., -99)")
     parser.add_argument("--checkpoint", type=int, default=None, help="Epoch number to resume from (loads from most recent run directory)")
     parser.add_argument("--workers", type=int, default=int(os.getenv("NUM_WORKERS", 4)), help="Number of workers for data loading")
+    parser.add_argument("--loss_fn", type=str, choices=["mse", "poisson"], default="mse", help="Loss function to use for training")
+      
     args = parser.parse_args()
-    
+
+
     config = {
         "batch_size": args.batch_size,
         "num_epochs": args.num_epochs,
@@ -594,6 +627,7 @@ if __name__ == "__main__":
         "amp": True,
         "grad_clip": 1.0,
         "save_dir": ROOT_DIR / "checkpoints",
+        "loss_fn": args.loss_fn,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
     }
 

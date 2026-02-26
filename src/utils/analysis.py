@@ -5,6 +5,7 @@ from definitions import DATA_PATH
 import logging
 from utils.general import process_gdf
 from tqdm import tqdm
+import os 
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,9 @@ class DengueRasterizer():
         
         if output_file is None:
             countries_str = "_".join(countries)
-            self.output_file = DATA_PATH / "dengue_cases"/ f"dengue_admin2_cases_{countries_str}.nc"
+            output_path =  DATA_PATH / "dengue_cases"
+            os.makedirs(output_path, exist_ok=True)
+            self.output_file = output_path / f"dengue_admin2_cases_{countries_str}.nc"
         else:
             self.output_file = output_file
 

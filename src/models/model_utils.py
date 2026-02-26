@@ -18,7 +18,7 @@ from torchgeo.samplers import GridGeoSampler
 
 from tqdm import tqdm
 
-from typing import Optional
+from typing import Optional, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ def export_batches(batch_idx, epoch, batch, run_dir,
     if epoch != export_epoch or batch_idx >= n_export_batches:
         return
 
-    x_high, x_med, x_static, y_batch = batch
+    x_high, x_med, x_static, x_cond, y_batch = batch
 
     export_dir = run_dir / "batch_exports" / f"epoch_{epoch:03d}"
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -49,6 +49,7 @@ def export_batches(batch_idx, epoch, batch, run_dir,
             "x_high": x_high.cpu().numpy(),
             "x_med": x_med.cpu().numpy(),
             "x_static": x_static.cpu().numpy(),
+            "x_cond": x_cond.cpu().numpy(),
             "y_batch": y_batch.cpu().numpy(),
         }
     )
@@ -810,6 +811,65 @@ def mask_mbe(preds, labels, mask, return_value=True):
             return loss
         
 
+class MaskedAdmin2Loss():
+    def __init__(self, loss_fn, num_zones, device, pop_weights=None):
+        self.device = device
+        self.loss_fn = loss_fn
+        self.num_zones = num_zones
+        self.pop_weights = torch.tensor(pop_weights, dtype=torch.float32, device=self.device) if pop_weights is not None else None
+
+    def zone_aggregate(self, pred, zone_map):
+        B = pred.shape[0]
+        pred = pred.squeeze(1).float()          # [B, H, W]
+
+        # Handle any shape [..., H, W] → [B, H, W]
+        H, W = pred.shape[-2], pred.shape[-1]
+        zone_map = zone_map.view(B, H, W).long()
+
+        zone_preds  = torch.zeros(B, self.num_zones, device=pred.device, dtype=torch.float32)
+        zone_counts = torch.zeros(B, self.num_zones, device=pred.device, dtype=torch.float32)
+
+        # Valid mask: exclude -1 (out-of-zone) and out-of-bounds
+        valid = (zone_map >= 0) & (zone_map < self.num_zones)  # [B, H, W]
+
+        for b in range(B):
+            zm = zone_map[b][valid[b]].view(-1)
+            pv = pred[b][valid[b]].view(-1)
+            zone_preds[b].scatter_add_(0, zm, pv)
+            zone_counts[b].scatter_add_(0, zm, torch.ones_like(pv))
+
+        zone_means = zone_preds / (zone_counts + 1e-8)
+        return zone_means, zone_counts
+
+    def zone_loss(self, pred, target, zone_map):
+        """
+        pred:     [B, 1, H, W]  — model output (log-counts)
+        target:   [B, num_zones] — ground truth zone-level case counts
+        zone_map: [B, H, W]     — integer zone IDs
+        """
+        zone_preds, zone_counts = self.zone_aggregate(pred, zone_map)
+
+        # Mask 1: zones not present in this spatial patch
+        spatial_mask = zone_counts > 0              # [B, num_zones]
+
+        # Mask 2: zones with null/nan/inf targets
+        target_mask = torch.isfinite(target)        # [B, num_zones]
+
+        # Combined mask: zone must be present AND have a valid target
+        valid_mask = spatial_mask & target_mask     # [B, num_zones]
+
+        if valid_mask.sum() == 0:
+            # No valid zones in this batch — return zero loss with gradient
+            return (zone_preds * 0).sum()
+
+        loss = self.loss_fn(zone_preds[valid_mask], target[valid_mask])
+        return loss
+    
+    def weighted_zone_loss(self, zone_preds, target, valid_mask, weights):
+        diff = (zone_preds - target) ** 2
+        weighted = diff * weights  # [B, num_zones]
+        return weighted[valid_mask].mean()
+
 
 
 
@@ -899,7 +959,13 @@ class XarraySpatioTemporalDataset(RasterDataset):
     ):  
         
         self.ds = self._normalize_coords(ds)
-        self.variables = variables
+        if variables is not None:
+            self.variables = variables
+            self.ds = self.ds[variables]
+
+        if "FAO_GAUL_code" in self.ds:
+            self.ds, self.zone_remap, self.num_zones = self.remap_zone_ids(self.ds, zone_var="FAO_GAUL_code")
+
         self.T_max = T_max
         self.transform = transform
 
@@ -921,6 +987,44 @@ class XarraySpatioTemporalDataset(RasterDataset):
 
     def __len__(self):
         return len(self.times)
+
+    def remap_zone_ids(self, ds, zone_var):
+        """
+        Remap arbitrary zone IDs to contiguous 0..N-1 using xarray.apply_ufunc.
+        Returns the remapped DataArray and the lookup table.
+        """
+        zone_data = ds[zone_var]
+
+        # Get unique IDs from the full array (compute() forces evaluation if dask-backed)
+        unique_ids = np.unique(zone_data.values)
+        unique_ids = unique_ids[np.isfinite(unique_ids)].astype(np.int32)
+        num_zones = len(unique_ids)
+
+        # Build numpy lookup array: old_id -> new_id
+        max_id = int(unique_ids.max())
+        lookup = np.full(max_id + 1, -1, dtype=np.int32)
+        for new_id, old_id in enumerate(sorted(unique_ids.tolist())):
+            lookup[old_id] = new_id
+
+        def _remap(arr):
+            arr = arr.astype(np.int64)
+            arr_clipped = np.clip(arr, 0, max_id)
+            return lookup[arr_clipped]
+
+        remapped = xr.apply_ufunc(
+            _remap,
+            zone_data,
+            dask="parallelized",        # works transparently if ds is dask-backed
+            output_dtypes=[np.int32],
+            keep_attrs=True,
+        )
+
+        ds = ds.assign({zone_var: remapped})
+
+        logger.info(f"Zone remapping: {num_zones} zones, "
+                    f"ID range {unique_ids.min()}–{unique_ids.max()} → 0–{num_zones - 1}")
+
+        return ds, lookup, num_zones
 
     def __getitem__(self, query):
         """
@@ -1023,110 +1127,6 @@ class XarraySpatioTemporalDataset(RasterDataset):
             patch = self.transform(patch)
 
         return {"image": patch}
-
-# class ERA5Daily:
-#     """
-#     ERA5 preloaded tensor cube with TorchGeo-style [query] interface
-#     Returns patches as: {"image": Tensor[T, C, H, W]}
-#     """
-
-#     def __init__(self, root, variables=None, T_max=32, transform=None, min_date=None, max_date=None):
-#         import xarray as xr
-#         from pathlib import Path
-#         import torch
-
-#         self.root = Path(root)
-#         self.variables = variables
-#         self.T_max = T_max
-#         self.transform = transform
-
-#         # --- load dataset ---
-#         files = sorted(self.root.glob("era5land_latin_america*.nc"))
-#         if not files:
-#             raise RuntimeError("No ERA5 files found")
-
-#         ds = xr.open_mfdataset([str(f) for f in files], combine="by_coords")
-#         ds = self._normalize_coords(ds)
-
-#         if min_date is not None and max_date is not None:
-#             ds = ds.sel(time=slice(min_date, max_date))
-
-#         vars_ = variables or list(ds.data_vars)
-#         ds = ds[vars_].load()  # 🔥 fully in RAM
-
-#         # --- tensor cube ---
-#         da = ds.to_array()  # [T,C,H,W]
-#         self.data = torch.from_numpy(da.values).contiguous()
-#         self.data = self.data.permute(1, 0, 2, 3).contiguous()  # [T,C,H,W]
-
-#         # --- coords for slicing ---
-#         self.time_index = ds.time.values
-#         self.x_coords = ds.x.values
-#         self.y_coords = ds.y.values
-
-#         logger.info("ERA5 loaded into memory:", self.data.shape)
-
-#     def _normalize_coords(self, ds):
-#         rename = {}
-#         for k in ("lon", "longitude"):
-#             if k in ds.coords:
-#                 rename[k] = "x"
-#         for k in ("lat", "latitude"):
-#             if k in ds.coords:
-#                 rename[k] = "y"
-#         for k in ("valid_time", "date"):
-#             if k in ds.coords:
-#                 rename[k] = "time"
-#         if rename:
-#             ds = ds.rename(rename)
-
-#         if "x" in ds.coords:
-#             x = ds.x.values
-#             if x.max() > 180:
-#                 ds = ds.assign_coords(x=((ds.x + 180) % 360) - 180).sortby("x")
-
-#         if "y" in ds.coords:
-#             if ds.y[0] > ds.y[-1]:
-#                 ds = ds.sortby("y")
-
-#         return ds
-
-#     # --- THIS MAKES THE CLASS SUBSCRIPTABLE ---
-#     def __getitem__(self, query):
-#         """
-#         query: tuple of slices (x_slice, y_slice, t_slice)
-#         returns: {"image": Tensor[T,C,H,W]}
-#         """
-#         x_slice, y_slice, t_slice = query
-
-#         # --- get time indices ---
-#         t_mask = (self.time_index >= t_slice.start) & (self.time_index <= t_slice.stop)
-#         t_idx = torch.from_numpy(t_mask.nonzero()[0])
-
-#         if len(t_idx) == 0:
-#             return {"image": torch.empty(0)}
-
-#         # --- get spatial indices ---
-#         x_idx = torch.from_numpy(((self.x_coords >= x_slice.start) & (self.x_coords <= x_slice.stop)).nonzero()[0])
-#         y_idx = torch.from_numpy(((self.y_coords >= y_slice.start) & (self.y_coords <= y_slice.stop)).nonzero()[0])
-
-#         patch = self.data[t_idx][:, :, y_idx][:, :, :, x_idx]  # [T,C,H,W]
-
-#         # --- temporal padding ---
-#         T = patch.shape[0]
-#         if T > self.T_max:
-#             patch = patch[-self.T_max :]
-#         elif T < self.T_max:
-#             pad = torch.zeros((self.T_max - T, *patch.shape[1:]), dtype=patch.dtype)
-#             patch = torch.cat([pad, patch], dim=0)
-
-#         if self.transform:
-#             patch = self.transform(patch)
-
-#         return {"image": patch}
-
-#     def __len__(self):
-#         return len(self.time_index)
 
 
 class ERA5Daily:
@@ -1329,25 +1329,36 @@ class DengueDataset(torch.utils.data.Dataset):
         viirs,
         era5,
         static,
+        spatial_conditioning,
         y,
         patch_sizes={
             "viirs": (1024, 1024),
             "era5": (43, 43),
             "static": (102, 102),
-            "y": (86, 86)
+            "y": (86, 86),
+            "spatial_conditioning":(86, 86)
         },
         y_valid_threshold = 0.3,
+        loss_fn:Literal["mse", "poisson"] = "mse",
+        num_zones=None,
         bbox=None,
         skip_era5_bounds=False,
         cache_dir=None):
+
 
 
         self.viirs = viirs
         self.era5 = era5
         self.static = static
         self.y = y
+        self.spatial_conditioning = spatial_conditioning
         self.cache_dir = cache_dir
         self.skip_era5_bounds = skip_era5_bounds
+        self.loss_fn = loss_fn
+        self.num_zones = num_zones
+
+        if self.loss_fn == "poisson" and num_zones is None:
+            raise ValueError("num_zones must be provided for poisson loss")
 
         from utils import latin_box
 
@@ -1355,9 +1366,10 @@ class DengueDataset(torch.utils.data.Dataset):
         self.patch_size_era5 = patch_sizes.get("era5", (43, 43))
         self.patch_size_static = patch_sizes.get("static", (512, 512))
         self.patch_size_y = patch_sizes.get("y", (86, 86))
+        self.patch_size_spatial_cond = patch_sizes.get("spatial_conditioning", (86, 86))
 
         self.y_valid_threshold = y_valid_threshold
-
+        
         user_bbox = bbox if bbox is not None else latin_box()
 
         if not isinstance(user_bbox, (list, tuple, np.ndarray)) or len(user_bbox) != 4:
@@ -1466,8 +1478,8 @@ class DengueDataset(torch.utils.data.Dataset):
             t_viirs = t_week.to_period("M").to_timestamp()
             self.time_pairs.append((t_week, t_viirs))
 
-        # ---- Build spatial grid ONCE using first time ----
-        sample_idx = 1
+        # ---- Build spatial grid ONCE using random time ----
+        sample_idx = 5
 
         sampler = GridGeoSampler(
             self.viirs,
@@ -1549,6 +1561,7 @@ class DengueDataset(torch.utils.data.Dataset):
         # Determine cache file path
         cache_file = None
         if self.cache_dir:
+            os.makedirs(self.cache_dir, exist_ok=True)
             cache_file = Path(self.cache_dir) / "valid_patches_cache.pkl"
         
         # Try to load from cache first
@@ -1601,32 +1614,54 @@ class DengueDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         
         spatial_idx, time_idx = self.valid_indices[idx]
-
         bbox = self.spatial_queries[spatial_idx]
-
         x_slice, y_slice = bbox[0], bbox[1]
         t_week, t_viirs = self.time_pairs[time_idx]
 
         static_query = (x_slice, y_slice)
-        query_viirs = (x_slice, y_slice, slice(t_viirs, t_viirs))
+        query_viirs = (x_slice, y_slice, slice(
+            pd.Timestamp(t_viirs).to_period("M").to_timestamp(),
+            pd.Timestamp(t_viirs).to_period("M").to_timestamp()
+        ))
         query_xarray = (x_slice, y_slice, slice(t_week, t_week))
 
-        # # logger.info("ERA5 x,y range:", float(self.era5.ds.x.min()), float(self.era5.ds.x.max()), float(self.era5.ds.y.min()), float(self.era5.ds.y.max()))
-        # logger.info("ERA5 y first/last:", self.era5.ds.y.values[0], self.era5.ds.y.values[-1])
-
-        # logger.info("VIIRS x,y range:", viirs.bounds[0].start, viirs.bounds[0].stop, viirs.bounds[1].start, viirs.bounds[1].stop)
-        # logger.info("Output x,y range:", float(self.y.ds.x.min()), float(self.y.ds.x.max()), float(self.y.ds.y.min()), float(self.y.ds.y.max()))
-        # logger.info("Query x:", x_slice.start, x_slice.stop)
-        # logger.info("Query y:", y_slice.start, y_slice.stop)
-
         try:
-            x_high = self._pad_to_size(self.viirs[query_viirs]["image"].float(), *self.patch_size)
-            x_med = self._pad_to_size(self.era5[query_xarray]["image"].float(), *self.patch_size_era5)
-            x_static = self._pad_to_size(self.static[static_query]["image"].float(), *self.patch_size_static)
-            y_val = self._pad_to_size(self.y[query_xarray]["image"].float(), *self.patch_size_y)
-            return x_high, x_med, x_static, y_val
-        
+            x_high    = self._pad_to_size(self.viirs[query_viirs]["image"].float(), *self.patch_size)
+            x_med     = self._pad_to_size(self.era5[query_xarray]["image"].float(), *self.patch_size_era5)
+            x_static  = self._pad_to_size(self.static[static_query]["image"].float(), *self.patch_size_static)
+            x_cond    = self._pad_to_size(self.spatial_conditioning[query_xarray]["image"].float(), *self.patch_size_spatial_cond)
+            y_spatial = self._pad_to_size(self.y[query_xarray]["image"].float(), *self.patch_size_y)
+
+            if self.loss_fn == "poisson":
+                # Aggregate y from pixel-level [1, H, W] to zone-level [num_zones]
+                y_2d = y_spatial.view(y_spatial.shape[-2], y_spatial.shape[-1]).squeeze(0) # [H, W]
+                zone_map = x_cond.view(x_cond.shape[-2], x_cond.shape[-1]).squeeze(0).long()   # [H, W]
+
+                zone_sums   = torch.zeros(self.num_zones, dtype=torch.float32)
+                zone_counts = torch.zeros(self.num_zones, dtype=torch.float32)
+
+                valid = torch.isfinite(y_2d)
+                if valid.any():
+                    zm = zone_map[valid].view(-1)
+                    yv = y_2d[valid].float().view(-1)
+                    # Drop any remaining -1s that slipped through
+                    pos = zm >= 0
+                    zone_sums.scatter_add_(0, zm[pos], yv[pos])
+                    zone_counts.scatter_add_(0, zm[pos], torch.ones_like(yv[pos]))
+                # NaN for zones absent from this patch → masked out in loss
+                y_val = torch.where(
+                    zone_counts > 0,
+                    zone_sums / zone_counts,
+                    torch.full_like(zone_sums, float('nan'))
+                )  # [num_zones]
+
+            else:
+                y_val = y_spatial  # [1, H, W] — original pixel-level behaviour
+
+            return x_high, x_med, x_static, x_cond, y_val
+
         except Exception as e:
+            logger.error(f"Error loading patch at spatial_idx={spatial_idx}, time_idx={time_idx}: {e}")
             return None
 
 
