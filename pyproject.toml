@@ -48,6 +48,7 @@ dependencies = [
     "huggingface-hub>=1.2.3",
     "majortom",
     "transformers>=5.2.0",
+    "gdal>=3.12.2",
 ]
 
 [dependency-groups]

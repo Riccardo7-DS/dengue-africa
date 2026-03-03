@@ -110,11 +110,6 @@ class MediumResBranchAttention(nn.Module):
         feat = feat2d.mean(dim=1)                      # [B, hidden_dim]
 
         return self.fc(feat)                           # [B, out_dim]
-
-
-class RearrangeToChannelFirst(nn.Module):
-    def forward(self, x):
-        return x.permute(0, 3, 1, 2).contiguous()
     
 class ZoneEmbeddingBlock(nn.Module):
     def __init__(self, num_zones, embed_dim):

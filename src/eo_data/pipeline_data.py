@@ -171,3 +171,5 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
         downloader.cleanup()
         logger.error(e)
         raise e
+
+

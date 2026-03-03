@@ -1,7 +1,7 @@
 # import ee
 import logging
 from pathlib import Path
-# from osgeo import gdal
+from osgeo import gdal
 from requests import patch
 from definitions import DATA_PATH
 import tempfile
@@ -916,7 +916,7 @@ class EarthAccessDownloader:
             for f in files:
                 ds = gdal.Open(str(f))
                 if ds is None:
-                    logger.warning(f"⚠️ Could not open {f}, skipping.")
+                    logger.warning(f"Could not open {f}, skipping.")
                     if f.endswith(self.raw_data_type):
                         Path(f).unlink(missing_ok=True)
                     continue
@@ -931,7 +931,7 @@ class EarthAccessDownloader:
                     if var in s[0]
                 ]
                 if not subdatasets:
-                    logger.warning(f"⚠️ No subdatasets for '{var}' on {date:%Y-%m-%d}")
+                    logger.warning(f"No subdatasets for '{var}' on {date:%Y-%m-%d}")
                     continue
 
                 da = self._build_mosaic(subdatasets, var)
