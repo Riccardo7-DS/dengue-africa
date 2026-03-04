@@ -110,7 +110,6 @@ load_dotenv()
 PRODUCT_KEY = "VIIRS_500m_night_monthly"
 
 CORRUPTED_DATES = [
-    "2014-03-01",
     "2014-09-01",
     "2015-05-01",
     "2016-01-01",
@@ -203,11 +202,11 @@ for date_str in CORRUPTED_DATES:
         # 🔥 override output directory WITHOUT touching API internals
         downloader.output_dir = NEW_OUTPUT_DIR
 
-        # downloader.cleanup()
         downloader.run(batch_days=1)
-
+        downloader.cleanup()
         logger.info(f"Finished {date_str}")
 
     except Exception as e:
+        downloader.cleanup()
         logger.error(f"Failed on {date_str}: {e}")
         continue
