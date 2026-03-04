@@ -129,8 +129,10 @@ CORRUPTED_DATES = [
 
 # CORRUPTED_DATES = ["2025-01-01"]
 
+from definitions import DATA_PATH
+
 NEW_OUTPUT_DIR = Path(
-    "/shared/home/rdercole/Riccardo/projects/dengue-africa/data/modis/VIIRS_nightlight/new_data"
+    DATA_PATH / "modis/VIIRS_nightlight/new_data"
 )
 
 # ------------------------------------------------------------------
@@ -184,14 +186,14 @@ for date_str in CORRUPTED_DATES:
     try:
         logger.info(f"Re-downloading {date_str}")
 
-        date_end = datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)
+        # date_end = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
         downloader = EarthAccessDownloader(args,
             short_name=short_name,
             bbox=bbox,
             variables=variables,
             resolution=resolution,
-            date_range=(date_str, date_end.strftime("%Y-%m-%d")),
+            date_range=(date_str, date_str),
             collection_name=f"{short_name}_061",
             output_format="tiff",
             raw_data_type=raw_data_type,

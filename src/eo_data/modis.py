@@ -465,17 +465,43 @@ class EarthAccessDownloader:
         logger.info(f"Using reproj_method: {reproj_method} with {self._crs}")
         return reproj_method
 
-    def _get_utm_crs(self):
-        if not self.bbox:
+    def _get_utm_crs(self, bbox=None):
+        """
+        Compute UTM CRS from a bounding box in EPSG:4326.
+
+        Parameters
+        ----------
+        bbox : tuple or list
+            (minx, miny, maxx, maxy) in EPSG:4326
+
+        Returns
+        -------
+        str
+            EPSG code string for the UTM zone.
+        """
+
+        # If bbox not provided, fallback to stored bbox
+        if bbox is None:
+            bbox = self.bbox
+
+        if not bbox:
             return "EPSG:6933"  # fallback
-        # bbox is [minx, miny, maxx, maxy] in EPSG:4326
-        lon = (self.bbox[0] + self.bbox[2]) / 2
-        lat = (self.bbox[1] + self.bbox[3]) / 2
+
+        minx, miny, maxx, maxy = bbox
+
+        # Center of the bounding box
+        lon = (minx + maxx) / 2
+        lat = (miny + maxy) / 2
+
+        # Compute UTM zone
         zone = int((lon + 180) / 6) + 1
+
+        # Determine hemisphere
         if lat >= 0:
-            epsg = 32600 + zone
+            epsg = 32600 + zone  # Northern hemisphere
         else:
-            epsg = 32700 + zone
+            epsg = 32700 + zone  # Southern hemisphere
+
         return f"EPSG:{epsg}"
 
     def _login_earthaccess(self):
@@ -590,32 +616,65 @@ class EarthAccessDownloader:
                 else:
                     earthaccess.download(results, str(self.granule_dir))
 
-        # After download, refresh file list
+        # After download, refresh file list and filter by date range
         if not self._store_cloud:
-            self.files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.{self.raw_data_type}")))
+            all_files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.{self.raw_data_type}")))
         else:
-            self.files = sorted(glob.glob(str(self.temp_dir / f"{self.short_name}*.{self.raw_data_type}")))
+            all_files = sorted(glob.glob(str(self.temp_dir / f"{self.short_name}*.{self.raw_data_type}")))
+        
+        # Filter files to only keep those within the requested date range
+        start_date, end_date = self.date_range if date_range is None else date_range
+        range_start = datetime.strptime(start_date, "%Y-%m-%d")
+        range_end = datetime.strptime(end_date, "%Y-%m-%d")
+        
+        self.files = []
+        for f in all_files:
+            file_date = self._get_date(f)
+            if range_start <= file_date <= range_end:
+                self.files.append(f)
 
 
-    def _custom_preprocess(self, da):
+    def _custom_preprocess(self, da, band_name=None):
 
-        # ---------- PRODUCT-SPECIFIC TRANSFORMS ----------
+        if band_name is None:
+            band_name = da.name
+
+        # ---------- MODIS LST ----------
         if self.short_name == "MOD11A1":
-            # LST products: scale factor and conversion to Celsius
-            da = da.where(da > 0).astype("float32") * 0.02 - 273.15  # LST scale factor
+            da = da.where(da > 0).astype("float32") * 0.02 - 273.15
             da.name = "LST_Day_Celsius"
+
+        # ---------- MODIS NDVI ----------
         elif "MOD13" in self.short_name:
-            # NDVI products (MOD13Q1, MYD13A2, etc.)
-            da = da.where(da != -3000) * 0.0001  # NDVI scale factor
+            da = da.where(da != -3000).astype("float32") * 0.0001
             da.name = "NDVI"
+
+        # ---------- VIIRS NIGHT LIGHTS ----------
         elif "VNP46A" in self.short_name:
-            da = da.rio.write_nodata(-9999)  # int16-safe nodata
-            da = da.where(da != 65535, -9999)
+
+            if band_name in ["NearNadir_Composite_Snow_Free", "NearNadir_Composite_Snow_Free_Std"]:
+                da = da.where(da != 65535)
+                da = da.astype("float32")
+
+                # attrs are already stripped — apply known VIIRS scale factor directly
+                # VNP46A2 radiance scale is 0.1, offset 0
+                da = da * 0.1
+
+                da = da.rio.write_nodata(np.nan)
+                da.name = "Radiance" if "Std" not in band_name else "Radiance_Std"
+
+            elif band_name in ["NearNadir_Composite_Snow_Free_Quality", "NearNadir_Composite_Snow_Free_Num"]:
+                # Categorical band → keep integer
+                da = da.where(da != 65535, 0)
+                da = da.astype("uint8")
+                da = da.rio.write_nodata(0)
+                da.name = "Quality_Flag"
+
+        # ---------- DEFAULT ----------
         else:
+            da = da.astype("float32")
+            da = da.rio.write_nodata(np.nan)
             da.name = "band_data"
-            da = da.rio.write_nodata(-9999)  # Set nodata for int16 data
-            da = da.where(da != 65535, -9999)
-        # -------------------------------------------------
 
         return da
 
@@ -939,7 +998,7 @@ class EarthAccessDownloader:
                     continue
 
                 # --- Custom preprocessing ---
-                da = self._custom_preprocess(da)
+                # da = self._custom_preprocess(da)
                 da = da.expand_dims(time=[date])
                 da.name = var
                 variable_data[var] = da
@@ -992,30 +1051,59 @@ class EarthAccessDownloader:
         from osgeo import gdal
         import rioxarray
 
-        vrt_path = self.temp_dir / f"{self.short_name}_{var}.vrt"
-        tif_path = self.temp_dir / f"{self.short_name}_{var}.tif"
-
         try:
             gdal.UseExceptions()
-            
-            # Reproject each subdataset to UTM before mosaicking
+
+            # 1. Reproject to UTM only — no preprocessing yet
             temp_tifs = []
             for i, subdataset in enumerate(subdatasets):
                 da = rioxarray.open_rasterio(subdataset, chunks=True).squeeze("band", drop=True)
-                dest_crs = self._get_utm_crs(da.rio.bounds())
-                
+                dest_crs = self._get_utm_crs()
+
                 if not dest_crs.startswith("EPSG"):
                     raise ValueError(f"Invalid UTM CRS returned: {dest_crs}")
+
+                da.attrs.pop("scale_factor", None)
+                da.attrs.pop("add_offset", None)
+
                 da_utm = da.rio.reproject(
                     dst_crs=dest_crs,
                     resampling=self._reproj_method,
                     resolution=self._resolution
                 )
+
+                da_utm.attrs.pop("scale_factor", None)
+                da_utm.attrs.pop("add_offset", None)
+                
                 temp_tif = self.temp_dir / f"temp_{var}_{i}.tif"
                 da_utm.rio.to_raster(str(temp_tif), driver="GTiff")
                 temp_tifs.append(str(temp_tif))
-            
-            vrt = gdal.BuildVRT(str(vrt_path), temp_tifs, creationOptions=["NUM_THREADS=ALL_CPUS"])
+
+            # 2. Group tiles by dtype before mosaicking
+            dtype_groups = {}
+            for tif in temp_tifs:
+                ds = gdal.Open(tif)
+                dtype = ds.GetRasterBand(1).DataType  # e.g. GDT_Float32, GDT_Byte
+                ds = None
+                dtype_groups.setdefault(dtype, []).append(tif)
+
+            if len(dtype_groups) > 1:
+                # Pick the dominant group (most tiles), warn about the rest
+                dominant_dtype, dominant_tifs = max(dtype_groups.items(), key=lambda x: len(x[1]))
+                logger.warning(
+                    f"Mixed dtypes detected for {var}: "
+                    f"{ {gdal.GetDataTypeName(k): len(v) for k, v in dtype_groups.items()} }. "
+                    f"Using dtype '{gdal.GetDataTypeName(dominant_dtype)}' group only."
+                )
+                tifs_to_mosaic = dominant_tifs
+            else:
+                tifs_to_mosaic = temp_tifs
+
+            # 3. Build VRT + translate with homogeneous dtype group
+            vrt_path = self.temp_dir / f"{self.short_name}_{var}.vrt"
+            tif_path = self.temp_dir / f"{self.short_name}_{var}.tif"
+
+            vrt = gdal.BuildVRT(str(vrt_path), tifs_to_mosaic, creationOptions=["NUM_THREADS=ALL_CPUS"])
             if vrt is None:
                 raise RuntimeError("BuildVRT returned None")
 
@@ -1026,8 +1114,10 @@ class EarthAccessDownloader:
             )
             vrt = None
 
-            da_mosaic = rioxarray.open_rasterio(tif_path, chunks=True).squeeze("band", drop=True).astype("int16")
-            return da_mosaic 
+            # 4. Preprocess ONCE on the full mosaic — much faster
+            da_mosaic = rioxarray.open_rasterio(tif_path, chunks=True).squeeze("band", drop=True)
+            da_mosaic = self._custom_preprocess(da_mosaic, band_name=os.path.basename(str(subdatasets[0])))
+            return da_mosaic
 
         except RuntimeError as e:
             logger.warning(f"GDAL mosaic failed for {var}: {e}")
@@ -1417,8 +1507,8 @@ class EarthAccessDownloader:
         batches = []
         
         current = start
-        while current < end:
-            batch_end = min(current + timedelta(days=batch_days), end)
+        while current <= end:
+            batch_end = min(current + timedelta(days=batch_days - 1), end)
             batches.append((current.strftime("%Y-%m-%d"), batch_end.strftime("%Y-%m-%d")))
             current = batch_end + timedelta(days=1)
         

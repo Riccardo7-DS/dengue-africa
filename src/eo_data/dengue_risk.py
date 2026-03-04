@@ -1,4 +1,3 @@
-from cuda.bindings import utils
 from definitions import DATA_PATH
 from pathlib import Path
 import rioxarray
