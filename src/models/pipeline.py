@@ -1,40 +1,4 @@
-import logging
-import sys
 import argparse
-
-from models.model_utils import export_batches
-
-def run_pipeline():
-    from models import DengueConvLSTM
-    import torch
-    from utils import admin2_aggregate, aggregate_to_admin, load_admin_data
-    from torch.nn import MSELoss
-    from definitions import DATA_PATH
-
-    tabular_data = load_admin_data(DATA_PATH / "Spatial_extract_V1_3.csv",
-        temporal_resolution="Week", 
-        spatial_resolution="Admin2", 
-        filter_year=2000
-    )
-
-    data_path = DATA_PATH / "Spatial_extract_V1_3.csv"
-    weekly_admin2_cases = load_admin_data(data_path, 
-        temporal_resolution="Week", 
-        spatial_resolution="Admin2", 
-        filter_year=2000
-    )
-
-    criterion = MSELoss()
-    model = DengueConvLSTM(raster_channels=3, tab_features=20, hidden_dim=64, weeks_out=4)
-    raster_seq = torch.randn(8, 10, 3, 32, 32)  # (B, T, C, H, W)
-
-    
-    # Training loop
-    weekly_pred = model(raster_seq, tabular_data)  # (B, weeks, H, W)
-    agg_pred = aggregate_to_admin(weekly_pred, admin2_mask)
-    loss = criterion(agg_pred, weekly_admin2_cases)  # MSE / Poisson / etc.
-
-
 
 def tabular_dataset_pipeline(sample=False):
     from definitions import DATA_PATH
@@ -254,11 +218,15 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
     # ------------------------------------------------------------------
     default_config = {
         "batch_size": 32,
+        "grad_accum_steps": 1,
         "num_epochs": 20,
         "learning_rate": 1e-4,
         "train_split": 0.8,
         "patience": 5,
         "num_workers": 4,
+        "prefetch_factor": 2,  # Increased from 1 to keep workers busy
+        "persistent_workers": True,
+        "pin_memory": True,
         "amp": True,
         "grad_clip": 1.0,
         "save_dir": "./checkpoints",
@@ -313,7 +281,7 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
     admin_path = DATA_PATH / "dengue_cases" #"weekly_admin2_cases.nc"
 
     start_date = "2012-01-01"
-    end_date = "2024-12-31"
+    end_date = "2023-12-31"
 
     ds_cases = xr.open_mfdataset(os.path.join(admin_path, "*.nc")).sel(time=slice(start_date, end_date))
     num_zones = len(np.unique(ds_cases["FAO_GAUL_code"].values))
@@ -328,8 +296,8 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
 
     y = XarraySpatioTemporalDataset(ds_cases, variables=["dengue_total"], T_max=1)
     x_spatial = XarraySpatioTemporalDataset(ds_cases, variables=["FAO_GAUL_code"], T_max=1)
-    era5 = ERA5Daily(era5_path, T_max=63, min_date=start_date, max_date=end_date)
-    viirs = VIIRSData(viirs_data_path, min_date=start_date, max_date=end_date)
+    era5 = ERA5Daily(era5_path, T_max=63, T_offset=1, min_date=start_date, max_date=end_date)
+    viirs = VIIRSData(viirs_data_path, min_date=start_date, max_date=end_date, n_bands=2)
     static = StaticLayer(risk_raster_path, nodata=-3.3999999521443642e+38)
 
     # Use shared cache directory that persists across runs (not inside run-specific directory)
@@ -348,34 +316,73 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-    train_loader = DataLoader(
-        train_dataset,
+    def _worker_init_fn(_):
+        # Prevent each worker from spawning many OpenMP threads.
+        torch.set_num_threads(1)
+
+    train_loader_kwargs = dict(
+        dataset=train_dataset,
         batch_size=cfg["batch_size"],
         shuffle=True,
         collate_fn=collate_skip_none,
         num_workers=cfg["num_workers"],
-        pin_memory=True,
+        pin_memory=cfg["pin_memory"],
+        worker_init_fn=_worker_init_fn if cfg["num_workers"] > 0 else None,
     )
-
-    val_loader = DataLoader(
-        val_dataset,
+    val_loader_kwargs = dict(
+        dataset=val_dataset,
         batch_size=cfg["batch_size"],
         shuffle=False,
         collate_fn=collate_skip_none,
         num_workers=cfg["num_workers"],
-        pin_memory=True,
+        pin_memory=cfg["pin_memory"],
+        worker_init_fn=_worker_init_fn if cfg["num_workers"] > 0 else None,
+    )
+
+    if cfg["num_workers"] > 0:
+        train_loader_kwargs["persistent_workers"] = cfg["persistent_workers"]
+        val_loader_kwargs["persistent_workers"] = cfg["persistent_workers"]
+        train_loader_kwargs["prefetch_factor"] = cfg["prefetch_factor"]
+        val_loader_kwargs["prefetch_factor"] = cfg["prefetch_factor"]
+
+    train_loader = DataLoader(**train_loader_kwargs)
+    val_loader = DataLoader(**val_loader_kwargs)
+
+    # Log DataLoader configuration
+    logger.info(
+        f"DataLoader config: num_workers={cfg['num_workers']}, "
+        f"prefetch_factor={cfg['prefetch_factor']}, "
+        f"batch_size={cfg['batch_size']}, "
+        f"pin_memory={cfg['pin_memory']}, "
+        f"persistent_workers={cfg['persistent_workers']}"
     )
 
     # ------------------------------------------------------------------
     # Model, optimizer, loss
     # ------------------------------------------------------------------
-    model = DenguePredictor(
-        pretrained_autoencoder="swin_tiny_patch4_window7_224.ms_in1k",
-        high_in_ch=3,
-        med_in_ch=18,
-        static_in_ch=1,
-        num_zones=num_zones 
-    ).to(device)
+    
+    if cfg.get("titok", False):
+        # TiTok with custom settings
+        logger.info("Using TiTok model as high res branch")
+        model = DenguePredictor(
+            use_titok=True,
+            high_in_ch=2,
+            med_in_ch=18,
+            static_in_ch=1,
+            num_zones=num_zones,
+            titok_backbone='vit_base_patch16_224.mae',
+            titok_num_latent_tokens=16,   # more aggressive compression for sparse nightlights
+            titok_patch_size=256
+        ).to(device)
+    else:
+        logger.info("Using Swin model as high res branch")
+        model = DenguePredictor(
+            swin_model="swin_tiny_patch4_window7_224.ms_in1k",
+            high_in_ch=2,
+            med_in_ch=18,
+            static_in_ch=1,
+            num_zones=num_zones 
+        ).to(device)
 
     
     if cfg["loss_fn"] == "poisson":
@@ -448,6 +455,9 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
         model.train()
         running_loss = 0.0
         n_batches = 0
+        grad_accum_steps = max(1, int(cfg["grad_accum_steps"]))
+
+        optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(train_loader):
             if batch is None:
@@ -456,7 +466,8 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
             export_batches(
                 batch_idx, epoch,
                  batch, 
-                 run_dir
+                 run_dir,
+                 n_export_batches=0 # Set to >0 to export some batches for debugging
             )
 
             x_high, x_med, x_static, x_cond, y_batch = [
@@ -464,11 +475,9 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
             ]
             x_high, x_med, x_static, x_cond, y_batch = process_datasets(
                 [x_high, x_med, x_static, x_cond, y_batch], 
-                replace_nan=-99, 
+                replace_nan=-2, 
                 fill_nans=args.fillna
             )                
-
-            optimizer.zero_grad()
 
             with torch.amp.autocast(enabled=cfg["amp"], device_type=cfg["device"]):
                 y_pred = model(x_high, x_med, x_static, x_cond) 
@@ -488,14 +497,19 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
                     logger.warning("[train] Loss is NaN, skipping this batch")
                     continue
                 else:
-                    scaler.scale(loss).backward()
+                    scaled_loss = loss / grad_accum_steps
+                    scaler.scale(scaled_loss).backward()
 
-            if cfg["grad_clip"] is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+            should_step = ((batch_idx + 1) % grad_accum_steps == 0)
 
-            scaler.step(optimizer)
-            scaler.update()
+            if should_step:
+                if cfg["grad_clip"] is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
             running_loss += loss.item()
             n_batches += 1
@@ -513,7 +527,7 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
                     continue
 
                 x_high, x_med, x_static, x_cond, y_batch = [b.to(device) for b in batch]
-                x_high, x_med, x_static, x_cond, y_batch = process_datasets([x_high, x_med, x_static, x_cond, y_batch], replace_nan=-99, fill_nans=args.fillna)
+                x_high, x_med, x_static, x_cond, y_batch = process_datasets([x_high, x_med, x_static, x_cond, y_batch], replace_nan=-2, fill_nans=args.fillna)
 
                 with torch.amp.autocast(enabled=cfg["amp"], device_type=cfg["device"]):
                     y_pred = model(x_high, x_med, x_static, x_cond)
@@ -597,7 +611,6 @@ def plot_learning_curves(train_losses, val_losses, plot_dir, logger):
 
 if __name__ == "__main__":
     import os
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     import argparse
     from definitions import ROOT_DIR
     import os
@@ -611,8 +624,13 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for optimizer")
     parser.add_argument("--fillna", action="store_true", help="Whether to fill NaN values in the dataset with a specified value (e.g., -99)")
     parser.add_argument("--checkpoint", type=int, default=None, help="Epoch number to resume from (loads from most recent run directory)")
-    parser.add_argument("--workers", type=int, default=int(os.getenv("NUM_WORKERS", 4)), help="Number of workers for data loading")
+    parser.add_argument("--workers", type=int, default=int(os.getenv("NUM_WORKERS", 4)), help="Number of workers for data loading (default 4, increase to 8-12 if training is slow and workers are underutilized)")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="DataLoader prefetch factor per worker (increase to 2-4 if workers are idle, decrease if OOM)")
+    parser.add_argument("--no_pin_memory", action="store_true", help="Disable DataLoader pin_memory (use if OOM)")
+    parser.add_argument("--no_persistent_workers", action="store_true", help="Disable DataLoader persistent workers (use if workers crash)")
+    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps (effective batch = batch_size * grad_accum_steps)")
     parser.add_argument("--loss_fn", type=str, choices=["mse", "poisson"], default="mse", help="Loss function to use for training")
+    parser.add_argument("--titok", action="store_true", help="Using TiTok model with custom settings instead of Swin for high res branch")
       
     args = parser.parse_args()
 
@@ -624,11 +642,16 @@ if __name__ == "__main__":
         "train_split": 0.8,
         "patience": args.patience,
         "num_workers": args.workers,
+        "prefetch_factor": args.prefetch_factor,
+        "persistent_workers": not args.no_persistent_workers,
+        "pin_memory": not args.no_pin_memory,
+        "grad_accum_steps": args.grad_accum_steps,
         "amp": True,
         "grad_clip": 1.0,
         "save_dir": ROOT_DIR / "checkpoints",
         "loss_fn": args.loss_fn,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "titok": args.titok
     }
 
     # tb = ProgressBar().register()

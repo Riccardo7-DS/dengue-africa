@@ -2,6 +2,7 @@
 Functions for DL models
 """
 
+import math
 import os 
 import logging 
 import numpy as np 
@@ -12,13 +13,14 @@ from torchgeo.samplers import GridGeoSampler
 import xarray as xr
 import torch
 import torch.nn.functional as F
-
+import hashlib
+import pickle
 from torchgeo.datasets import RasterDataset
 from torchgeo.samplers import GridGeoSampler
-
+from pathlib import Path
 from tqdm import tqdm
 
-from typing import Optional, Literal
+from typing import List, Optional, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -870,9 +872,6 @@ class MaskedAdmin2Loss():
         weighted = diff * weights  # [B, num_zones]
         return weighted[valid_mask].mean()
 
-
-
-
 # -----------------------------------------------------------------------------
 # Datasets
 # -----------------------------------------------------------------------------
@@ -888,9 +887,12 @@ class VIIRSData(RasterDataset):
         root: str,
         min_date: Optional[str] = None,
         max_date: Optional[str] = None,
+        n_bands: int = 3,
         **kwargs,
     ):
         super().__init__(root, **kwargs)
+
+        self.n_bands = n_bands
 
         # Only filter if at least one bound is provided
         if min_date is not None or max_date is not None:
@@ -910,6 +912,13 @@ class VIIRSData(RasterDataset):
                 mask &= dates <= max_date
 
             self.index = self.index[mask]
+
+    def __getitem__(self, query):
+        sample = super().__getitem__(query)
+
+        sample["image"] = sample["image"][:self.n_bands]
+
+        return sample
 
 
 class StaticLayer(RasterDataset):
@@ -1141,6 +1150,7 @@ class ERA5Daily:
         root,
         variables=None,
         T_max=32,
+        T_offset=1,
         transform=None,
         min_date=None,
         max_date=None,
@@ -1150,7 +1160,9 @@ class ERA5Daily:
 
         self.root = Path(root)
         self.variables = variables
-        self.T_max = T_max
+        self.T_max = int(math.ceil(T_max / 7))
+        logger.info(f"ERA5 dataset initialized with T_max={self.T_max} weeks (T_offset={T_offset} days)")
+        self.T_offset = T_offset
         self.transform = transform
 
         files = sorted(self.root.glob("era5land_latin_america*.nc"))
@@ -1555,31 +1567,64 @@ class DengueDataset(torch.utils.data.Dataset):
 
     def _compute_valid_patches(self):
         """Compute and cache valid patch indices for faster subsequent runs"""
-        import pickle
-        from pathlib import Path
-        
-        # Determine cache file path
+
+        # -----------------------------
+        # Build robust cache filename
+        # -----------------------------
         cache_file = None
         if self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
-            cache_file = Path(self.cache_dir) / "valid_patches_cache.pkl"
-        
-        # Try to load from cache first
+
+            # hash time_pairs so cache invalidates if timestamps change
+            time_hash = hashlib.md5(str(self.time_pairs).encode()).hexdigest()[:10]
+
+            cache_name = (
+                f"valid_indices_"
+                f"{len(self.time_pairs)}t_"
+                f"{len(self.spatial_queries)}s_"
+                f"{time_hash}.pkl"
+            )
+
+            cache_file = Path(self.cache_dir) / cache_name
+
+        # -----------------------------
+        # Try loading cache
+        # -----------------------------
         if cache_file and cache_file.exists():
             try:
                 logger.info(f"[DengueDataset] Loading cached valid patches from {cache_file}...")
-                with open(cache_file, 'rb') as f:
+
+                with open(cache_file, "rb") as f:
                     self.valid_indices = pickle.load(f)
+
+                # Safety check: ensure cached indices are still valid
+                max_time_idx = max(t for _, t in self.valid_indices)
+
+                if max_time_idx >= len(self.time_pairs):
+                    raise RuntimeError(
+                        "Cached valid_indices incompatible with current time_pairs."
+                    )
+
                 logger.info(f"[DengueDataset] Loaded {len(self.valid_indices)} cached patches")
+
                 return self.valid_indices
+
             except Exception as e:
-                logger.warning(f"[DengueDataset] Failed to load cache: {e}. Computing patches...")
-        
-        # Compute valid patches (same logic as before)
+                logger.warning(
+                    f"[DengueDataset] Cache invalid or incompatible ({e}). Recomputing patches..."
+                )
+
+        # -----------------------------
+        # Compute valid patches
+        # -----------------------------
         logger.info("[DengueDataset] Computing valid spatiotemporal patches...")
         self.valid_indices = []
 
-        for spatial_idx, bbox in tqdm(enumerate(self.spatial_queries), total=len(self.spatial_queries), desc="Checking valid patches over space and time"):
+        for spatial_idx, bbox in tqdm(
+            enumerate(self.spatial_queries),
+            total=len(self.spatial_queries),
+            desc="Checking valid patches over space and time",
+        ):
 
             x_slice, y_slice = bbox[0], bbox[1]
 
@@ -1598,17 +1643,24 @@ class DengueDataset(torch.utils.data.Dataset):
 
         if len(self.valid_indices) == 0:
             raise RuntimeError("No valid spatiotemporal patches found!")
-        
-        # Save to cache for future runs
+
+        # -----------------------------
+        # Save cache
+        # -----------------------------
         if cache_file:
             try:
                 cache_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(cache_file, 'wb') as f:
+
+                with open(cache_file, "wb") as f:
                     pickle.dump(self.valid_indices, f)
-                logger.info(f"[DengueDataset] Cached {len(self.valid_indices)} patches to {cache_file}")
+
+                logger.info(
+                    f"[DengueDataset] Cached {len(self.valid_indices)} patches to {cache_file}"
+                )
+
             except Exception as e:
                 logger.warning(f"[DengueDataset] Failed to save cache: {e}")
-        
+
         return self.valid_indices
 
     def __getitem__(self, idx):
@@ -1623,14 +1675,17 @@ class DengueDataset(torch.utils.data.Dataset):
             pd.Timestamp(t_viirs).to_period("M").to_timestamp(),
             pd.Timestamp(t_viirs).to_period("M").to_timestamp()
         ))
-        query_xarray = (x_slice, y_slice, slice(t_week, t_week))
-
+        query_current = (x_slice, y_slice, slice(t_week, t_week))
+        query_previous_n_days = (x_slice, y_slice, slice(
+            pd.Timestamp(t_week) - pd.Timedelta(days=self.era5.T_max * 7 + self.era5.T_offset),
+            pd.Timestamp(t_week) - pd.Timedelta(days=self.era5.T_offset)
+        ))
         try:
             x_high    = self._pad_to_size(self.viirs[query_viirs]["image"].float(), *self.patch_size)
-            x_med     = self._pad_to_size(self.era5[query_xarray]["image"].float(), *self.patch_size_era5)
+            x_med     = self._pad_to_size(self.era5[query_previous_n_days]["image"].float(), *self.patch_size_era5)
             x_static  = self._pad_to_size(self.static[static_query]["image"].float(), *self.patch_size_static)
-            x_cond    = self._pad_to_size(self.spatial_conditioning[query_xarray]["image"].float(), *self.patch_size_spatial_cond)
-            y_spatial = self._pad_to_size(self.y[query_xarray]["image"].float(), *self.patch_size_y)
+            x_cond    = self._pad_to_size(self.spatial_conditioning[query_current]["image"].float(), *self.patch_size_spatial_cond)
+            y_spatial = self._pad_to_size(self.y[query_current]["image"].float(), *self.patch_size_y)
 
             if self.loss_fn == "poisson":
                 # Aggregate y from pixel-level [1, H, W] to zone-level [num_zones]
