@@ -521,6 +521,31 @@ def masked_mse(preds, labels, null_val=np.nan):
 def masked_rmse(preds, labels, null_val=np.nan):
     return torch.sqrt(masked_mse(preds, labels, null_val))
 
+def masked_bce(preds, labels, null_val=np.nan):
+    """
+    preds:  (B, H, W) logits
+    labels: (B, H, W) float binary mask (can contain NaN)
+    """
+    preds = preds.squeeze(1) if preds.dim() == 4 else preds
+
+    if np.isnan(null_val):
+        mask = ~torch.isnan(labels)
+    else:
+        mask = (labels != null_val)
+
+    mask = mask.float()
+    mask = mask / mask.mean().clamp(min=1e-8)
+    mask = torch.nan_to_num(mask, nan=0.0)
+
+    labels_clean = torch.nan_to_num(labels, nan=0.0).float()
+
+    loss = F.binary_cross_entropy_with_logits(preds, labels_clean, reduction="none")
+    loss = loss * mask
+    loss = torch.nan_to_num(loss, nan=0.0)
+    return loss.mean()
+
+
+
 def masked_mae(preds, labels, null_val=np.nan):
     if np.isnan(null_val):
         mask = ~torch.isnan(labels)
@@ -620,91 +645,140 @@ def mask_rmse(preds, labels, mask=None):
 
 from typing import Union
 
-class CustomMetrics():
-    def __init__(self,
-                 preds:Union[torch.tensor, np.ndarray],
-                 labels:Union[torch.tensor, np.ndarray], 
-                 metric_lists:Union[list, str],
-                 mask = Union[None, torch.tensor, np.ndarray],
-                 masked:bool=False):
-        
-        if isinstance(preds, np.ndarray):
-            preds = torch.from_numpy(preds)
-        if isinstance(labels, np.ndarray):
-            labels = torch.from_numpy(labels)
-        if isinstance(mask, np.ndarray):
-            mask = torch.from_numpy(mask)
+class CustomMetrics:
+
+    def __init__(
+        self,
+        preds: Union[torch.Tensor, np.ndarray],
+        labels: Union[torch.Tensor, np.ndarray],
+        metric_list: Union[List[str], str],
+        mask: Union[None, torch.Tensor, np.ndarray] = None,
+        masked: bool = False,
+        reduction: str = "mean"
+    ):
+
+        self.preds = self._to_tensor(preds)
+        self.labels = self._to_tensor(labels)
+
+        self.mask = None
+        self.masked = masked
+        self.reduction = reduction
+
+        if mask is not None:
+            self.mask = self._to_tensor(mask).float()
+
+        if masked and self.mask is None:
+            raise ValueError("Masked=True but no mask provided")
 
         if masked:
-            self._count_masked_pixels(mask)
+            self._count_masked_pixels(self.mask)
 
-        self.mask = mask
-        if masked and mask is None:
-            logger.error(RuntimeError("No provided mask but chosen masked loss option"))
+        self.losses, self.metrics = self._get_metrics(metric_list)
 
-        self.losses, self.metrics = self._get_metrics(metric_lists, preds, labels, masked)
+    # -------------------------------------------------------
+    # Utilities
+    # -------------------------------------------------------
 
-    def _get_metrics(self, metric_list, preds, labels, masked):
-        if isinstance(metric_list, list):
-            results = []
-            metrics = []
-            for metric in metric_list:
-                res, m = self._apply_metric(metric, preds, labels)
-                if masked:
-                    res = self._metric_masking(res, self.mask)
-                results.append(res)
-                metrics.append(m)
-            return results, metrics
-        
-        elif isinstance(metric_list, str):
-            results, m = self._apply_metric(metric_list, preds, labels)
-            if masked:
-                results = self._metric_masking(results, self.mask)
-            return [results], [m]
-    
-    def _apply_metric(self, metric, preds, labels):
+    def _to_tensor(self, x):
+        if isinstance(x, np.ndarray):
+            return torch.from_numpy(x)
+        return x
+
+    # -------------------------------------------------------
+    # Metric dispatcher
+    # -------------------------------------------------------
+
+    def _get_metrics(self, metric_list):
+
+        if isinstance(metric_list, str):
+            metric_list = [metric_list]
+
+        results = []
+        metrics = []
+
+        for metric in metric_list:
+
+            loss = self._apply_metric(metric)
+
+            if self.masked:
+                loss = self._apply_mask(loss)
+
+            results.append(loss)
+            metrics.append(metric)
+
+        return results, metrics
+
+    # -------------------------------------------------------
+    # Metric definitions
+    # -------------------------------------------------------
+
+    def _apply_metric(self, metric):
+
+        preds = self.preds
+        labels = self.labels
+
         if metric == "rmse":
-            loss = torch.sqrt((preds-labels)**2)
+            loss = torch.sqrt((preds - labels) ** 2)
+
         elif metric == "bias":
             loss = preds - labels
-        
+
         elif metric == "mse":
-            loss = (preds-labels)**2
+            loss = (preds - labels) ** 2
 
         elif metric == "mae":
-            loss = torch.abs(preds-labels)
+            loss = torch.abs(preds - labels)
 
         elif metric == "mape":
-            loss = torch.abs((preds-labels)/labels)
-        else:
-            logger.warning(f"Metric {metric} not recognized")
-            loss = None
+            eps = 1e-8
+            loss = torch.abs((preds - labels) / (labels + eps))
 
-        return loss, metric
-    
+        elif metric == "cross_entropy":
+            # expects preds: (B,C,W,H), labels: (B,W,H)
+            loss = torch.nn.functional.cross_entropy(
+                preds,
+                labels.long(),
+                reduction="none"
+            )
+
+        else:
+            raise ValueError(f"Metric {metric} not recognized")
+
+        return loss
+
+    # -------------------------------------------------------
+    # Mask utilities
+    # -------------------------------------------------------
+
     def _count_masked_pixels(self, mask):
-        w, h = mask.shape
+
         good_pixels = mask.sum()
-        tot_pixels = w*h
-        logger.info(f"{(1-good_pixels/tot_pixels):.2%} of the pixels are masked in the loss computation")
-        
+        tot_pixels = mask.numel()
 
-    def _metric_masking(self, loss, mask, return_value=True):
-        if isinstance(loss, np.ndarray):
-            loss = torch.from_numpy(loss)
+        logger.info(
+            f"{(1 - good_pixels / tot_pixels):.2%} of pixels masked in loss"
+        )
 
-        full_mask = torch.broadcast_to(mask, loss.shape)
-        null_loss = (loss * full_mask)
-        null_loss = torch.where(torch.isnan(null_loss), torch.tensor(0.0), null_loss)
+    def _apply_mask(self, loss):
 
-        if return_value:
-            non_zero_elements = full_mask.sum()
-            return (null_loss.sum() / non_zero_elements).item()
+        mask = self.mask
+
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+
+        mask = mask.expand_as(loss)
+
+        loss = loss * mask
+        loss = torch.nan_to_num(loss, nan=0.0)
+
+        if self.reduction == "mean":
+            return loss.sum() / mask.sum()
+
+        elif self.reduction == "none":
+            return loss
+
         else:
-            if len(loss.shape)>2:
-                return loss.mean(0)
-            else:
-                return loss
+            raise ValueError("Unsupported reduction")
 
 def mask_mape(preds, labels, mask, return_value=True):
     loss = torch.abs((preds-labels)/labels)
