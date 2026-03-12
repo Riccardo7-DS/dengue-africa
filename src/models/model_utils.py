@@ -61,17 +61,16 @@ def export_batches(batch_idx, epoch, batch, run_dir,
 def nan_checks_replace(datasets, replace_nan=0.0):
     processed = []
     for i, data in enumerate(datasets):
-        data = data.clone().float()  # no clone — already cloned before calling this
+        data = data.float()
 
         # Single-pass sentinel + nan + inf replacement
         # Handles -3.4e38 ESRI nodata, NaN, and Inf in one operation
         sentinel_mask = data.abs() > 3.3e38
         if sentinel_mask.any():  # .any() stays on GPU, no .item() sync
-            data = data.masked_fill(sentinel_mask, replace_nan)
+            data.masked_fill_(sentinel_mask, replace_nan)
 
         # One call handles all remaining NaN/Inf
-        data = torch.nan_to_num(data, nan=replace_nan, 
-                                posinf=replace_nan, neginf=replace_nan)
+        torch.nan_to_num_(data, nan=replace_nan, posinf=replace_nan, neginf=replace_nan)
 
         processed.append(data)
 

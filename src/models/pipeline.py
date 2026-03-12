@@ -178,6 +178,7 @@ def load_checkpoint(checkpoint_dir, model, optimizer, scheduler, device):
 def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample: bool = False, fillna: bool = False):
     import logging
     import re
+    import gc
     from pathlib import Path
     from types import SimpleNamespace
     from datetime import datetime
@@ -224,11 +225,12 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
         "train_split": 0.8,
         "patience": 5,
         "num_workers": 4,
-        "prefetch_factor": 2,  # Increased from 1 to keep workers busy
-        "persistent_workers": True,
+        "prefetch_factor": 1,
+        "persistent_workers": False,
         "pin_memory": True,
         "amp": True,
         "grad_clip": 1.0,
+        "memory_cleanup_interval": 100,
         "save_dir": "./checkpoints",
         "device": "cuda" if torch.cuda.is_available() else "cpu",
     }
@@ -514,6 +516,24 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
             running_loss += loss.item()
             n_batches += 1
 
+            # Drop references promptly to help Python release CPU RAM.
+            del x_high, x_med, x_static, x_cond, y_batch, y_pred, loss
+
+            cleanup_every = int(cfg.get("memory_cleanup_interval", 0) or 0)
+            if cleanup_every > 0 and (batch_idx + 1) % cleanup_every == 0:
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        # Handle trailing gradients when number of batches is not divisible by grad_accum_steps.
+        if n_batches > 0 and (n_batches % grad_accum_steps) != 0:
+            if cfg["grad_clip"] is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
         return running_loss / max(1, n_batches)
 
     def validate_one_epoch(args):
@@ -521,12 +541,14 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
         running_loss = 0.0
         n_batches = 0
 
-        with torch.no_grad():
-            for batch in val_loader:
+        with torch.inference_mode():
+            for batch_idx, batch in enumerate(val_loader):
                 if batch is None:
                     continue
 
-                x_high, x_med, x_static, x_cond, y_batch = [b.to(device) for b in batch]
+                x_high, x_med, x_static, x_cond, y_batch = [
+                    b.to(device, non_blocking=True) for b in batch
+                ]
                 x_high, x_med, x_static, x_cond, y_batch = process_datasets([x_high, x_med, x_static, x_cond, y_batch], replace_nan=-2, fill_nans=args.fillna)
 
                 with torch.amp.autocast(enabled=cfg["amp"], device_type=cfg["device"]):
@@ -546,6 +568,14 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
 
                 running_loss += loss.item()
                 n_batches += 1
+
+                del x_high, x_med, x_static, x_cond, y_batch, y_pred, loss
+
+                cleanup_every = int(cfg.get("memory_cleanup_interval", 0) or 0)
+                if cleanup_every > 0 and (batch_idx + 1) % cleanup_every == 0:
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
 
         return running_loss / max(1, n_batches)
 
@@ -628,6 +658,7 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch_factor", type=int, default=2, help="DataLoader prefetch factor per worker (increase to 2-4 if workers are idle, decrease if OOM)")
     parser.add_argument("--no_pin_memory", action="store_true", help="Disable DataLoader pin_memory (use if OOM)")
     parser.add_argument("--no_persistent_workers", action="store_true", help="Disable DataLoader persistent workers (use if workers crash)")
+    parser.add_argument("--cleanup_every", type=int, default=50, help="Run periodic RAM cleanup every N batches (0 to disable)")
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps (effective batch = batch_size * grad_accum_steps)")
     parser.add_argument("--loss_fn", type=str, choices=["mse", "poisson"], default="mse", help="Loss function to use for training")
     parser.add_argument("--titok", action="store_true", help="Using TiTok model with custom settings instead of Swin for high res branch")
@@ -646,6 +677,7 @@ if __name__ == "__main__":
         "persistent_workers": not args.no_persistent_workers,
         "pin_memory": not args.no_pin_memory,
         "grad_accum_steps": args.grad_accum_steps,
+        "memory_cleanup_interval": args.cleanup_every,
         "amp": True,
         "grad_clip": 1.0,
         "save_dir": ROOT_DIR / "checkpoints",
