@@ -1803,3 +1803,17 @@ def collate_skip_none(batch):
     return torch.utils.data.default_collate(batch)
 
 
+def worker(args):
+    world_size = args.num_gpus * args.num_nodes
+    global_rank = args.node_id * args.num_gpus + args.local_rank
+
+    device = torch.device(f'cuda:{args.local_rank}')
+    torch.cuda.set_device(device)
+
+    torch.dist.init_process_group(
+        backend='nccl',
+        world_size=world_size,
+        rank= global_rank,
+        device_id=device)
+    
+    return device, world_size

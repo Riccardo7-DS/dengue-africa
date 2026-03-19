@@ -176,6 +176,7 @@ def load_checkpoint(checkpoint_dir, model, optimizer, scheduler, device):
 
 
 def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample: bool = False, fillna: bool = False):
+    
     import logging
     import re
     import gc
@@ -240,6 +241,33 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
     cfg = default_config
 
     device = torch.device(cfg["device"])
+    
+    # Handle DDP setup
+    is_ddp = cfg.get("ddp", False)
+    world_size = None
+    
+    if is_ddp:
+        import torch.distributed as dist
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        from models.model_utils import worker
+        
+        if dist.is_available() and dist.is_initialized():
+            device = torch.device(f'cuda:{cfg["local_rank"]}')
+            world_size = dist.get_world_size()
+        else:
+            # Use worker function from model_utils
+            class DDPArgs:
+                num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+                num_nodes = 1
+                node_id = 0
+                local_rank = cfg.get("local_rank", 0)
+            ddp_args = DDPArgs()
+            device, world_size = worker(ddp_args)
+        
+        torch.cuda.set_device(device)
+        logger.info(f"Using DDP: device={device}, world_size={world_size}, local_rank={cfg['local_rank']}")
+    else:
+        logger.info(f"Using single GPU/CPU: device={device}")
     
     # Handle checkpoint loading or create new run directory
     base_dir = Path(cfg["save_dir"])
@@ -325,7 +353,7 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
     train_loader_kwargs = dict(
         dataset=train_dataset,
         batch_size=cfg["batch_size"],
-        shuffle=True,
+        shuffle=(not is_ddp),  # Use sampler for DDP
         collate_fn=collate_skip_none,
         num_workers=cfg["num_workers"],
         pin_memory=cfg["pin_memory"],
@@ -346,6 +374,25 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
         val_loader_kwargs["persistent_workers"] = cfg["persistent_workers"]
         train_loader_kwargs["prefetch_factor"] = cfg["prefetch_factor"]
         val_loader_kwargs["prefetch_factor"] = cfg["prefetch_factor"]
+
+    # Add DistributedSampler for DDP
+    if is_ddp:
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=cfg["local_rank"],
+            shuffle=True,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=cfg["local_rank"],
+            shuffle=False,
+        )
+        train_loader_kwargs["sampler"] = train_sampler
+        val_loader_kwargs["sampler"] = val_sampler
+        del train_loader_kwargs["shuffle"]  # Can't use shuffle with sampler
 
     train_loader = DataLoader(**train_loader_kwargs)
     val_loader = DataLoader(**val_loader_kwargs)
@@ -385,6 +432,12 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
             static_in_ch=1,
             num_zones=num_zones 
         ).to(device)
+
+    # Wrap model with DDP if enabled
+    if is_ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[cfg["local_rank"]])
+        logger.info(f"Model wrapped with DDP on rank {cfg['local_rank']}")
 
     
     if cfg["loss_fn"] == "poisson":
@@ -453,7 +506,7 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
         else:
             return standardize_tensor(cleaned, replace_nan=replace_nan)
 
-    def train_one_epoch(args):
+    def train_one_epoch(args, is_ddp=False, world_size=None, local_rank=0):
         model.train()
         running_loss = 0.0
         n_batches = 0
@@ -502,6 +555,9 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
                     scaled_loss = loss / grad_accum_steps
                     scaler.scale(scaled_loss).backward()
 
+            if is_ddp:
+                torch.distributed.barrier()
+
             should_step = ((batch_idx + 1) % grad_accum_steps == 0)
 
             if should_step:
@@ -513,8 +569,9 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
-            running_loss += loss.item()
-            n_batches += 1
+            bs = y_batch.size(0)
+            running_loss += loss.item() * bs
+            n_batches += bs
 
             # Drop references promptly to help Python release CPU RAM.
             del x_high, x_med, x_static, x_cond, y_batch, y_pred, loss
@@ -534,9 +591,17 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        return running_loss / max(1, n_batches)
+        avg_loss = running_loss / max(1, n_batches)
+        
+        # Aggregate across DDP replicas
+        if is_ddp and world_size is not None:
+            loss_tensor = torch.tensor(avg_loss, device=device)
+            torch.distributed.all_reduce(loss_tensor)
+            avg_loss = loss_tensor.item() / world_size
+        
+        return avg_loss
 
-    def validate_one_epoch(args):
+    def validate_one_epoch(args, is_ddp=False, world_size=None, local_rank=0):
         model.eval()
         running_loss = 0.0
         n_batches = 0
@@ -566,8 +631,9 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
                     logger.warning("[validate] Loss is NaN, skipping this batch")
                     continue
 
-                running_loss += loss.item()
-                n_batches += 1
+                bs = y_batch.size(0)
+                running_loss += loss.item() * bs
+                n_batches += bs
 
                 del x_high, x_med, x_static, x_cond, y_batch, y_pred, loss
 
@@ -577,40 +643,66 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
 
-        return running_loss / max(1, n_batches)
+        if n_batches == 0:
+            return float("nan")
+        
+        avg_loss = running_loss / n_batches
+        
+        # Aggregate across DDP replicas
+        if is_ddp and world_size is not None:
+            loss_tensor = torch.tensor(avg_loss, device=device)
+            torch.distributed.all_reduce(loss_tensor)
+            avg_loss = loss_tensor.item() / world_size
+        
+        return avg_loss
 
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
     logger.info(f"Starting training from epoch {start_epoch + 1}...")
     
+    # Get local_rank for logging
+    local_rank = cfg.get("local_rank", 0)
+    
     for epoch in range(start_epoch + 1, cfg["num_epochs"] + 1):
-        train_loss = train_one_epoch(args)
-        val_loss = validate_one_epoch(args)
+        # Update sampler epoch for DDP
+        if is_ddp and hasattr(train_loader, 'sampler'):
+            train_loader.sampler.set_epoch(epoch)
         
-        # Track losses for plotting
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
+        train_loss = train_one_epoch(args, is_ddp=is_ddp, world_size=world_size, local_rank=local_rank)
+        val_loss = validate_one_epoch(args, is_ddp=is_ddp, world_size=world_size, local_rank=local_rank)
+        
+        # Only log and save from rank 0
+        if not is_ddp or local_rank == 0:
+            # Track losses for plotting
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
 
-        logger.info(
-            f"Epoch {epoch:03d} | "
-            f"Train Loss: {train_loss:.6f} | "
-            f"Val Loss: {val_loss:.6f}"
-        )
+            logger.info(
+                f"Epoch {epoch:03d} | "
+                f"Train Loss: {train_loss:.6f} | "
+                f"Val Loss: {val_loss:.6f}"
+            )
 
-        plot_learning_curves(train_losses, val_losses, plot_dir, logger)
+            plot_learning_curves(train_losses, val_losses, plot_dir, logger)
 
-        model_dict = {
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-        }
+            model_dict = {
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+            }
 
-        early_stopper(val_loss, model_dict, epoch, str(checkpoint_dir))
+            early_stopper(val_loss, model_dict, epoch, str(checkpoint_dir))
 
-        if early_stopper.early_stop:
-            logger.info(f"Early stopping triggered at epoch {epoch}")
-            break
+            if early_stopper.early_stop:
+                logger.info(f"Early stopping triggered at epoch {epoch}")
+                break
+
+    # Cleanup DDP
+    if is_ddp:
+        import torch.distributed as dist
+        dist.destroy_process_group()
+        logger.info("DDP process group destroyed")
 
     logger.info("Training finished.")
     
@@ -648,6 +740,8 @@ if __name__ == "__main__":
     import torch
     parser = argparse.ArgumentParser(description="Run the dataset preparation pipeline.")
     parser.add_argument("--sample", action="store_true", help="Whether to run in sample mode with fewer points and times for quick testing.")
+    parser.add_argument("--ddp", action="store_true", help="training with Distributed Data Parallel")
+    parser.add_argument("--local_rank", type=int, default=0, help="Local rank for DDP")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience (epochs without improvement)")
     parser.add_argument("--num_epochs", type=int, default=100, help="Maximum number of training epochs")
@@ -683,7 +777,9 @@ if __name__ == "__main__":
         "save_dir": ROOT_DIR / "checkpoints",
         "loss_fn": args.loss_fn,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "titok": args.titok
+        "titok": args.titok,
+        "ddp": args.ddp,
+        "local_rank": args.local_rank,
     }
 
     # tb = ProgressBar().register()

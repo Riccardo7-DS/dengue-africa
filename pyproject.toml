@@ -50,6 +50,7 @@ dependencies = [
     "transformers>=5.2.0",
     "openpyxl>=3.1.5",
     "diffusers>=0.37.0",
+    "torchrun>=0.2.9",
 ]
 
 [dependency-groups]

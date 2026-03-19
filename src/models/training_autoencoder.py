@@ -82,7 +82,11 @@ class VAEWithTrainableResize(nn.Module):
         z = posterior.rsample() if hasattr(posterior, "rsample") else posterior.sample()
         recon_up = self.vae.decode(z).sample
         recon = self.post(recon_up)
-        return recon, posterior
+        # Return tensors only for DataParallel/DDP compatibility
+        # posterior is DiagonalGaussianDistribution, extract mean and logvar
+        posterior_mean = posterior.mean
+        posterior_logvar = posterior.logvar
+        return recon, posterior_mean, posterior_logvar
 
 
 # ------------------------------------------------------------------
@@ -167,10 +171,12 @@ def ensure_bchw_1x86x86(x: torch.Tensor) -> torch.Tensor:
 
 
 def normalize_to_neg_one_one(x, data_min, data_max):
-    denom = torch.clamp(data_max - data_min, min=1e-6)
+    denom = torch.clamp(torch.tensor(data_max - data_min, device=x.device), min=1e-6)
     return 2.0 * (x - data_min) / denom - 1.0
 
 def denormalize_from_neg_one_one(x, data_min, data_max):
+    data_min = torch.as_tensor(data_min, device=x.device, dtype=x.dtype)
+    data_max = torch.as_tensor(data_max, device=x.device, dtype=x.dtype)
     return 0.5 * (x + 1.0) * (data_max - data_min) + data_min
 
 def compute_global_minmax(loader, device):
@@ -218,7 +224,7 @@ def masked_mse_loss(pred, target, valid_mask):
 # ------------------------------------------------------------------
 
 def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max, 
-                   beta_kl=0.01, use_kl=False, scaler=None, cfg=None, logger=None):
+                   beta_kl=0.01, use_kl=False, scaler=None, cfg=None, logger=None, is_ddp=False):
     """Train for one epoch with optional gradient accumulation and memory cleanup."""
     model.train()
     running_loss = 0.0
@@ -247,13 +253,14 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
         y_batch = normalize_to_neg_one_one(y_batch, data_min, data_max)
 
         with torch.amp.autocast(enabled=cfg.get("amp", True) if cfg else True, device_type=cfg.get("device", "cuda") if cfg else "cuda"):
-            recon, posterior = model(y_batch)
+            recon, posterior_mean, posterior_logvar = model(y_batch)
 
             if recon.shape != y_batch.shape:
                 raise ValueError(f"Shape mismatch: recon {recon.shape} vs y_batch {y_batch.shape}")
 
             recon_loss = masked_mse_loss(recon, y_batch, valid_mask)
-            kl_loss = posterior.kl().mean()
+            # Compute KL divergence manually: KL(N(mean, logvar) || N(0,1))
+            kl_loss = -0.5 * torch.mean(1 + posterior_logvar - posterior_mean.pow(2) - posterior_logvar.exp())
             loss = recon_loss + beta_kl * kl_loss if use_kl else recon_loss
 
             if torch.isnan(loss):
@@ -266,6 +273,9 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
                 scaler.scale(scaled_loss).backward()
             else:
                 scaled_loss.backward()
+
+        if is_ddp:
+            torch.distributed.barrier()
 
         should_step = ((batch_idx + 1) % grad_accum_steps == 0)
         if should_step:
@@ -283,7 +293,7 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
         running_kl += kl_loss.item() * bs
 
         # Explicit cleanup
-        del x_high, x_med, x_static, x_cond, y_batch, recon, posterior, loss, valid_mask
+        del x_high, x_med, x_static, x_cond, y_batch, recon, posterior_mean, posterior_logvar, loss, valid_mask
         
         cleanup_every = int(cfg.get("memory_cleanup_interval", 0) if cfg else 0)
         if cleanup_every > 0 and (batch_idx + 1) % cleanup_every == 0:
@@ -303,6 +313,25 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
     if n_batches == 0:
         return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
     
+    # Aggregate across DDP replicas
+    if is_ddp:
+        world_size = torch.distributed.get_world_size()
+        loss_tensor = torch.tensor(running_loss / n_batches, device=device)
+        recon_tensor = torch.tensor(running_recon / n_batches, device=device)
+        kl_tensor = torch.tensor(running_kl / n_batches, device=device)
+        count_tensor = torch.tensor(n_batches, device=device)
+        
+        torch.distributed.all_reduce(loss_tensor)
+        torch.distributed.all_reduce(recon_tensor)
+        torch.distributed.all_reduce(kl_tensor)
+        torch.distributed.all_reduce(count_tensor)
+        
+        return {
+            "loss": loss_tensor.item() / world_size,
+            "recon": recon_tensor.item() / world_size,
+            "kl": kl_tensor.item() / world_size,
+        }
+    
     return {
         "loss": running_loss / n_batches,
         "recon": running_recon / n_batches,
@@ -311,7 +340,7 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
 
 @torch.inference_mode()
 def evaluate_one_epoch(model, loader, device, data_min, data_max, 
-                      beta_kl=0.01, use_kl=False, desc="Eval", cfg=None, logger=None):
+                      beta_kl=0.01, use_kl=False, desc="Eval", cfg=None, logger=None, is_ddp=False):
     """Evaluate for one epoch with memory cleanup."""
     model.eval()
     running_loss = 0.0
@@ -337,13 +366,14 @@ def evaluate_one_epoch(model, loader, device, data_min, data_max,
         y_batch = normalize_to_neg_one_one(y_batch, data_min, data_max)
 
         with torch.amp.autocast(enabled=cfg.get("amp", True) if cfg else True, device_type=cfg.get("device", "cuda") if cfg else "cuda"):
-            recon, posterior = model(y_batch)
+            recon, posterior_mean, posterior_logvar = model(y_batch)
 
             if recon.shape != y_batch.shape:
                 raise ValueError(f"Shape mismatch: recon {recon.shape} vs y_batch {y_batch.shape}")
 
             recon_loss = masked_mse_loss(recon, y_batch, valid_mask)
-            kl_loss = posterior.kl().mean()
+            # Compute KL divergence manually: KL(N(mean, logvar) || N(0,1))
+            kl_loss = -0.5 * torch.mean(1 + posterior_logvar - posterior_mean.pow(2) - posterior_logvar.exp())
             loss = recon_loss + beta_kl * kl_loss if use_kl else recon_loss
 
             if torch.isnan(loss):
@@ -358,7 +388,7 @@ def evaluate_one_epoch(model, loader, device, data_min, data_max,
         running_kl += kl_loss.item() * bs
 
         # Explicit cleanup
-        del x_high, x_med, x_static, x_cond, y_batch, recon, posterior, loss, valid_mask
+        del x_high, x_med, x_static, x_cond, y_batch, recon, posterior_mean, posterior_logvar, loss, valid_mask
         
         cleanup_every = int(cfg.get("memory_cleanup_interval", 0) if cfg else 0)
         if cleanup_every > 0 and (batch_idx + 1) % cleanup_every == 0:
@@ -369,11 +399,31 @@ def evaluate_one_epoch(model, loader, device, data_min, data_max,
     if n_batches == 0:
         return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
     
+    # Aggregate across DDP replicas
+    if is_ddp:
+        world_size = torch.distributed.get_world_size()
+        loss_tensor = torch.tensor(running_loss / n_batches, device=device)
+        recon_tensor = torch.tensor(running_recon / n_batches, device=device)
+        kl_tensor = torch.tensor(running_kl / n_batches, device=device)
+        count_tensor = torch.tensor(n_batches, device=device)
+        
+        torch.distributed.all_reduce(loss_tensor)
+        torch.distributed.all_reduce(recon_tensor)
+        torch.distributed.all_reduce(kl_tensor)
+        torch.distributed.all_reduce(count_tensor)
+        
+        return {
+            "loss": loss_tensor.item() / world_size,
+            "recon": recon_tensor.item() / world_size,
+            "kl": kl_tensor.item() / world_size,
+        }
+    
     return {
         "loss": running_loss / n_batches,
         "recon": running_recon / n_batches,
         "kl": running_kl / n_batches,
     }
+
 
 def main(config: dict | None = None):
     """Main training pipeline following pipeline.py pattern."""
@@ -419,8 +469,23 @@ def main(config: dict | None = None):
         default_config.update(config)
     cfg = default_config
 
-    device = torch.device(cfg["device"])
-    logger.info(f"Device: {device}")
+    import torch.distributed as dist
+    from torch.utils.data.distributed import DistributedSampler
+    from models import worker
+    
+    is_ddp = args.ddp and dist.is_available()
+    
+    if is_ddp:
+        if dist.is_available() and dist.is_initialized():
+            device = torch.device(f'cuda:{args.local_rank}')
+            world_size = dist.get_world_size()
+        else:
+            device, world_size = worker(args)
+        logger.info(f"Using DDP: device={device}, world_size={world_size}, local_rank={args.local_rank}")
+    else:
+        device = torch.device(cfg["device"])
+        world_size = None
+        logger.info(f"Using single GPU: device={device}")
 
     # ------------------------------------------------------------------
     # Dataset construction (reuse pipeline.py pattern)
@@ -465,7 +530,7 @@ def main(config: dict | None = None):
     train_loader_kwargs = dict(
         dataset=train_dataset,
         batch_size=cfg["batch_size"],
-        shuffle=True,
+        shuffle=(not is_ddp),  # Use sampler for DDP
         collate_fn=collate_skip_none,
         num_workers=cfg["num_workers"],
         pin_memory=True,
@@ -484,6 +549,24 @@ def main(config: dict | None = None):
     if cfg["num_workers"] > 0:
         train_loader_kwargs["persistent_workers"] = False
         val_loader_kwargs["persistent_workers"] = False
+
+    # Add DistributedSampler for DDP
+    if is_ddp:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=args.local_rank,
+            shuffle=True,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=args.local_rank,
+            shuffle=False,
+        )
+        train_loader_kwargs["sampler"] = train_sampler
+        val_loader_kwargs["sampler"] = val_sampler
+        del train_loader_kwargs["shuffle"]  # Can't use shuffle with sampler
 
     train_loader = DataLoader(**train_loader_kwargs)
     val_loader = DataLoader(**val_loader_kwargs)
@@ -511,6 +594,14 @@ def main(config: dict | None = None):
     )
 
     model = VAEWithTrainableResize(vae).to(device)
+
+    if args.ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model.to(device), device_ids=[args.local_rank])
+    else:
+        from torch.nn import DataParallel
+        model = DataParallel(model.to(device))
+
     optimizer = AdamW(model.parameters(), lr=cfg["learning_rate"])
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
     scaler = torch.amp.GradScaler(enabled=cfg["amp"])
@@ -527,6 +618,10 @@ def main(config: dict | None = None):
     logger.info(f"Starting training for {cfg['num_epochs']} epochs...")
     
     for epoch in range(1, cfg["num_epochs"] + 1):
+        # Update sampler epoch for DDP
+        if is_ddp:
+            train_loader.sampler.set_epoch(epoch)
+        
         train_metrics = train_one_epoch(
             model=model,
             train_loader=train_loader,
@@ -539,6 +634,7 @@ def main(config: dict | None = None):
             scaler=scaler,
             cfg=cfg,
             logger=logger,
+            is_ddp=is_ddp,
         )
 
         val_metrics = evaluate_one_epoch(
@@ -552,44 +648,49 @@ def main(config: dict | None = None):
             desc="Validation",
             cfg=cfg,
             logger=logger,
+            is_ddp=is_ddp,
         )
 
         scheduler.step(val_metrics["loss"])
 
-        logger.info(
-            f"Epoch {epoch:03d} | "
-            f"Train Loss: {train_metrics['loss']:.6f} "
-            f"(Recon: {train_metrics['recon']:.6f}, KL: {train_metrics['kl']:.6f}) | "
-            f"Val Loss: {val_metrics['loss']:.6f} "
-            f"(Recon: {val_metrics['recon']:.6f}, KL: {val_metrics['kl']:.6f})"
-        )
+        # Only log from rank 0
+        if not is_ddp or args.local_rank == 0:
+            logger.info(
+                f"Epoch {epoch:03d} | "
+                f"Train Loss: {train_metrics['loss']:.6f} "
+                f"(Recon: {train_metrics['recon']:.6f}, KL: {train_metrics['kl']:.6f}) | "
+                f"Val Loss: {val_metrics['loss']:.6f} "
+                f"(Recon: {val_metrics['recon']:.6f}, KL: {val_metrics['kl']:.6f})"
+            )
 
-        train_losses.append(train_metrics["loss"])
-        val_losses.append(val_metrics["loss"])
-        plot_learning_curves(train_losses, val_losses, plot_dir, logger)
+            train_losses.append(train_metrics["loss"])
+            val_losses.append(val_metrics["loss"])
+            plot_learning_curves(train_losses, val_losses, plot_dir, logger)
 
-        # Early stopping
-        model_dict = {
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-        }
-        early_stopper(val_metrics["loss"], model_dict, epoch, str(checkpoint_dir))
+            # Early stopping
+            model_dict = {
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+            }
+            early_stopper(val_metrics["loss"], model_dict, epoch, str(checkpoint_dir))
 
-        if early_stopper.early_stop:
-            logger.info(f"Early stopping triggered at epoch {epoch}")
-            break
+            if early_stopper.early_stop:
+                logger.info(f"Early stopping triggered at epoch {epoch}")
+                break
+
+    # Cleanup DDP
+    if is_ddp:
+        dist.destroy_process_group()
+        logger.info("DDP process group destroyed")
 
     logger.info("Training finished.")
 
 
-    
-
-   
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Train VAE on dengue dataset.")
+    parser.add_argument("--ddp", action="store_true", help="training with Distributed Data Parallel")
+    parser.add_argument("--local_rank", type=int, default=0, help="Local rank for DDP")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument("--train_split", type=float, default=0.8, help="Train/val split ratio")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
