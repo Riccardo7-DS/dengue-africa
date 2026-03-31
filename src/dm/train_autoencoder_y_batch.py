@@ -1,0 +1,576 @@
+import os
+import argparse
+import gc
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import xarray as xr
+
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+
+from models import (
+    VIIRSData,
+    ERA5Daily,
+    StaticLayer,
+    XarraySpatioTemporalDataset,
+    DengueDataset,
+    collate_skip_none,
+)
+from definitions import DATA_PATH, ROOT_DIR
+from models.model_utils import EarlyStopping, nan_checks_replace
+from utils import latin_box
+
+from utils_training import (
+    plot_learning_curves,
+    setup_run_dirs_and_logger,
+    setup_device_and_distributed,
+    wrap_model_for_parallel,
+    build_train_val_loaders,
+    normalize_to_neg_one_one_with_minmax_ignore_nan,
+    ensure_bchw_CxHxW,
+)
+
+
+# ------------------------------------------------------------------
+# MODEL
+# ------------------------------------------------------------------
+
+
+class InputUpsampler(nn.Module):
+    def __init__(self, in_channels=1, hidden_channels=16, out_channels=1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Upsample(size=(128, 128), mode="bilinear", align_corners=False),
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class OutputDownsampler(nn.Module):
+    def __init__(self, in_channels=1, hidden_channels=16, out_channels=1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1),
+            nn.AdaptiveAvgPool2d((102, 102)),
+            nn.Tanh(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Autoencoder_y_batch(nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        self.pre = InputUpsampler(in_channels=1, hidden_channels=16, out_channels=1)
+        self.vae = vae
+        self.post = OutputDownsampler(in_channels=1, hidden_channels=16, out_channels=1)
+
+    def forward(self, x):
+        x_up = self.pre(x)
+        enc = self.vae.encode(x_up)
+        posterior = enc.latent_dist
+        z = posterior.rsample() if hasattr(posterior, "rsample") else posterior.sample()
+        recon_up = self.vae.decode(z).sample
+        recon = self.post(recon_up)
+
+        posterior_mean = posterior.mean
+        posterior_logvar = posterior.logvar
+        return recon, posterior_mean, posterior_logvar
+
+
+# ------------------------------------------------------------------
+# LOSS
+# ------------------------------------------------------------------
+
+
+def masked_mse_loss(pred, target, valid_mask):
+    if pred.shape != target.shape or pred.shape != valid_mask.shape:
+        raise ValueError(
+            f"Shape mismatch: pred={pred.shape}, target={target.shape}, mask={valid_mask.shape}"
+        )
+
+    diff2 = (pred - target) ** 2
+    diff2 = diff2[valid_mask]
+
+    if diff2.numel() == 0:
+        return pred.sum() * 0.0
+
+    return diff2.mean()
+
+
+# ------------------------------------------------------------------
+# TRAIN
+# ------------------------------------------------------------------
+
+def train_one_epoch(
+    model,
+    train_loader,
+    optimizer,
+    device,
+    data_min,
+    data_max,
+    beta_kl=0.01,
+    use_kl=False,
+    scaler=None,
+    cfg=None,
+    logger=None,
+    is_ddp=False,
+):
+    model.train()
+    running_loss = 0.0
+    running_recon = 0.0
+    running_kl = 0.0
+    n_samples = 0
+    num_steps = 0
+
+    grad_accum_steps = max(1, int(cfg.get("grad_accum_steps", 1) if cfg else 1))
+    optimizer.zero_grad(set_to_none=True)
+
+    for batch_idx, batch in enumerate(train_loader):
+        if batch is None:
+            continue
+
+        x_high, x_med, x_static, x_cond, y_batch = [
+            b.to(device, non_blocking=True) for b in batch
+        ]
+        y_batch = ensure_bchw_CxHxW(y_batch, C=1, H=86, W=86)
+        valid_mask = (~torch.isnan(y_batch)).bool()
+        if not valid_mask.any():
+            continue
+
+        valid_mask = (~torch.isnan(y_batch)).bool()
+        if not valid_mask.any():
+            continue
+
+        y_batch = normalize_to_neg_one_one_with_minmax_ignore_nan(
+            y_batch,
+            data_min,
+            data_max,
+            fill_value=-2.0,
+        )
+
+        with torch.amp.autocast(
+            enabled=cfg.get("amp", True) if cfg else True,
+            device_type=cfg.get("device", "cuda") if cfg else "cuda",
+        ):
+            recon, posterior_mean, posterior_logvar = model(y_batch)
+
+            if recon.shape != y_batch.shape:
+                raise ValueError(f"Shape mismatch: recon {recon.shape} vs y_batch {y_batch.shape}")
+
+            recon_loss = masked_mse_loss(recon, y_batch, valid_mask)
+            kl_loss = -0.5 * torch.mean(
+                1 + posterior_logvar - posterior_mean.pow(2) - posterior_logvar.exp()
+            )
+            loss = recon_loss + beta_kl * kl_loss if use_kl else recon_loss
+
+            if torch.isnan(loss):
+                if logger:
+                    logger.warning("[train] Loss is NaN, skipping this batch")
+                continue
+
+            scaled_loss = loss / grad_accum_steps
+
+        if scaler:
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+
+        num_steps += 1
+        should_step = (num_steps % grad_accum_steps) == 0
+
+        if should_step:
+            if scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        bs = y_batch.size(0)
+        n_samples += bs
+        running_loss += loss.item() * bs
+        running_recon += recon_loss.item() * bs
+        running_kl += kl_loss.item() * bs
+
+        del x_high, x_med, x_static, x_cond, y_batch, recon, posterior_mean, posterior_logvar, loss, valid_mask
+
+        cleanup_every = int(cfg.get("memory_cleanup_interval", 0) if cfg else 0)
+        if cleanup_every > 0 and (batch_idx + 1) % cleanup_every == 0:
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    if num_steps > 0 and (num_steps % grad_accum_steps) != 0:
+        if scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    if n_samples == 0:
+        return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
+
+    if is_ddp:
+        metrics_tensor = torch.tensor(
+            [running_loss, running_recon, running_kl, n_samples],
+            device=device,
+            dtype=torch.float64,
+        )
+        torch.distributed.all_reduce(metrics_tensor, op=torch.distributed.ReduceOp.SUM)
+        running_loss = metrics_tensor[0].item()
+        running_recon = metrics_tensor[1].item()
+        running_kl = metrics_tensor[2].item()
+        n_samples = int(metrics_tensor[3].item())
+
+    return {
+        "loss": running_loss / n_samples,
+        "recon": running_recon / n_samples,
+        "kl": running_kl / n_samples,
+    }
+
+
+@torch.inference_mode()
+def evaluate_one_epoch(
+    model,
+    loader,
+    device,
+    data_min,
+    data_max,
+    beta_kl=0.01,
+    use_kl=False,
+    desc="Eval",
+    cfg=None,
+    logger=None,
+    is_ddp=False,
+):
+    model.eval()
+    running_loss = 0.0
+    running_recon = 0.0
+    running_kl = 0.0
+    n_samples = 0
+
+    for batch_idx, batch in enumerate(loader):
+        if batch is None:
+            continue
+
+        x_high, x_med, x_static, x_cond, y_batch = [
+            b.to(device, non_blocking=True) for b in batch
+        ]
+        y_batch = ensure_bchw_CxHxW(y_batch, C=1, H=86, W=86)
+        valid_mask = (~torch.isnan(y_batch)).bool()
+        if not valid_mask.any():
+            continue
+
+        y_batch = normalize_to_neg_one_one_with_minmax_ignore_nan(
+            y_batch,
+            data_min,
+            data_max,
+            fill_value=-2.0,
+        )
+
+        with torch.amp.autocast(
+            enabled=cfg.get("amp", True) if cfg else True,
+            device_type=cfg.get("device", "cuda") if cfg else "cuda",
+        ):
+            recon, posterior_mean, posterior_logvar = model(y_batch)
+
+            if recon.shape != y_batch.shape:
+                raise ValueError(f"Shape mismatch: recon {recon.shape} vs y_batch {y_batch.shape}")
+
+            recon_loss = masked_mse_loss(recon, y_batch, valid_mask)
+            kl_loss = -0.5 * torch.mean(
+                1 + posterior_logvar - posterior_mean.pow(2) - posterior_logvar.exp()
+            )
+            loss = recon_loss + beta_kl * kl_loss if use_kl else recon_loss
+
+            if torch.isnan(loss):
+                if logger:
+                    logger.warning(f"[{desc}] Loss is NaN, skipping this batch")
+                continue
+
+        bs = y_batch.size(0)
+        n_samples += bs
+        running_loss += loss.item() * bs
+        running_recon += recon_loss.item() * bs
+        running_kl += kl_loss.item() * bs
+
+        del x_high, x_med, x_static, x_cond, y_batch, recon, posterior_mean, posterior_logvar, loss, valid_mask
+
+        cleanup_every = int(cfg.get("memory_cleanup_interval", 0) if cfg else 0)
+        if cleanup_every > 0 and (batch_idx + 1) % cleanup_every == 0:
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    if n_samples == 0:
+        return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
+
+    if is_ddp:
+        metrics_tensor = torch.tensor(
+            [running_loss, running_recon, running_kl, n_samples],
+            device=device,
+            dtype=torch.float64,
+        )
+        torch.distributed.all_reduce(metrics_tensor, op=torch.distributed.ReduceOp.SUM)
+        running_loss = metrics_tensor[0].item()
+        running_recon = metrics_tensor[1].item()
+        running_kl = metrics_tensor[2].item()
+        n_samples = int(metrics_tensor[3].item())
+
+    return {
+        "loss": running_loss / n_samples,
+        "recon": running_recon / n_samples,
+        "kl": running_kl / n_samples,
+    }
+
+
+# ------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------
+
+def main(config: dict | None = None, args=None):
+    run_dir, checkpoint_dir, log_dir, plot_dir, logger = setup_run_dirs_and_logger(
+        config=config,
+        default_save_dir=ROOT_DIR / "checkpoints",
+        run_prefix="run",
+    )
+
+    logger.info("Starting VAE training run")
+    logger.info(f"Run directory: {run_dir}")
+
+    default_config = {
+        "batch_size": 1,
+        "train_split": 0.8,
+        "num_workers": 4,
+        "num_epochs": 100,
+        "learning_rate": 1e-3,
+        "patience": 5,
+        "beta_kl": 0.01,
+        "latent_channels": 4,
+        "block_out_channels": (64, 128, 256),
+        "layers_per_block": 2,
+        "norm_num_groups": 32,
+        "amp": True,
+        "grad_accum_steps": 1,
+        "memory_cleanup_interval": 100,
+        "save_dir": ROOT_DIR / "checkpoints",
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "use_kl": False,
+    }
+    if config:
+        default_config.update(config)
+    cfg = default_config
+
+    is_ddp, device, world_size = setup_device_and_distributed(args, cfg, logger)
+
+    # ------------------------------------------------------------------
+    # Dataset construction
+    # ------------------------------------------------------------------
+    viirs_data_path = DATA_PATH / "modis" / "VIIRS_nightlight"
+    era5_path = DATA_PATH / "ERA5" / "Latin_america"
+    risk_raster_path = DATA_PATH / "riskmaps_public main data" / "DEN_riskmap_wmean_masked.tif"
+    admin_path = DATA_PATH / "dengue_cases"
+
+    start_date = "2012-01-01"
+    end_date = "2023-12-31"
+
+    ds_cases = xr.open_mfdataset(os.path.join(admin_path, "*.nc")).sel(time=slice(start_date, end_date))
+    num_zones = len(np.unique(ds_cases["FAO_GAUL_code"].values))
+
+    y = XarraySpatioTemporalDataset(ds_cases, variables=["dengue_total"], T_max=1)
+    x_spatial = XarraySpatioTemporalDataset(ds_cases, variables=["FAO_GAUL_code"], T_max=1)
+    era5 = ERA5Daily(era5_path, T_max=63, min_date=start_date, max_date=end_date)
+    viirs = VIIRSData(viirs_data_path, min_date=start_date, max_date=end_date)
+    static = StaticLayer(risk_raster_path, nodata=-3.3999999521443642e+38)
+
+    shared_cache_dir = Path(cfg["save_dir"]) / "dataset_cache"
+    full_dataset = DengueDataset(
+        viirs,
+        era5,
+        static,
+        x_spatial,
+        y,
+        bbox=latin_box(),
+        skip_era5_bounds=True,
+        cache_dir=shared_cache_dir,
+        num_zones=num_zones,
+        loss_fn=cfg.get("loss_fn", "mse"),
+    )
+
+    logger.info(f"Full dataset size: {len(full_dataset)}")
+
+    _, _, train_loader, val_loader, train_sampler, _ = build_train_val_loaders(
+        full_dataset=full_dataset,
+        train_split=cfg["train_split"],
+        batch_size=cfg["batch_size"],
+        num_workers=cfg["num_workers"],
+        collate_fn=collate_skip_none,
+        is_ddp=is_ddp,
+        world_size=world_size,
+        local_rank=args.local_rank,
+    )
+
+    logger.info(f"DataLoader config: num_workers={cfg['num_workers']}, batch_size={cfg['batch_size']}")
+
+    logger.info("Computing global min/max on training target...")
+    data_min = float(ds_cases["dengue_total"].min().values)
+    data_max = float(ds_cases["dengue_total"].max().values)
+    logger.info(f"Global training min: {data_min:.6f}, max: {data_max:.6f}")
+
+    # ------------------------------------------------------------------
+    # Model, optimizer, scheduler
+    # ------------------------------------------------------------------
+    vae = AutoencoderKL(
+        in_channels=1,
+        out_channels=1,
+        latent_channels=cfg["latent_channels"],
+        down_block_types=("DownEncoderBlock2D",) * 3,
+        up_block_types=("UpDecoderBlock2D",) * 3,
+        block_out_channels=cfg["block_out_channels"],
+        layers_per_block=cfg["layers_per_block"],
+        norm_num_groups=cfg["norm_num_groups"],
+    )
+
+    model = Autoencoder_y_batch(vae).to(device)
+    model = wrap_model_for_parallel(model, args, device)
+
+    optimizer = AdamW(model.parameters(), lr=cfg["learning_rate"])
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6)
+    scaler = torch.amp.GradScaler(enabled=cfg["amp"])
+
+    es_config = SimpleNamespace(patience=cfg["patience"], min_patience=0)
+    early_stopper = EarlyStopping(es_config, verbose=True)
+
+    train_losses = []
+    val_losses = []
+
+    logger.info(f"Starting training for {cfg['num_epochs']} epochs...")
+
+    for epoch in range(1, cfg["num_epochs"] + 1):
+        if is_ddp and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        train_metrics = train_one_epoch(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            data_min=data_min,
+            data_max=data_max,
+            beta_kl=cfg["beta_kl"],
+            use_kl=cfg["use_kl"],
+            scaler=scaler,
+            cfg=cfg,
+            logger=logger,
+            is_ddp=is_ddp,
+        )
+
+        val_metrics = evaluate_one_epoch(
+            model=model,
+            loader=val_loader,
+            device=device,
+            data_min=data_min,
+            data_max=data_max,
+            beta_kl=cfg["beta_kl"],
+            use_kl=cfg["use_kl"],
+            desc="Validation",
+            cfg=cfg,
+            logger=logger,
+            is_ddp=is_ddp,
+        )
+
+        scheduler.step(val_metrics["loss"])
+
+        if not is_ddp or args.local_rank == 0:
+            logger.info(
+                f"Epoch {epoch:03d} | "
+                f"Train Loss: {train_metrics['loss']:.6f} "
+                f"(Recon: {train_metrics['recon']:.6f}, KL: {train_metrics['kl']:.6f}) | "
+                f"Val Loss: {val_metrics['loss']:.6f} "
+                f"(Recon: {val_metrics['recon']:.6f}, KL: {val_metrics['kl']:.6f})"
+            )
+
+            train_losses.append(train_metrics["loss"])
+            val_losses.append(val_metrics["loss"])
+            plot_learning_curves(train_losses, val_losses, plot_dir, logger)
+
+            model_dict = {
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "data_min": data_min,
+                "data_max": data_max,
+            }
+            early_stopper(val_metrics["loss"], model_dict, epoch, str(checkpoint_dir))
+
+            if early_stopper.early_stop:
+                logger.info(f"Early stopping triggered at epoch {epoch}")
+                break
+
+    if is_ddp:
+        import torch.distributed as dist
+        dist.destroy_process_group()
+        logger.info("DDP process group destroyed")
+
+    logger.info("Training finished.")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train VAE on dengue dataset.")
+    parser.add_argument("--ddp", action="store_true", help="training with Distributed Data Parallel")
+    parser.add_argument("--local_rank", type=int, default=0, help="Local rank for DDP")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--train_split", type=float, default=0.8, help="Train/val split ratio")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
+    parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs")
+    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
+    parser.add_argument("--beta_kl", type=float, default=0.01, help="KL divergence weight")
+    parser.add_argument("--latent_channels", type=int, default=4, help="VAE latent channels")
+    parser.add_argument("--layers_per_block", type=int, default=2, help="Layers per VAE block")
+    parser.add_argument("--norm_num_groups", type=int, default=32, help="GroupNorm groups")
+    parser.add_argument("--use_kl", action="store_true", help="Include KL loss term")
+    parser.add_argument("--cleanup_every", type=int, default=100, help="Memory cleanup every N batches")
+    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--loss_fn", type=str, choices=["mse", "poisson"], default="mse", help="Loss function to use for training")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    config = {
+        "batch_size": args.batch_size,
+        "train_split": args.train_split,
+        "num_workers": args.num_workers,
+        "num_epochs": args.num_epochs,
+        "learning_rate": args.learning_rate,
+        "patience": args.patience,
+        "beta_kl": args.beta_kl,
+        "latent_channels": args.latent_channels,
+        "layers_per_block": args.layers_per_block,
+        "norm_num_groups": args.norm_num_groups,
+        "use_kl": args.use_kl,
+        "memory_cleanup_interval": args.cleanup_every,
+        "grad_accum_steps": args.grad_accum_steps,
+        "amp": True,
+        "save_dir": ROOT_DIR / "checkpoints",
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "loss_fn": args.loss_fn,
+    }
+
+    main(config=config, args=args)
