@@ -4,7 +4,8 @@ Functions for DL models
 
 import math
 import os 
-import logging 
+import logging
+import time
 import numpy as np 
 import torch
 from torch.utils.data import Subset
@@ -19,7 +20,7 @@ from torchgeo.datasets import RasterDataset
 from torchgeo.samplers import GridGeoSampler
 from pathlib import Path
 from tqdm import tqdm
-
+import torch.distributed as dist
 from typing import List, Optional, Literal
 
 logger = logging.getLogger(__name__)
@@ -521,28 +522,46 @@ def masked_mse(preds, labels, null_val=np.nan):
 def masked_rmse(preds, labels, null_val=np.nan):
     return torch.sqrt(masked_mse(preds, labels, null_val))
 
-def masked_bce(preds, labels, null_val=np.nan):
+def masked_bce(preds, labels, null_val=np.nan, pos_weight=None):
     """
     preds:  (B, H, W) logits
     labels: (B, H, W) float binary mask (can contain NaN)
+    pos_weight: scalar or tensor for positive class weighting
     """
     preds = preds.squeeze(1) if preds.dim() == 4 else preds
 
+    # ── build mask ─────────────────────────────
     if np.isnan(null_val):
         mask = ~torch.isnan(labels)
     else:
         mask = (labels != null_val)
 
     mask = mask.float()
-    mask = mask / mask.mean().clamp(min=1e-8)
+    # removed: mask = mask / mask.mean().clamp(min=1e-8)
     mask = torch.nan_to_num(mask, nan=0.0)
 
+    # ── clean labels ───────────────────────────
     labels_clean = torch.nan_to_num(labels, nan=0.0).float()
 
-    loss = F.binary_cross_entropy_with_logits(preds, labels_clean, reduction="none")
+    # ── pos_weight handling ────────────────────
+    if pos_weight is not None:
+        if not torch.is_tensor(pos_weight):
+            pos_weight = torch.tensor(pos_weight, device=preds.device)
+        pos_weight = pos_weight.to(preds.device)
+
+    # ── BCE with logits ────────────────────────
+    loss = F.binary_cross_entropy_with_logits(
+        preds,
+        labels_clean,
+        reduction="none",
+        pos_weight=pos_weight
+    )
+
+    # ── apply mask and average over valid pixels only ──
     loss = loss * mask
     loss = torch.nan_to_num(loss, nan=0.0)
-    return loss.mean()
+
+    return loss.sum() / mask.sum().clamp(min=1)
 
 
 
@@ -1038,6 +1057,7 @@ class XarraySpatioTemporalDataset(RasterDataset):
         variables=None,
         T_max=32,
         transform=None,
+        chunks=None,
     ):  
         
         self.ds = self._normalize_coords(ds)
@@ -1052,7 +1072,8 @@ class XarraySpatioTemporalDataset(RasterDataset):
         self.transform = transform
 
         self.times = self.ds.time.values
-
+        self.chunks = "auto" if chunks is None else chunks
+    
     def _normalize_coords(self, ds):
         rename = {}
         for k in ("lon", "longitude"):
@@ -1246,7 +1267,9 @@ class ERA5Daily:
         self.ds = xr.open_mfdataset(
             [str(f) for f in files],
             combine="by_coords",
-            chunks={"time": 1},  # <- key for daily loading
+            chunks={"time": 63,
+            "x": 43,
+            "y": 43}, 
         )
 
         self.ds = self._normalize_coords(self.ds)
@@ -1743,6 +1766,9 @@ class DengueDataset(torch.utils.data.Dataset):
         x_slice, y_slice = bbox[0], bbox[1]
         t_week, t_viirs = self.time_pairs[time_idx]
 
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        timings = {}
+
         static_query = (x_slice, y_slice)
         query_viirs = (x_slice, y_slice, slice(
             pd.Timestamp(t_viirs).to_period("M").to_timestamp(),
@@ -1754,11 +1780,29 @@ class DengueDataset(torch.utils.data.Dataset):
             pd.Timestamp(t_week) - pd.Timedelta(days=self.era5.T_offset)
         ))
         try:
+            t0 = time.perf_counter()
             x_high    = self._pad_to_size(self.viirs[query_viirs]["image"].float(), *self.patch_size)
+            timings["viirs"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
             x_med     = self._pad_to_size(self.era5[query_previous_n_days]["image"].float(), *self.patch_size_era5)
+            timings["era5"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
             x_static  = self._pad_to_size(self.static[static_query]["image"].float(), *self.patch_size_static)
+            timings["static"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
             x_cond    = self._pad_to_size(self.spatial_conditioning[query_current]["image"].float(), *self.patch_size_spatial_cond)
+            timings["cond"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
             y_spatial = self._pad_to_size(self.y[query_current]["image"].float(), *self.patch_size_y)
+            timings["y"] = time.perf_counter() - t0
+
+            total = sum(timings.values())
+            if total > 5.0:
+                logger.warning(
+                    f"[Rank {rank}] SLOW sample idx={idx} spatial={spatial_idx} time={time_idx} "
+                    f"total={total:.2f}s | " +
+                    " | ".join(f"{k}={v:.2f}s" for k, v in timings.items())
+                )
 
             if self.loss_fn == "poisson":
                 # Aggregate y from pixel-level [1, H, W] to zone-level [num_zones]
@@ -1790,7 +1834,11 @@ class DengueDataset(torch.utils.data.Dataset):
 
         except Exception as e:
             logger.error(f"Error loading patch at spatial_idx={spatial_idx}, time_idx={time_idx}: {e}")
-            return None
+            # fallback: pick another random index
+                # retry mechanism (safe for DDP)
+            if idx == 1:
+                raise  # avoid infinite loop
+            return self.__getitem__(1)  # deterministic fallback
 
 
 # -----------------------------------------------------------------------------
@@ -1801,7 +1849,6 @@ def collate_skip_none(batch):
     if len(batch) == 0:
         return None
     return torch.utils.data.default_collate(batch)
-
 
 def worker(args):
     world_size = args.num_gpus * args.num_nodes

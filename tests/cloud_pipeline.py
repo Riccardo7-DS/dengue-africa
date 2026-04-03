@@ -1,31 +1,16 @@
-import os
-from utils import get_tiles, get_days_for_tile
-from dotenv import load_dotenv
-from utils import minio_client
+from definitions import DATA_PATH, ROOT_DIR
+import matplotlib.pyplot as plt
+from transform import CloudAdapterPipeline, extract_modis_cube, extract_image
+path_modis_500 = DATA_PATH / "modis/data/modis" / "MOD09GA_dataset.zarr"
+path_modis_250 = DATA_PATH / "modis/data/modis" / "MOD09GQ_dataset.zarr"
 
-load_dotenv()
+test_time = 10
+test_patch = 50
 
-# --- Initialize MinIO client ---
-client = minio_client()
-bucket = os.getenv("MINIO_BUCKET")
+cloud_pipe = CloudAdapterPipeline(
+        model_name=("facebookresearch/dinov2", "dinov2_vits14"))
 
-# -------------------------
-# Example usage
-# -------------------------
-collection_path_ga = "modis/MOD09GA_061/"
-collection_path_gq = "modis/MOD09GQ_061/"
-
-# tiles = get_tiles(client, bucket, collection_path_ga)
-# print("Tiles:", tiles)
-
-# tile = tiles[0]
-# days = get_days_for_tile(client, bucket, collection_path_ga, tile)
-# print(f"Days available for {tile}:", days)
-
-from transform import CloudAdapterPipeline
-
-CloudAdapterPipeline(client, 
-    bucket, 
-    collection_ga=collection_path_ga, 
-    collection_gq=collection_path_gq
-)
+cloud_pipe.load_checkpoint(ROOT_DIR / "checkpoints/best.pt")
+cube_250 = extract_modis_cube(path_modis_250, "mod09_250")
+test_array = extract_image(path_modis_250, "mod09_250", test_time, test_patch)
+cloud_pipe.predict(test_array)

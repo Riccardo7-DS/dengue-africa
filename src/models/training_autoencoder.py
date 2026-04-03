@@ -1,8 +1,10 @@
 import os
 import argparse
 import gc
-import logging
-import re
+from torch.utils.data import DataLoader
+import torch.distributed as dist
+
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from datetime import datetime
@@ -24,7 +26,7 @@ from models import (
     StaticLayer,
     XarraySpatioTemporalDataset,
     DengueDataset,
-    collate_skip_none,
+    collate_skip_none
 )
 from definitions import DATA_PATH, ROOT_DIR
 from models.model_utils import (
@@ -226,6 +228,7 @@ def masked_mse_loss(pred, target, valid_mask):
 def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max, 
                    beta_kl=0.01, use_kl=False, scaler=None, cfg=None, logger=None, is_ddp=False):
     """Train for one epoch with optional gradient accumulation and memory cleanup."""
+    
     model.train()
     running_loss = 0.0
     running_recon = 0.0
@@ -236,6 +239,7 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
     optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, batch in enumerate(train_loader):
+        start = time.time()
         if batch is None:
             continue
 
@@ -300,6 +304,8 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+
+        print(f"Rank {dist.get_rank()} batch time: {time.time() - start}")
 
     # Handle trailing gradients
     if n_batches > 0 and (n_batches % grad_accum_steps) != 0:
@@ -428,23 +434,6 @@ def evaluate_one_epoch(model, loader, device, data_min, data_max,
 def main(config: dict | None = None):
     """Main training pipeline following pipeline.py pattern."""
     
-    # Setup logging
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = Path(config.get("save_dir", ROOT_DIR / "checkpoints"))
-    run_dir = base_dir / f"run_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    checkpoint_dir = run_dir / "checkpoints"
-    log_dir = run_dir / "logs"
-    plot_dir = run_dir / "plots"
-    checkpoint_dir.mkdir(exist_ok=True)
-    log_dir.mkdir(exist_ok=True)
-    plot_dir.mkdir(exist_ok=True)
-
-    logger = init_logging(log_file=log_dir / "training.log", verbose=False)
-    logger.info(f"Starting VAE training run at {timestamp}")
-    logger.info(f"Run directory: {run_dir}")
-
     # Merge config
     default_config = {
         "batch_size": 1,
@@ -469,23 +458,59 @@ def main(config: dict | None = None):
         default_config.update(config)
     cfg = default_config
 
+    # Determine rank and DDP setup BEFORE logging
     import torch.distributed as dist
     from torch.utils.data.distributed import DistributedSampler
-    from models import worker
     
-    is_ddp = args.ddp and dist.is_available()
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_ddp = args.ddp and world_size > 1
     
     if is_ddp:
-        if dist.is_available() and dist.is_initialized():
-            device = torch.device(f'cuda:{args.local_rank}')
-            world_size = dist.get_world_size()
-        else:
-            device, world_size = worker(args)
-        logger.info(f"Using DDP: device={device}, world_size={world_size}, local_rank={args.local_rank}")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
+        rank = dist.get_rank()
+        print(f"Initialized DDP: world_size={world_size}, local_rank={local_rank}, global_rank={rank}")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        
     else:
         device = torch.device(cfg["device"])
-        world_size = None
-        logger.info(f"Using single GPU: device={device}")
+        local_rank = 0
+        rank = 0
+
+    # Setup logging - ONLY on rank 0 (or when not using DDP)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = Path(config.get("save_dir", ROOT_DIR / "checkpoints"))
+    run_dir = base_dir / f"run_{timestamp}"
+    
+    # Only rank 0 creates directories and sets up logging
+    if rank == 0:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = run_dir / "checkpoints"
+        log_dir = run_dir / "logs"
+        plot_dir = run_dir / "plots"
+        checkpoint_dir.mkdir(exist_ok=True)
+        log_dir.mkdir(exist_ok=True)
+        plot_dir.mkdir(exist_ok=True)
+        logger = init_logging(log_file=log_dir / "training.log", verbose=False)
+        logger.info(f"Starting VAE training run at {timestamp}")
+        logger.info(f"Run directory: {run_dir}")
+    else:
+        # Create placeholder objects for non-rank-0 processes
+        run_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = run_dir / "checkpoints"
+        log_dir = run_dir / "logs"
+        plot_dir = run_dir / "plots"
+        checkpoint_dir.mkdir(exist_ok=True)
+        log_dir.mkdir(exist_ok=True)
+        plot_dir.mkdir(exist_ok=True)
+        logger = None
+    
+    if rank == 0:
+        if is_ddp:
+            logger.info(f"Using DDP: device={device}, world_size={world_size}, local_rank={local_rank}")
+        else:
+            logger.info(f"Using single GPU: device={device}")
 
     # ------------------------------------------------------------------
     # Dataset construction (reuse pipeline.py pattern)
@@ -498,7 +523,7 @@ def main(config: dict | None = None):
     start_date = "2012-01-01"
     end_date = "2023-12-31"
 
-    ds_cases = xr.open_mfdataset(os.path.join(admin_path, "*.nc")).sel(time=slice(start_date, end_date))
+    ds_cases = xr.open_mfdataset(os.path.join(admin_path, "*.nc")).sel(time=slice(start_date, end_date)).chunk(chunks={"time": 1, "x": 86, "y": 86})
     num_zones = len(np.unique(ds_cases["FAO_GAUL_code"].values))
 
     y = XarraySpatioTemporalDataset(ds_cases, variables=["dengue_total"], T_max=1)
@@ -517,7 +542,8 @@ def main(config: dict | None = None):
         loss_fn=cfg.get("loss_fn", "mse"),
     )
 
-    logger.info(f"Full dataset size: {len(full_dataset)}")
+    if rank == 0:
+        logger.info(f"Full dataset size: {len(full_dataset)}")
 
     # Train/val split
     train_size = int(cfg["train_split"] * len(full_dataset))
@@ -534,6 +560,7 @@ def main(config: dict | None = None):
         collate_fn=collate_skip_none,
         num_workers=cfg["num_workers"],
         pin_memory=True,
+        drop_last=True,
         worker_init_fn=_worker_init_fn if cfg["num_workers"] > 0 else None,
     )
     val_loader_kwargs = dict(
@@ -543,6 +570,7 @@ def main(config: dict | None = None):
         collate_fn=collate_skip_none,
         num_workers=cfg["num_workers"],
         pin_memory=True,
+        drop_last=True,
         worker_init_fn=_worker_init_fn if cfg["num_workers"] > 0 else None,
     )
 
@@ -555,14 +583,16 @@ def main(config: dict | None = None):
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
-            rank=args.local_rank,
+            rank=rank,
             shuffle=True,
+            drop_last=True,
         )
         val_sampler = DistributedSampler(
             val_dataset,
             num_replicas=world_size,
-            rank=args.local_rank,
+            rank=rank,
             shuffle=False,
+            drop_last=True,
         )
         train_loader_kwargs["sampler"] = train_sampler
         val_loader_kwargs["sampler"] = val_sampler
@@ -571,13 +601,16 @@ def main(config: dict | None = None):
     train_loader = DataLoader(**train_loader_kwargs)
     val_loader = DataLoader(**val_loader_kwargs)
 
-    logger.info(f"DataLoader config: num_workers={cfg['num_workers']}, batch_size={cfg['batch_size']}")
+    if rank == 0:
+        logger.info(f"DataLoader config: num_workers={cfg['num_workers']}, batch_size={cfg['batch_size']}")
 
     # Compute global min/max
-    logger.info("Computing global min/max on training set...")
+    if rank == 0:
+        logger.info("Computing global min/max on training set...")
     # data_min, data_max = compute_global_minmax(train_loader, device=device)
     data_min, data_max = float(ds_cases['dengue_total'].min().values), float(ds_cases['dengue_total'].max().values)
-    logger.info(f"Global training min: {data_min:.6f}, max: {data_max:.6f}")
+    if rank == 0:
+        logger.info(f"Global training min: {data_min:.6f}, max: {data_max:.6f}")
 
     # ------------------------------------------------------------------
     # Model, optimizer, scheduler
@@ -593,14 +626,13 @@ def main(config: dict | None = None):
         norm_num_groups=cfg["norm_num_groups"],
     )
 
-    model = VAEWithTrainableResize(vae).to(device)
+    model = VAEWithTrainableResize(vae)
 
-    if args.ddp:
+    if is_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
-        model = DDP(model.to(device), device_ids=[args.local_rank])
+        model = DDP(model.to(device), device_ids=[local_rank])
     else:
-        from torch.nn import DataParallel
-        model = DataParallel(model.to(device))
+        model = model.to(device)
 
     optimizer = AdamW(model.parameters(), lr=cfg["learning_rate"])
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
@@ -615,7 +647,8 @@ def main(config: dict | None = None):
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    logger.info(f"Starting training for {cfg['num_epochs']} epochs...")
+    if rank == 0:
+        logger.info(f"Starting training for {cfg['num_epochs']} epochs...")
     
     for epoch in range(1, cfg["num_epochs"] + 1):
         # Update sampler epoch for DDP
@@ -654,7 +687,7 @@ def main(config: dict | None = None):
         scheduler.step(val_metrics["loss"])
 
         # Only log from rank 0
-        if not is_ddp or args.local_rank == 0:
+        if rank == 0:
             logger.info(
                 f"Epoch {epoch:03d} | "
                 f"Train Loss: {train_metrics['loss']:.6f} "
@@ -682,9 +715,11 @@ def main(config: dict | None = None):
     # Cleanup DDP
     if is_ddp:
         dist.destroy_process_group()
-        logger.info("DDP process group destroyed")
+        if rank == 0:
+            logger.info("DDP process group destroyed")
 
-    logger.info("Training finished.")
+    if rank == 0:
+        logger.info("Training finished.")
 
 
 def parse_args():
