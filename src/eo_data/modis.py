@@ -2,7 +2,7 @@
 import logging
 from pathlib import Path
 from osgeo import gdal
-from requests import patch
+from pyhdf.SD import SD, SDC
 from definitions import DATA_PATH
 import tempfile
 from collections import defaultdict
@@ -33,12 +33,17 @@ import json
 import re 
 import time 
 import errno
+from contextlib import contextmanager
+from pyresample import geometry
+from pyresample.kd_tree import resample_nearest
+import requests
+
 
 REFL_BANDS = {
     "sur_refl_b01", "sur_refl_b02", "sur_refl_b03",
     "sur_refl_b04", "sur_refl_b05", "sur_refl_b06", "sur_refl_b07"}
 
-QC_BANDS = {"state_1km", "qc_500m", "qc_250m"}
+QC_BANDS = {"state_1km", "qc_500m", "qc_250m", "cloud_mask"}
 
 logger = logging.getLogger(__name__)
 
@@ -1592,11 +1597,22 @@ class EarthAccessDownloader:
         )
         return tile_to_grid
     
-    def run(self, batch_days=30, majortom_grid: bool = False, pixel_size=250, patch_size=64):
+    def run(self, batch_days=30, 
+            majortom_grid: bool = False, 
+            pixel_size=250, 
+            patch_size=64, 
+            reference_band=None):
+        
         if majortom_grid:
             from transform import CalculationsMajorTom
             self.calculations =  CalculationsMajorTom(pixel_size=pixel_size)
-            tile_to_grid = self._generate_global_aoi(generate_global=True, pixel_resolution_m=pixel_size, patch_size_px=patch_size, target_grid_km=100)
+            tile_to_grid = self._generate_global_aoi(generate_global=True, 
+                                                     pixel_resolution_m=pixel_size, 
+                                                     patch_size_px=patch_size, 
+                                                     target_grid_km=100)
+            if reference_band is None:
+                reference_band = self.variable if isinstance(self.variable, str) else self.variable[0]
+                logger.info(f"No reference_band provided, using '{reference_band}' as default for grid alignment.")
         else:
             tile_to_grid = None
 
@@ -1621,6 +1637,7 @@ class EarthAccessDownloader:
                 self.build_or_update_majortom_zarr(
                     tile_to_grid=tile_to_grid,
                     patch_size=patch_size,
+                    reference_band=reference_band
                 )
             else:
                 self._mosaic_daily()
@@ -1720,6 +1737,8 @@ class EarthAccessDownloader:
         self,
         tile_to_grid,
         patch_size=64,
+        reference_band="sur_refl_b01",
+        max_null_fraction=0.1,
         ):
 
         if not tile_to_grid:
@@ -1727,13 +1746,23 @@ class EarthAccessDownloader:
             return
 
         store, patches_grp, compressor = self._init_or_open_sparse_zarr(patch_size)
-        written_dates = self._stream_tiles_into_sparse_zarr(
-            patches_grp=patches_grp,
-            compressor=compressor,
-            tile_to_grid=tile_to_grid,
-            patch_size=patch_size,
-            reference_band="sur_refl_b01",
-        )
+
+        if self.short_name =='MOD35_L2':
+            written_dates =  self._stream_mod35_swath(
+                patches_grp,
+                compressor,
+                tile_to_grid,
+                patch_size,
+                max_null_fraction,
+            )
+        else:
+            written_dates = self._stream_modis_tiles(
+                patches_grp=patches_grp,
+                compressor=compressor,
+                tile_to_grid=tile_to_grid,
+                patch_size=patch_size,
+                reference_band=reference_band,
+            )
 
         # Update index and consolidate metadata for faster subsequent opens
         if written_dates and not self._store_cloud:
@@ -1743,7 +1772,181 @@ class EarthAccessDownloader:
             except Exception:
                 logger.debug("Failed to update zarr index or consolidate metadata")
 
-    def _stream_tiles_into_sparse_zarr(
+    def _stream_mod35_swath(
+        self,
+        patches_grp,
+        compressor,
+        tile_to_grid,
+        patch_size,
+        max_null_fraction,
+        grid_res=0.01,
+    ):
+        HALF = patch_size
+        PATCH_SIZE = 2 * HALF
+        self.grid_res = grid_res
+
+        logger.info(f"🌥️ Streaming {len(self.files)} MOD35 swaths")
+
+        mod35 = MOD35SwathProcessor(
+            radius_of_influence=1500,
+            fill_value=np.nan,
+            nprocs=4,
+        )
+
+        # Flatten all grid cells once — reused for every file
+        grid_cells = sum(tile_to_grid.values(), [])
+        all_gids  = np.array([gid       for gid, _, _  in grid_cells])
+        all_lats  = np.array([lat       for _, lat, _   in grid_cells])
+        all_lons  = np.array([lon       for _, _, lon   in grid_cells])
+
+        from collections import defaultdict
+        written_counts = defaultdict(int)
+
+        for file_path in tqdm(self.files, desc="MOD35 swaths"):
+            try:
+                date_str = str(np.datetime64(self._get_date(file_path), "D"))
+
+                # --------------------------------------------------
+                # 1. Read swath (lat/lon needed before resampling)
+                # --------------------------------------------------
+                cloud_raw, swath_lat, swath_lon = mod35._read_swath(file_path)
+
+                # --------------------------------------------------
+                # 2. Compute swath bbox and filter grid cells
+                # --------------------------------------------------
+                lon_min, lon_max, lat_min, lat_max = mod35._get_swath_bbox(
+                    swath_lat, swath_lon, padding=2*self.grid_res
+                )
+
+                in_bbox = (
+                    (all_lons >= lon_min) & (all_lons <= lon_max) &
+                    (all_lats >= lat_min) & (all_lats <= lat_max)
+                )
+
+                if not in_bbox.any():
+                    logger.debug(f"No grid cells in swath footprint, skipping {file_path}")
+                    continue
+
+                # relevant_gids = all_gids[in_bbox]
+                relevant_lats = all_lats[in_bbox]
+                relevant_lons = all_lons[in_bbox]
+                relevant_gids = all_gids[in_bbox]
+
+                # --------------------------------------------------
+                # 3. Build small target grid for this swath only
+                # --------------------------------------------------
+                target_def = mod35.build_regular_latlon_grid(
+                    bbox=[lon_min, lon_max, lat_min, lat_max], 
+                    res_deg=self.grid_res)
+
+
+                # --------------------------------------------------
+                # 4. Decode + build consistent swath definition
+                # --------------------------------------------------
+                cloud_mask, cloud_flag = mod35._decode_cloud_mask(cloud_raw)
+
+                # Ensure lat/lon match cloud_mask resolution
+                swath_def, cloud_mask = mod35._build_swath_def(
+                    swath_lat,
+                    swath_lon,
+                    cloud_mask
+                )
+
+                # --------------------------------------------------
+                # 5. Resample onto filtered MajorTOM grid 
+                # --------------------------------------------------
+                cloud_grid = mod35._resample(
+                    swath_def,
+                    target_def,
+                    cloud_mask
+                )
+
+                if cloud_grid is None:
+                    continue
+
+                if len(relevant_gids) == 0:
+                    continue
+
+                # --------------------------------------------------
+                # 6. Prepare Zarr groups
+                # --------------------------------------------------
+                var_grp  = patches_grp.require_group("cloud_mask")
+                date_grp = var_grp.require_group(date_str)
+
+                # # (optional: also store cloud_flag)
+                # flag_grp = patches_grp.require_group("cloud_flag")
+                # date_flag_grp = flag_grp.require_group(date_str)
+
+                # --------------------------------------------------
+                # 7. Write values (Patches)
+                # --------------------------------------------------
+                for gid, lat, lon in zip(relevant_gids, relevant_lats, relevant_lons):
+
+                    # Convert lat/lon → row/col in bbox grid
+                    row = int(round((lat - lat_min) / self.grid_res))
+                    col = int(round((lon - lon_min) / self.grid_res))
+
+                    # Clamp (important for safety)
+                    row = max(0, min(row, cloud_grid.shape[0] - 1))
+                    col = max(0, min(col, cloud_grid.shape[1] - 1))
+
+                    # Skip edges
+                    if (
+                        row - HALF < 0 or row + HALF > cloud_grid.shape[0] or
+                        col - HALF < 0 or col + HALF > cloud_grid.shape[1]
+                    ):
+                        continue
+
+                    # Extract patches
+                    patch = cloud_grid[
+                        row - HALF : row + HALF,
+                        col - HALF : col + HALF
+                    ]
+
+                    # flag_patch = flag_grid[
+                    #     row - HALF : row + HALF,
+                    #     col - HALF : col + HALF
+                    # ]
+
+                    # Shape check
+                    if patch.shape != (PATCH_SIZE, PATCH_SIZE):
+                        continue
+
+                    # Quality filter
+                    if np.isnan(patch).mean() > max_null_fraction:
+                        continue
+                    
+                    
+                    # Convert dtype
+                    patch = np.where(np.isfinite(patch), patch, 99).astype(np.uint8)
+                    patch = np.ascontiguousarray(patch)
+                    # flag_patch = np.ascontiguousarray(flag_patch.astype(np.uint8))
+
+                    gid_str = str(gid)
+
+                    if gid_str in date_grp:
+                        date_grp[gid_str][:] = patch
+                    else:
+                        arr = date_grp.create(
+                            name=gid_str,
+                            shape=patch.shape,
+                            chunks=patch.shape,
+                            dtype="uint8",
+                            compressor=compressor,
+                        )
+                        arr[:] = patch
+
+                    written_counts[date_str] += 1
+
+            except Exception as e:
+                logger.error(f"❌ MOD35 error {file_path}: {e}", exc_info=True)
+
+        for d, cnt in written_counts.items():
+            logger.info(f"Written {cnt} patches for date {d}")
+
+        return set(written_counts.keys())
+
+    def _stream_modis_tiles(
         self,
         patches_grp,
         compressor,
@@ -2008,6 +2211,27 @@ class EarthAccessDownloader:
 
             return mask  # boolean array
 
+        elif band_name == "cloud_mask":
+            # If multi-byte (very common), take first byte
+            if QA.ndim == 3:
+                QA = QA[0, :, :]  # first byte only
+
+            QA = QA.astype(np.uint8)
+
+            # Bits 0–1 → cloud confidence
+            cloud_flag = QA & 0b00000011
+
+            # Convert to usable mask
+            # 0 = cloudy
+            # 1 = probably cloudy
+            # 2 = probably clear
+            # 3 = confident clear
+
+            # 👉 strict mask (recommended for training)
+            mask = cloud_flag >= 2   # True = clear
+
+            return mask.astype(np.uint8)
+
         # ----------------------------
         # state_1km
         # ----------------------------
@@ -2181,113 +2405,298 @@ class StacModisTileProcessor:
         logger.info(f"Processed {tile_id} tiles.")
 
 
-if __name__ == "__main__":
-    from utils import init_logging, countries_to_bbox
-    from osgeo import gdal
-    import argparse
-    from dotenv import load_dotenv
-    import geopandas as gpd 
 
-    from definitions import ROOT_DIR
-    load_dotenv(Path(ROOT_DIR)/ ".env")
 
-    gdal.SetConfigOption('GDAL_CACHEMAX', '512')    # MB, tune to memory
-    gdal.SetConfigOption('GDAL_DISABLE_READDIR_ON_OPEN', 'EMPTY_DIR')
-    import sys
-    sys.dont_write_bytecode = True
+class MOD35SwathProcessor:
+    def __init__(
+        self,
+        radius_of_influence=3000,
+        fill_value=np.nan,
+        nprocs=1,
+    ):
+        self.radius_of_influence = radius_of_influence
+        self.fill_value = fill_value
+        self.nprocs = nprocs
+        self._session = None
 
-    parser = argparse.ArgumentParser(description="MODIS Downloader")
-    parser.add_argument('--product', type=str, default='VIIRS_500m_night_monthly', help='MODIS product to download')
-    parser.add_argument('--start_date', type=str, help='date to start collection')
-    parser.add_argument('--end_date', type=str, help='date to end collection')
-    parser.add_argument('--reproj_lib', choices=['rioxarray', 'xesmf'], default=os.getenv('REPROJ_LIB', 'rioxarray'), help='Reprojection library to use (rioxarray or xesmf)')
-    parser.add_argument('--reproj_method', choices=['nearest', 'bilinear'], default=os.getenv('REPROJ_METHOD', 'nearest'), help='Reprojection method to use')    
-    parser.add_argument('-d', '--delete_temp', action='store_true', default=False, help='Delete temporary files after processing')
-    args = parser.parse_args()
+    # ------------------------------------------------------------------
+    # Auth — lazy LAADS session via earthaccess token
+    # ------------------------------------------------------------------
 
-    products = {
-        "LST": {
-            "short_name": "MOD11A1",
-            "variables": ["MODIS_Grid_Daily_1km_LST:LST_Day_1km"]
-        },
-        "reflectance_250m": {
-            "short_name": "MOD09GQ",
-            "variables": ["sur_refl_b01", 
-                           "sur_refl_b02", 
-                           "QC_250m"
-            ],
-            "raw_data_type" : "hdf",
-            "crs": "EPSG:6933",
-        },
-        "reflectance_1000m": {
-            "short_name": "MOD09GA",
-            "variables": ["sur_refl_b01",
-                          "sur_refl_b02",
-                          "state_1km"
-            ],
-            "raw_data_type" : "hdf",
-            "crs": "EPSG:6933",
-        },
-        "NDVI_1km_monthly": {
-            "short_name": "MOD13A3",
-            "variables": ["NDVI",
-                          "EVI",
-                          "SummaryQA"
-            ],
-            "raw_data_type" : "hdf",
-            "crs": "EPSG:6933",
-        },
-        "VIIRS_500m_night_monthly": {
-            "short_name": "VNP46A3",
-            "variables": ["NearNadir_Composite_Snow_Free",
-                          "NearNadir_Composite_Snow_Free_Std",
-                          "NearNadir_Composite_Snow_Free_Quality"
-            ],
-            "raw_data_type" : "h5"
-        },
+    def _get_session(self) -> requests.Session:
+        if self._session is None:
+            token = os.environ["EARTHDATA_TOKEN"]
+
+            session = requests.Session()
+            session.headers.update({"Authorization": f"Bearer {token}"})
+
+            self._session = session
+
+        return self._session
+
+    # ------------------------------------------------------------------
+    # Filename parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_modis_filename(hdf_path: str) -> dict:
+        """
+        Parse a standard MODIS filename into its components.
+        Format: PRODUCT.AYYYYDDD.HHMM.CCC.PRODDT.hdf
+        """
+        name = Path(hdf_path).name
+        pattern = (
+            r"^(?P<product>[A-Z0-9_]+)"
+            r"\.A(?P<date>\d{7})"
+            r"\.(?P<time>\d{4})"
+            r"\.(?P<collection>\d{3})"
+            r"\.(?P<production_dt>\d+)"
+            r"\.hdf$"
+        )
+        m = re.match(pattern, name, re.IGNORECASE)
+        if not m:
+            raise ValueError(
+                f"Cannot parse MODIS filename: '{name}'.\n"
+                "Expected: PRODUCT.AYYYYDDD.HHMM.CCC.PRODDT.hdf"
+            )
+        return m.groupdict()
+
+    @staticmethod
+    def _build_mod03_shortname(parts: dict) -> str:
+        product = parts["product"].upper()
+        if product.startswith("MOD"):
+            return "MOD03"
+        elif product.startswith("MYD"):
+            return "MYD03"
+        raise ValueError(f"Unrecognised platform prefix in: '{product}'")
+
+    # ------------------------------------------------------------------
+    # LAADS direct download (bypasses CMR entirely)
+    # ------------------------------------------------------------------
+
+    def _laads_search_mod03(self, parts: dict) -> str:
+        """
+        Find the exact MOD03 filename on LAADS by listing the day directory.
+
+        LAADS archive structure:
+          https://ladsweb.modaps.eosdis.nasa.gov/archive/allData/61/MOD03/YYYY/DDD/
+
+        Returns the full HTTPS download URL of the matching granule.
+        """
+        short_name  = self._build_mod03_shortname(parts)
+        date_str    = parts["date"]          # YYYYDDD  e.g. 2025152
+        time_str    = parts["time"]          # HHMM     e.g. 0105
+        collection  = parts["collection"]    # e.g. 061 → archive uses 61
+
+        year = date_str[:4]
+        doy  = date_str[4:]                  # day-of-year, 3 digits
+
+        archive_num = str(int(collection))   # "061" → "61"
+
+        # Directory listing URL
+        dir_url = (
+            f"https://ladsweb.modaps.eosdis.nasa.gov"
+            f"/archive/allData/{archive_num}/{short_name}/{year}/{doy}/"
+        )
+
+        session = self._get_session()
+        resp = session.get(dir_url, timeout=30)
+        resp.raise_for_status()
+
+        # LAADS returns an HTML or JSON listing — find the matching filename
+        # Filename stem we are looking for: MOD03.AYYYYDDD.HHMM.CCC.
+        stem = f"{short_name}.A{date_str}.{time_str}.{collection}."
+        matches = re.findall(
+            rf'({re.escape(stem)}\d+\.hdf)',
+            resp.text
+        )
+
+        if not matches:
+            raise FileNotFoundError(
+                f"No {short_name} granule found in LAADS directory:\n"
+                f"  {dir_url}\n"
+                f"  Looked for stem: '{stem}'\n"
+                "Verify the granule exists on LAADS for this date/time."
+            )
+
+        # Pick the most recent production run if duplicates exist
+        filename = sorted(matches)[-1]
+        return dir_url + filename
+
+    def _download_file(self, url: str, dest_dir: str) -> str:
+        """Stream-download a LAADS file to dest_dir, return local path."""
+        filename = url.split("/")[-1]
+        local_path = os.path.join(dest_dir, filename)
+
+        session = self._get_session()
+        with session.get(url, stream=True, timeout=120) as resp:
+            resp.raise_for_status()
+
+            with open(local_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+
+        # --- Diagnostics ---
+        file_size = os.path.getsize(local_path)
+        logger.debug(f"[MOD03] Downloaded {file_size / 1024 / 1024:.1f} MB → {local_path}")
+
+        with open(local_path, "rb") as f:
+            magic = f.read(4)
+        logger.debug(f"[MOD03] Magic bytes: {magic!r}  (expected: b'\\x0e\\x03\\x13\\x01')")
+
+        if magic != b"\x0e\x03\x13\x01":
+            content = open(local_path, "rb").read(500)
+            logger.debug(f"[MOD03] File head: {content!r}")
+            raise RuntimeError(
+                f"Not a valid HDF4 file. Size={file_size} bytes.\n"
+                f"Head: {content[:200]!r}"
+            )
+
+        return local_path
+
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _mod03_file(self, hdf_path: str):
+        """
+        Locate, download, yield, then delete the matching MOD03 granule.
+        """
+        parts = self._parse_modis_filename(hdf_path)
+        url   = self._laads_search_mod03(parts)
+        logger.debug(f"[MOD03] Downloading: {url.split('/')[-1]}")
+
+        with tempfile.TemporaryDirectory(prefix="mod03_") as tmpdir:
+            local_path = self._download_file(url, tmpdir)
+            try:
+                yield local_path
+            finally:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+
+    # ------------------------------------------------------------------
+    # Swath reading
+    # ------------------------------------------------------------------
+
+    def _read_swath(self, hdf_path: str):
+        """
+        Read Cloud_Mask from MOD35_L2 and 1 km lat/lon from MOD03.
+        MOD03 is downloaded automatically and deleted after reading.
+        """
+        hdf35 = SD(hdf_path, SDC.READ)
+        cloud = hdf35.select("Cloud_Mask")[0]   # (2030, 1354)
+        hdf35.end()
+
+        with self._mod03_file(hdf_path) as mod03_path:
+            hdf03 = SD(mod03_path, SDC.READ)
+            lat = hdf03.select("Latitude")[:]
+            lon = hdf03.select("Longitude")[:]
+            hdf03.end()
+
+        if lat.shape != cloud.shape:
+            raise ValueError(
+                f"Shape mismatch — Cloud_Mask: {cloud.shape}, "
+                f"MOD03 lat/lon: {lat.shape}."
+            )
+
+        return cloud, lat, lon
+
+    def _get_swath_bbox(self, lat, lon, padding=0.1):
+        """
+        Returns (lon_min, lon_max, lat_min, lat_max) for the swath footprint.
+        Padding is in degrees.
+        """
+        return (
+            float(np.nanmin(lon)) - padding,
+            float(np.nanmax(lon)) + padding,
+            float(np.nanmin(lat)) - padding,
+            float(np.nanmax(lat)) + padding,
+        )
+
+    def build_target_def_for_bbox(self, lon_min, lon_max, lat_min, lat_max, grid_res=0.01):
+        """
+        Build a pyresample GridDefinition covering only the swath bbox.
+        """
+        lon_grid = np.arange(lon_min, lon_max, grid_res)
+        lat_grid = np.arange(lat_min, lat_max, grid_res)
+        lon2d, lat2d = np.meshgrid(lon_grid, lat_grid)
+        return geometry.GridDefinition(lons=lon2d, lats=lat2d), lon_grid, lat_grid
+
+    def _decode_cloud_mask(self, cloud):
+        cloud = cloud.astype(np.uint8)
+        cloud_flag = cloud & 0b00000011
+        cloud_mask = (cloud_flag >= 2).astype(np.float32)
+        return cloud_mask, cloud_flag.astype(np.uint8)
+
+    def _build_swath_def(self, lat, lon, data=None):
+
+        if data is not None:
+            # Upsample lat/lon if needed
+            if lat.shape != data.shape:
+
+                factor_y = data.shape[0] // lat.shape[0]
+                factor_x = data.shape[1] // lon.shape[1]
+
+                lat = np.repeat(np.repeat(lat, factor_y, axis=0), factor_x, axis=1)
+                lon = np.repeat(np.repeat(lon, factor_y, axis=0), factor_x, axis=1)
+
+            # Crop to exact match (handles 1350 vs 1354 issue)
+            ny = min(lat.shape[0], data.shape[0])
+            nx = min(lon.shape[1], data.shape[1])
+
+            lat = lat[:ny, :nx]
+            lon = lon[:ny, :nx]
+            data = data[:ny, :nx]
+
+            # Final safety check
+            if lat.shape != data.shape:
+                raise ValueError(f"Mismatch: lat {lat.shape}, data {data.shape}")
+
+            swath_def = geometry.SwathDefinition(lons=lon, lats=lat)
+
+            return swath_def, data
         
-        "VIIRS_500m_night_daily": {
-            "short_name": "VNP46A2",
-            "variables": ["Gap_Filled_DNB_BRDF_Corrected_NTL",
-                          "DNB_BRDF_Corrected_NTL",
-                          "QF_Cloud_Mask"
-            ],
-            "raw_data_type" : "h5"
-        }
-    }
+        else:
+            return  geometry.SwathDefinition(lons=lon, lats=lat)
 
-    variables = products[args.product]["variables"]
-    short_name = products[args.product]["short_name"]
-    raw_data_type = products[args.product]["raw_data_type"]
+    def build_target_grid_from_latlon(self, lon2d, lat2d):
+        return geometry.AreaDefinition(lons=lon2d, lats=lat2d)
 
-    logger = init_logging(log_file="modis_downloader.log", verbose=False)
-    
-    gdf = gpd.read_file(DATA_PATH/ "shapefiles"/ "GAUL_2024.zip")
-    bbox, polygon = countries_to_bbox(["Brazil", "Argentina", "Peru", "Colombia", "Panama"], gdf, col_name="gaul0_name")
+    def build_regular_latlon_grid(self, bbox=None, res_deg=0.01):
+        if bbox is None:
+            lons = np.arange(-180, 180, res_deg)
+            lats = np.arange(-90, 90, res_deg)
+        else:
+            lon_min, lon_max, lat_min, lat_max = bbox
+            lons = np.arange(lon_min, lon_max, res_deg)
+            lats = np.arange(lat_min, lat_max, res_deg)
+        lon2d, lat2d = np.meshgrid(lons, lats)
+        return geometry.GridDefinition(lons=lon2d, lats=lat2d)
 
-    try:
-        
-        downloader = EarthAccessDownloader(
-        short_name=short_name,
-        bbox= bbox,
-        variables=variables,
-        date_range=(args.start_date, args.end_date),
-        collection_name=f"{short_name}_061",
-        reproj_lib=args.reproj_lib,
-        reproj_method=args.reproj_method,
-        output_format="tiff",
-        raw_data_type=raw_data_type
-    )   
-        if args.delete_temp and downloader.temp_dir.exists():
-            logger.warning("Deleting temporary directory as per user request.")
-            shutil.rmtree( downloader.temp_dir)
+    def _resample(self, swath_def, target_def, data):
+        return resample_nearest(
+            swath_def,
+            data,
+            target_def,
+            radius_of_influence=self.radius_of_influence,
+            fill_value=self.fill_value,
+            nprocs=self.nprocs,
+        )
 
-        downloader.cleanup()
-        downloader.run(batch_days=10)
+    def process_cloudmodis(self, hdf_path, target_def, return_confidence=False):
+        cloud_raw, lat, lon = self._read_swath(hdf_path)
+        cloud_mask, cloud_flag = self._decode_cloud_mask(cloud_raw)
+        swath_def = self._build_swath_def(lat, lon)
+        cloud_mask_resampled = self._resample(swath_def, target_def, cloud_mask)
 
-    except Exception as e:
-        # downloader.cleanup()
-        # if downloader.granule_dir.exists():
-        #     shutil.rmtree( downloader.granule_dir)
-        logger.error(e)
-        raise e
+        if return_confidence:
+            cloud_flag_resampled = self._resample(
+                swath_def, target_def, cloud_flag.astype(np.float32)
+            )
+            return cloud_mask_resampled, cloud_flag_resampled.astype(np.uint8)
+
+        return cloud_mask_resampled
