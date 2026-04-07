@@ -305,13 +305,16 @@ class EarthAccessDownloader:
         collection_name="lst_061",
         crs="EPSG:6933",
         output_format:Literal["tiff","zarr"]="zarr",
-        raw_data_type=".hdf"
-    ):  
-        
+        raw_data_type=".hdf",
+        add_new_variables: bool = False,
+    ):
+
         if resolution is None:
             raise ValueError("resolution must be provided.")
         else:
             self._resolution = resolution
+
+        self._add_new_variables = add_new_variables
         
         self.date_range = self._check_dates(date_range)
 
@@ -583,8 +586,15 @@ class EarthAccessDownloader:
             all_dates.append(d.strftime("%Y-%m-%d"))
             d += timedelta(days=1)
 
-        # Ask the fast path to probe only these dates (MajorTOM stores are fast this way)
-        processed_dates = self._get_processed_dates(dates_to_check=all_dates)
+        if self._add_new_variables:
+            # Only skip dates where ALL requested variables are already written in the zarr.
+            # This lets re-runs continue from where they left off instead of re-downloading
+            # everything from scratch, while still processing dates that the new variables
+            # haven't been written for yet.
+            processed_dates = self._get_processed_dates_for_variables(dates_to_check=all_dates)
+        else:
+            # Ask the fast path to probe only these dates (MajorTOM stores are fast this way)
+            processed_dates = self._get_processed_dates(dates_to_check=all_dates)
 
         done_dates_range = [d for d in all_dates if d in processed_dates]
         if len(done_dates_range) > 0:
@@ -812,6 +822,56 @@ class EarthAccessDownloader:
 
         return ds_regridded
     
+    def _get_processed_dates_for_variables(self, dates_to_check=None) -> set:
+        """
+        Like _get_processed_dates but scoped to the variables currently being downloaded.
+        A date is considered processed only if ALL of self.variable are already present
+        in the zarr for that date.  Used in add_new_variables mode so that re-runs skip
+        dates that are fully written while still processing dates that are missing any
+        of the new variables.
+        """
+        variables = [self.variable] if isinstance(self.variable, str) else list(self.variable)
+        processed_dates = set()
+
+        try:
+            zarr_path = self.zarr_path
+            store = zarr.open_group(str(zarr_path), mode="r")
+
+            if "patches" in store:
+                patches_grp = store["patches"]
+                # Collect, per variable, which of the requested dates are present
+                per_var: list[set] = []
+                for var in variables:
+                    if var in patches_grp:
+                        var_grp = patches_grp[var]
+                        if dates_to_check:
+                            per_var.append({d for d in dates_to_check if d in var_grp})
+                        else:
+                            per_var.append(set(var_grp.group_keys()))
+                    else:
+                        per_var.append(set())   # variable not yet in store → nothing processed
+
+                if per_var:
+                    processed_dates = set.intersection(*per_var)
+            else:
+                # Regular time-indexed zarr: variable must exist with those time steps
+                ds = xr.open_zarr(str(zarr_path))
+                if "time" in ds.dims:
+                    existing_dates = set(pd.to_datetime(ds.time.values).strftime("%Y-%m-%d"))
+                    missing_vars = [v for v in variables if v not in ds.data_vars]
+                    if missing_vars:
+                        # At least one variable is entirely absent → nothing processed
+                        processed_dates = set()
+                    else:
+                        if dates_to_check:
+                            processed_dates = {d for d in dates_to_check if d in existing_dates}
+                        else:
+                            processed_dates = existing_dates
+        except Exception:
+            pass  # zarr doesn't exist or can't be read → treat everything as unprocessed
+
+        return processed_dates
+
     def _get_processed_dates(self, dates_to_check=None):
         """
         Get processed dates. If `dates_to_check` is provided (iterable of YYYY-MM-DD strings),
@@ -1043,8 +1103,11 @@ class EarthAccessDownloader:
 
         # --- If Zarr is requested, merge all days into a single dataset ---
         if self._output_format.lower() == "zarr":
-            ds = xr.open_mfdataset(str(self.granule_dir / "*.nc"), combine="by_coords", parallel=True, chunks="auto")
-            ds= prepare(ds)
+            if not mosaics:
+                logger.warning("No daily mosaics produced — nothing to export to Zarr.")
+                return
+            ds = xr.concat(mosaics, dim="time")
+            ds = prepare(ds)
             ds = ds.chunk({"time": 1, "lat": 1024, "lon": 1024})
             self._export_to_zarr(ds)
 
@@ -1052,6 +1115,46 @@ class EarthAccessDownloader:
     # ------------------------
     # Helper: build mosaic for one variable
     # ------------------------
+    def _gdal_subdataset_to_dataarray(self, subdataset_path: str) -> "xr.DataArray":
+        """
+        Open a GDAL subdataset path (e.g. HDF4 EOS) directly via GDAL and return
+        an xarray DataArray with CRS, transform and nodata set.
+
+        rasterio/rioxarray cannot open HDF4 EOS paths like
+        HDF4_EOS:EOS_GRID:"...":Grid:Band directly, but gdal.Open() handles them
+        fine.  Reading through GDAL and constructing the DataArray manually avoids
+        any extra disk I/O.
+        """
+        from affine import Affine
+        from rasterio.crs import CRS as RasterioCRS
+
+        gdal_ds = gdal.Open(subdataset_path)
+        if gdal_ds is None:
+            raise RuntimeError(f"gdal.Open returned None for: {subdataset_path}")
+
+        band = gdal_ds.GetRasterBand(1)
+        data = band.ReadAsArray()
+        gt = gdal_ds.GetGeoTransform()
+        proj = gdal_ds.GetProjection()
+        nodata = band.GetNoDataValue()
+        gdal_ds = None  # release file handle
+
+        transform = Affine.from_gdal(*gt)
+        ny, nx = data.shape
+        xs = np.array([transform.c + (j + 0.5) * transform.a for j in range(nx)])
+        ys = np.array([transform.f + (i + 0.5) * transform.e for i in range(ny)])
+
+        da = xr.DataArray(data, dims=["y", "x"], coords={"y": ys, "x": xs})
+        da = da.rio.write_crs(RasterioCRS.from_wkt(proj))
+        da = da.rio.write_transform(transform)
+        # write_nodata without encoded=True stores in attrs (not encoding),
+        # which avoids a rioxarray bug where encoding._FillValue as np.int16
+        # gets re-cast through _ensure_nodata_dtype and raises ValueError.
+        if nodata is not None and not np.isnan(float(nodata)):
+            da = da.rio.write_nodata(int(nodata))
+
+        return da
+
     def _build_mosaic(self, subdatasets, var):
         from osgeo import gdal
         import rioxarray
@@ -1062,7 +1165,12 @@ class EarthAccessDownloader:
             # 1. Reproject to UTM only — no preprocessing yet
             temp_tifs = []
             for i, subdataset in enumerate(subdatasets):
-                da = rioxarray.open_rasterio(subdataset, chunks=True).squeeze("band", drop=True)
+                try:
+                    da = self._gdal_subdataset_to_dataarray(subdataset)
+                except Exception as e:
+                    logger.warning(f"Skipping subdataset (cannot open): {subdataset} — {e}")
+                    continue
+
                 dest_crs = self._get_utm_crs()
 
                 if not dest_crs.startswith("EPSG"):
@@ -1079,10 +1187,14 @@ class EarthAccessDownloader:
 
                 da_utm.attrs.pop("scale_factor", None)
                 da_utm.attrs.pop("add_offset", None)
-                
+
                 temp_tif = self.temp_dir / f"temp_{var}_{i}.tif"
                 da_utm.rio.to_raster(str(temp_tif), driver="GTiff")
                 temp_tifs.append(str(temp_tif))
+
+            if not temp_tifs:
+                logger.warning(f"No valid tiles for '{var}' — all subdatasets failed to open")
+                return None
 
             # 2. Group tiles by dtype before mosaicking
             dtype_groups = {}
@@ -1124,7 +1236,7 @@ class EarthAccessDownloader:
             da_mosaic = self._custom_preprocess(da_mosaic, band_name=os.path.basename(str(subdatasets[0])))
             return da_mosaic
 
-        except RuntimeError as e:
+        except Exception as e:
             logger.warning(f"GDAL mosaic failed for {var}: {e}")
             return None
         
@@ -1405,8 +1517,11 @@ class EarthAccessDownloader:
             # For cloud storage, we need to check existence differently
             try:
                 ds_existing = xr.open_zarr(zarr_path)
-                # Append to existing
-                ds.to_zarr(zarr_path, mode="a", append_dim="time")
+                if self._add_new_variables:
+                    # Add new variable arrays without touching existing time steps
+                    ds.to_zarr(zarr_path, mode="a")
+                else:
+                    ds.to_zarr(zarr_path, mode="a", append_dim="time")
             except (FileNotFoundError, KeyError, ValueError):
                 # Create new
                 ds.to_zarr(zarr_path, mode="w")
@@ -1425,7 +1540,11 @@ class EarthAccessDownloader:
             for attempt in range(3):
                 try:
                     if zarr_exists:
-                        ds.to_zarr(zarr_path, mode="a", append_dim="time")
+                        if self._add_new_variables:
+                            # Add new variable arrays without touching existing time steps
+                            ds.to_zarr(zarr_path, mode="a")
+                        else:
+                            ds.to_zarr(zarr_path, mode="a", append_dim="time")
                     else:
                         ds.to_zarr(zarr_path, mode="w")
                     break
@@ -1779,11 +1898,19 @@ class EarthAccessDownloader:
         tile_to_grid,
         patch_size,
         max_null_fraction,
-        grid_res=0.01,
     ):
         HALF = patch_size
         PATCH_SIZE = 2 * HALF
-        self.grid_res = grid_res
+        # Keep the intermediate lat/lon grid at MOD35's native ~1 km resolution
+        # (0.01° ≈ 1113 m) so pyresample stays fast.  The geographic footprint is
+        # matched to the co-registered product (e.g. MOD09GQ at 250 m) by extracting
+        # a proportionally smaller sub-patch and upsampling it to PATCH_SIZE×PATCH_SIZE.
+        self.grid_res = 0.01                                     # degrees, ~1 km native
+        _grid_res_m   = self.grid_res * 111_320                  # metres per native pixel
+        # Half-width in native pixels that spans the same area as HALF * self._resolution
+        _native_half  = max(1, round(HALF * self._resolution / _grid_res_m))
+        # Integer upsampling factor (ceiling) so np.kron output is ≥ PATCH_SIZE
+        _upsample_k   = -(-PATCH_SIZE // (2 * _native_half))    # ceiling division
 
         logger.info(f"🌥️ Streaming {len(self.files)} MOD35 swaths")
 
@@ -1852,8 +1979,13 @@ class EarthAccessDownloader:
                     cloud_mask
                 )
 
+                # Crop cloud_flag to the same spatial extent as the aligned
+                # cloud_mask (pyresample may trim a few rows/cols at edges).
+                ny, nx = cloud_mask.shape
+                cloud_flag_aligned = cloud_flag[:ny, :nx]
+
                 # --------------------------------------------------
-                # 5. Resample onto filtered MajorTOM grid 
+                # 5. Resample onto filtered MajorTOM grid
                 # --------------------------------------------------
                 cloud_grid = mod35._resample(
                     swath_def,
@@ -1862,6 +1994,18 @@ class EarthAccessDownloader:
                 )
 
                 if cloud_grid is None:
+                    continue
+
+                # Also resample the 4-level MOD35 confidence (cloud_probability).
+                # Values: 0=confident cloudy, 1=probably cloudy,
+                #         2=probably clear,   3=confident clear.
+                cloud_flag_grid = mod35._resample(
+                    swath_def,
+                    target_def,
+                    cloud_flag_aligned.astype(np.float32),
+                )
+
+                if cloud_flag_grid is None:
                     continue
 
                 if len(relevant_gids) == 0:
@@ -1873,9 +2017,10 @@ class EarthAccessDownloader:
                 var_grp  = patches_grp.require_group("cloud_mask")
                 date_grp = var_grp.require_group(date_str)
 
-                # # (optional: also store cloud_flag)
-                # flag_grp = patches_grp.require_group("cloud_flag")
-                # date_flag_grp = flag_grp.require_group(date_str)
+                # cloud_probability stores the raw MOD35 4-level confidence
+                # (0-3, uint8) for downstream use in generate_cloud_mask.
+                prob_grp      = patches_grp.require_group("cloud_probability")
+                date_prob_grp = prob_grp.require_group(date_str)
 
                 # --------------------------------------------------
                 # 7. Write values (Patches)
@@ -1890,23 +2035,36 @@ class EarthAccessDownloader:
                     row = max(0, min(row, cloud_grid.shape[0] - 1))
                     col = max(0, min(col, cloud_grid.shape[1] - 1))
 
-                    # Skip edges
+                    # Skip edges (use native-resolution half-width for bounds)
                     if (
-                        row - HALF < 0 or row + HALF > cloud_grid.shape[0] or
-                        col - HALF < 0 or col + HALF > cloud_grid.shape[1]
+                        row - _native_half < 0 or row + _native_half > cloud_grid.shape[0] or
+                        col - _native_half < 0 or col + _native_half > cloud_grid.shape[1]
                     ):
                         continue
 
-                    # Extract patches
-                    patch = cloud_grid[
-                        row - HALF : row + HALF,
-                        col - HALF : col + HALF
-                    ]
+                    # Extract native-resolution sub-patch; flip N-S so row 0 = north
+                    patch_native = cloud_grid[
+                        row - _native_half : row + _native_half,
+                        col - _native_half : col + _native_half
+                    ][::-1, :]
 
-                    # flag_patch = flag_grid[
-                    #     row - HALF : row + HALF,
-                    #     col - HALF : col + HALF
-                    # ]
+                    # Same spatial window for the 4-level confidence grid
+                    prob_native = cloud_flag_grid[
+                        row - _native_half : row + _native_half,
+                        col - _native_half : col + _native_half
+                    ][::-1, :]
+
+                    # Upsample to PATCH_SIZE×PATCH_SIZE with nearest-neighbour (np.kron)
+                    # then crop the ceiling-overshoot so the stored array is exactly PATCH_SIZE.
+                    patch = np.kron(
+                        patch_native,
+                        np.ones((_upsample_k, _upsample_k), dtype=patch_native.dtype),
+                    )[:PATCH_SIZE, :PATCH_SIZE]
+
+                    prob_patch = np.kron(
+                        prob_native,
+                        np.ones((_upsample_k, _upsample_k), dtype=prob_native.dtype),
+                    )[:PATCH_SIZE, :PATCH_SIZE]
 
                     # Shape check
                     if patch.shape != (PATCH_SIZE, PATCH_SIZE):
@@ -1915,15 +2073,16 @@ class EarthAccessDownloader:
                     # Quality filter
                     if np.isnan(patch).mean() > max_null_fraction:
                         continue
-                    
-                    
-                    # Convert dtype
-                    patch = np.where(np.isfinite(patch), patch, 99).astype(np.uint8)
-                    patch = np.ascontiguousarray(patch)
-                    # flag_patch = np.ascontiguousarray(flag_patch.astype(np.uint8))
+
+                    # Convert dtype; fill NaN (out-of-swath) with sentinel 99
+                    patch      = np.where(np.isfinite(patch),      patch,      99).astype(np.uint8)
+                    prob_patch = np.where(np.isfinite(prob_patch),  prob_patch, 99).astype(np.uint8)
+                    patch      = np.ascontiguousarray(patch)
+                    prob_patch = np.ascontiguousarray(prob_patch)
 
                     gid_str = str(gid)
 
+                    # Write cloud_mask patch
                     if gid_str in date_grp:
                         date_grp[gid_str][:] = patch
                     else:
@@ -1935,6 +2094,19 @@ class EarthAccessDownloader:
                             compressor=compressor,
                         )
                         arr[:] = patch
+
+                    # Write cloud_probability patch (MOD35 4-level confidence, 0-3)
+                    if gid_str in date_prob_grp:
+                        date_prob_grp[gid_str][:] = prob_patch
+                    else:
+                        prob_arr = date_prob_grp.create(
+                            name=gid_str,
+                            shape=prob_patch.shape,
+                            chunks=prob_patch.shape,
+                            dtype="uint8",
+                            compressor=compressor,
+                        )
+                        prob_arr[:] = prob_patch
 
                     written_counts[date_str] += 1
 
@@ -2086,12 +2258,12 @@ class EarthAccessDownloader:
                         # Grid point does not fall into this MODIS tile
                         continue
 
-                    px, py = self.calculations.xy_to_pixel(x, y, h, v)
+                    row, col = self.calculations.xy_to_pixel(x, y, h, v)
 
                     # Skip cells where patch would exceed tile bounds
                     if (
-                        py - HALF < 0 or px - HALF < 0
-                        or py + HALF > ny or px + HALF > nx
+                        row - HALF < 0 or col - HALF < 0
+                        or row + HALF > ny or col + HALF > nx
                     ):
                         continue
 
@@ -2100,7 +2272,7 @@ class EarthAccessDownloader:
                     if ref_data is None:
                         continue
 
-                    ref_patch = ref_data[py - HALF : py + HALF, px - HALF : px + HALF]
+                    ref_patch = ref_data[row - HALF : row + HALF, col - HALF : col + HALF]
                     if ref_patch.shape != (PATCH_SIZE, PATCH_SIZE):
                         continue
 
@@ -2121,7 +2293,7 @@ class EarthAccessDownloader:
                         if data is None:
                             continue
 
-                        patch = data[py - HALF : py + HALF, px - HALF : px + HALF]
+                        patch = data[row - HALF : row + HALF, col - HALF : col + HALF]
                         if patch.shape != (PATCH_SIZE, PATCH_SIZE):
                             continue
 
@@ -2628,9 +2800,11 @@ class MOD35SwathProcessor:
 
     def _decode_cloud_mask(self, cloud):
         cloud = cloud.astype(np.uint8)
-        cloud_flag = cloud & 0b00000011
-        cloud_mask = (cloud_flag >= 2).astype(np.float32)
-        return cloud_mask, cloud_flag.astype(np.uint8)
+        # Bit 0:   Cloud Mask Flag (1 = determined, 0 = not determined) — not a quality value
+        # Bits 1-2: Unobstructed FOV Quality (00=cloudy, 01=uncertain, 10=prob.clear, 11=clear)
+        cloud_quality = (cloud >> 1) & 0b00000011
+        cloud_mask = (cloud_quality >= 2).astype(np.float32)  # probably clear or confident clear
+        return cloud_mask, cloud_quality.astype(np.uint8)
 
     def _build_swath_def(self, lat, lon, data=None):
 

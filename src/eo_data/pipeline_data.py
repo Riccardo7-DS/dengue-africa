@@ -42,8 +42,10 @@ parser.add_argument('--start_date', type=str, default=os.getenv('start_date', "2
 parser.add_argument('--end_date', type=str, default=os.getenv('end_date', "2025-07-05"))
 parser.add_argument('--batch_days', type=int, default=os.getenv("batch_days", 30), help='Number of days per download batch')
 parser.add_argument("--store_cloud", action="store_true", help="Store data in cloud storage")
-parser.add_argument("--majortom_grid", action="store_true")
+parser.add_argument("--majortom_grid", action="store_true", help="Reproject to MajorTom grid (only supported for Zarr output format)")
 parser.add_argument("--output_format", type=str, choices=["tiff", "zarr"], default=os.getenv("output_format", "zarr"), help="Output format for downloaded data")
+parser.add_argument("--add_variables", action="store_true", default=False, help="Add new variables to an existing zarr store without re-appending existing time steps")
+parser.add_argument("--variables_override", type=str, default=None, help="Comma-separated list of variables to download instead of the product defaults (e.g. 'sur_refl_b03')")
 args = parser.parse_args()
 
 if args.majortom_grid and args.output_format != "zarr":
@@ -78,6 +80,7 @@ products = {
             "short_name": "MOD09GA",
             "variables": ["sur_refl_b01",
                           "sur_refl_b02",
+                          "sur_refl_b03",
                           "state_1km"
             ],
             "raw_data_type" : "hdf",
@@ -117,7 +120,14 @@ print("AWS_ACCESS_KEY_ID:", os.getenv("AWS_ACCESS_KEY_ID"))
 print("AWS_SECRET_ACCESS_KEY:", os.getenv("AWS_SECRET_ACCESS_KEY")[:4] + "****")
 print("AWS_S3_ENDPOINT:", os.getenv("AWS_S3_ENDPOINT"))
 
-variables = products[args.product]["variables"]
+if args.majortom_grid and args.output_format != "zarr":
+    logger.error("MajorTom grid is only supported with Zarr output format.")
+    raise ValueError("MajorTom grid is only supported with Zarr output format.")
+
+if args.majortom_grid:
+    logger.info("******* Using MajorTom grid for download. *******")
+
+variables = [v.strip() for v in args.variables_override.split(",")] if args.variables_override else products[args.product]["variables"]
 short_name = products[args.product]["short_name"]
 raw_data_type = products[args.product]["raw_data_type"]
 resolution = products[args.product].get("resolution", None)
@@ -170,7 +180,8 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
             date_range=(start, end),
             collection_name=f"{short_name}_061",
             output_format=args.output_format,
-            raw_data_type=raw_data_type
+            raw_data_type=raw_data_type,
+            add_new_variables=args.add_variables,
     )   
         if args.delete_temp and downloader.temp_dir.exists():
             logger.warning("Deleting temporary directory as per user request.")
