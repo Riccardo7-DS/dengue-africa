@@ -19,6 +19,8 @@ logger = init_logging(log_file="modis_downloader.log", verbose=False)
 # Load environment variables
 load_dotenv()
 
+os.environ["PYDEVD_THREAD_DUMP_ON_WARN_EVALUATION_TIMEOUT"] = "true"
+os.environ["PYDEVD_INTERRUPT_THREAD_TIMEOUT "] = "600"  # milliseconds
 # # GDAL tuning
 # gdal.SetConfigOption('GDAL_CACHEMAX', '512')    # MB, tune to memory
 # gdal.SetConfigOption('GDAL_DISABLE_READDIR_ON_OPEN', 'EMPTY_DIR')
@@ -52,6 +54,15 @@ products = {
             "short_name": "MOD11A1",
             "variables": ["MODIS_Grid_Daily_1km_LST:LST_Day_1km"]
         },
+
+        "modis_cloud_mask": {
+            "short_name": "MOD35_L2",
+            "variables": ["Cloud_Mask"],
+            "raw_data_type" : "hdf",
+            "resolution": 250,
+            "patch_size": 256
+        },
+
         "reflectance_250m": {
             "short_name": "MOD09GQ",
             "variables": ["sur_refl_b01", 
