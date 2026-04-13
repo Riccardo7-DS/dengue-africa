@@ -8,10 +8,10 @@ def tabular_dataset_pipeline(sample=False):
     import numpy as np
     from eo_data import read_predict_arbodata
     from tqdm import tqdm
-    from utils import prepare
+    from modis_majortom.utils import prepare
     from dask.diagnostics import ProgressBar
     from eo_data import load_nightlights_data
-    from utils import init_logging
+    from modis_majortom.utils import init_logging
 
     logger = init_logging(log_file="dengue_pipeline.log", verbose=False)
 
@@ -209,8 +209,8 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
         export_batches
     )
     from definitions import DATA_PATH
-    from utils import latin_box, init_logging
-    
+    from modis_majortom.utils import latin_box, init_logging
+
     # Create a simple namespace to mimic args for backward compatibility
     from types import SimpleNamespace
     args = SimpleNamespace(sample=sample, fillna=fillna)

@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 from definitions import DATA_PATH
-from utils import process_gdf, countries_to_bbox
+from modis_majortom.utils import process_gdf, countries_to_bbox
 import zipfile
 import time
 

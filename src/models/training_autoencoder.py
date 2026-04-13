@@ -35,7 +35,7 @@ from models.model_utils import (
     standardize_tensor,
     export_batches
 )
-from utils import latin_box, init_logging
+from modis_majortom.utils import latin_box, init_logging
 
 
 # ------------------------------------------------------------------

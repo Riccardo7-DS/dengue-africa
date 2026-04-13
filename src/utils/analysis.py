@@ -3,30 +3,10 @@ import numpy as np
 import pandas as pd
 from definitions import DATA_PATH
 import logging
-from utils.general import process_gdf
 from tqdm import tqdm
-import os 
+import os
 
 logger = logging.getLogger(__name__)
-
-def compute_ndvi(band1: xr.DataArray,
-                 band2: xr.DataArray) -> xr.DataArray:
-    """
-    Compute NDVI given two reflectance bands:
-    band1 = RED
-    band2 = NIR
-    """
-
-    denom = band2 + band1
-    num   = band2 - band1
-
-    # Mask zero denominators BEFORE division → no warnings
-    safe_denom = xr.where(denom == 0, np.nan, denom)
-
-    ndvi = num / safe_denom
-
-    return ndvi.astype("float32")
-
 
 from dataclasses import dataclass, field
 from typing import Optional, Callable

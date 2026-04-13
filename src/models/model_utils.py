@@ -1468,7 +1468,7 @@ class DengueDataset(torch.utils.data.Dataset):
         if self.loss_fn == "poisson" and num_zones is None:
             raise ValueError("num_zones must be provided for poisson loss")
 
-        from utils import latin_box
+        from modis_majortom.utils import latin_box
 
         self.patch_size = patch_sizes.get("viirs", (1024, 1024))
         self.patch_size_era5 = patch_sizes.get("era5", (43, 43))

@@ -32,7 +32,8 @@ from torchgeo.samplers import GridGeoSampler
 from torchgeo.datasets.utils import stack_samples, lazy_import
 import torch.nn.functional as F
 from pathlib import Path
-from utils import latin_box,  load_admin_data, process_gdf, df_to_xarray, rasterize_timeseries, init_logging, prepare
+from modis_majortom.utils import latin_box, process_gdf, init_logging, prepare
+from utils import load_admin_data, df_to_xarray, rasterize_timeseries
 import torch 
 import pandas as pd 
 import numpy as np
