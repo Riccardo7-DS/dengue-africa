@@ -43,7 +43,9 @@ REFL_BANDS = {
     "sur_refl_b01", "sur_refl_b02", "sur_refl_b03",
     "sur_refl_b04", "sur_refl_b05", "sur_refl_b06", "sur_refl_b07"}
 
-QC_BANDS = {"state_1km", "qc_500m", "qc_250m", "cloud_mask"}
+QC_BANDS = {"qc_500m", "qc_250m"}
+
+CLOUD_BANDS = {"state_1km", "cloud_mask"}
 
 logger = logging.getLogger(__name__)
 
@@ -326,8 +328,6 @@ class EarthAccessDownloader:
         self._check_cloud_or_local(data_dir, args.store_cloud)
         
         self._crs = crs
-        if self.bbox:
-            self._crs = self._get_utm_crs()
         self._reproj_lib = self._check_reproj_lib(args.reproj_lib)
         self._reproj_method = self._check_reproj_method(args.reproj_method)
         
@@ -341,6 +341,12 @@ class EarthAccessDownloader:
             setup_minio_config()
         
         self._login_earthaccess()
+
+        if "state_1km" in (self.variable or []):
+            logger.info(
+                f"[{self.short_name}] 'state_1km' will be stored as raw uint16 QA bits. "
+                f"Decode at load time with MODISQCMask (e.g. state_1km_cloud_mask)."
+            )
 
     def _check_cloud_or_local(self, data_dir, store_cloud, zarr_path=None):
         """
@@ -835,7 +841,10 @@ class EarthAccessDownloader:
 
         try:
             zarr_path = self.zarr_path
-            store = zarr.open_group(str(zarr_path), mode="r")
+            # use_consolidated=False: zarr v3 auto-uses .zmetadata by default, which can
+            # contain stale entries for variables whose chunk files were never written
+            # (e.g. after a partial/failed run).  Read the real filesystem state instead.
+            store = zarr.open_group(str(zarr_path), mode="r", use_consolidated=False)
 
             if "patches" in store:
                 patches_grp = store["patches"]
@@ -1162,7 +1171,7 @@ class EarthAccessDownloader:
         try:
             gdal.UseExceptions()
 
-            # 1. Reproject to UTM only — no preprocessing yet
+            # 1. Reproject to self._crs — no preprocessing yet
             temp_tifs = []
             for i, subdataset in enumerate(subdatasets):
                 try:
@@ -1171,10 +1180,10 @@ class EarthAccessDownloader:
                     logger.warning(f"Skipping subdataset (cannot open): {subdataset} — {e}")
                     continue
 
-                dest_crs = self._get_utm_crs()
+                dest_crs = self._crs
 
                 if not dest_crs.startswith("EPSG"):
-                    raise ValueError(f"Invalid UTM CRS returned: {dest_crs}")
+                    raise ValueError(f"Invalid CRS: {dest_crs}")
 
                 da.attrs.pop("scale_factor", None)
                 da.attrs.pop("add_offset", None)
@@ -1848,7 +1857,10 @@ class EarthAccessDownloader:
 
         elif band_name in QC_BANDS:
             data = data.astype(np.uint16)
-            data = self._modis_qc_mask(data, band_name)
+            data = MODISQCMask.get_mask(data, band_name)
+
+        elif band_name in CLOUD_BANDS:
+            data = data.astype(np.uint16)  # store raw QA bits; decode at load time
 
         return data, band_name
 
@@ -1968,21 +1980,19 @@ class EarthAccessDownloader:
 
 
                 # --------------------------------------------------
-                # 4. Decode + build consistent swath definition
+                # 4. Extract 4-level quality + build swath definition
+                # Bits 1-2 of Cloud_Mask byte:
+                #   0=confident cloudy, 1=probably cloudy,
+                #   2=probably clear,   3=confident clear
                 # --------------------------------------------------
-                cloud_mask, cloud_flag = mod35._decode_cloud_mask(cloud_raw)
+                cloud_quality = ((cloud_raw.astype(np.uint8) >> 1) & 0b11).astype(np.float32)
 
-                # Ensure lat/lon match cloud_mask resolution
-                swath_def, cloud_mask = mod35._build_swath_def(
+                # Ensure lat/lon match cloud_quality resolution
+                swath_def, cloud_quality = mod35._build_swath_def(
                     swath_lat,
                     swath_lon,
-                    cloud_mask
+                    cloud_quality
                 )
-
-                # Crop cloud_flag to the same spatial extent as the aligned
-                # cloud_mask (pyresample may trim a few rows/cols at edges).
-                ny, nx = cloud_mask.shape
-                cloud_flag_aligned = cloud_flag[:ny, :nx]
 
                 # --------------------------------------------------
                 # 5. Resample onto filtered MajorTOM grid
@@ -1990,22 +2000,10 @@ class EarthAccessDownloader:
                 cloud_grid = mod35._resample(
                     swath_def,
                     target_def,
-                    cloud_mask
+                    cloud_quality
                 )
 
                 if cloud_grid is None:
-                    continue
-
-                # Also resample the 4-level MOD35 confidence (cloud_probability).
-                # Values: 0=confident cloudy, 1=probably cloudy,
-                #         2=probably clear,   3=confident clear.
-                cloud_flag_grid = mod35._resample(
-                    swath_def,
-                    target_def,
-                    cloud_flag_aligned.astype(np.float32),
-                )
-
-                if cloud_flag_grid is None:
                     continue
 
                 if len(relevant_gids) == 0:
@@ -2014,13 +2012,10 @@ class EarthAccessDownloader:
                 # --------------------------------------------------
                 # 6. Prepare Zarr groups
                 # --------------------------------------------------
+                # cloud_mask stores the 4-level MOD35 quality (0-3, uint8, fill=99).
+                # Decode at load time with MODISQCMask.decode_mod35().
                 var_grp  = patches_grp.require_group("cloud_mask")
                 date_grp = var_grp.require_group(date_str)
-
-                # cloud_probability stores the raw MOD35 4-level confidence
-                # (0-3, uint8) for downstream use in generate_cloud_mask.
-                prob_grp      = patches_grp.require_group("cloud_probability")
-                date_prob_grp = prob_grp.require_group(date_str)
 
                 # --------------------------------------------------
                 # 7. Write values (Patches)
@@ -2048,22 +2043,11 @@ class EarthAccessDownloader:
                         col - _native_half : col + _native_half
                     ][::-1, :]
 
-                    # Same spatial window for the 4-level confidence grid
-                    prob_native = cloud_flag_grid[
-                        row - _native_half : row + _native_half,
-                        col - _native_half : col + _native_half
-                    ][::-1, :]
-
                     # Upsample to PATCH_SIZE×PATCH_SIZE with nearest-neighbour (np.kron)
                     # then crop the ceiling-overshoot so the stored array is exactly PATCH_SIZE.
                     patch = np.kron(
                         patch_native,
                         np.ones((_upsample_k, _upsample_k), dtype=patch_native.dtype),
-                    )[:PATCH_SIZE, :PATCH_SIZE]
-
-                    prob_patch = np.kron(
-                        prob_native,
-                        np.ones((_upsample_k, _upsample_k), dtype=prob_native.dtype),
                     )[:PATCH_SIZE, :PATCH_SIZE]
 
                     # Shape check
@@ -2075,14 +2059,12 @@ class EarthAccessDownloader:
                         continue
 
                     # Convert dtype; fill NaN (out-of-swath) with sentinel 99
-                    patch      = np.where(np.isfinite(patch),      patch,      99).astype(np.uint8)
-                    prob_patch = np.where(np.isfinite(prob_patch),  prob_patch, 99).astype(np.uint8)
-                    patch      = np.ascontiguousarray(patch)
-                    prob_patch = np.ascontiguousarray(prob_patch)
+                    patch = np.where(np.isfinite(patch), patch, 99).astype(np.uint8)
+                    patch = np.ascontiguousarray(patch)
 
                     gid_str = str(gid)
 
-                    # Write cloud_mask patch
+                    # Write cloud_mask patch (4-level quality: 0-3, fill=99)
                     if gid_str in date_grp:
                         date_grp[gid_str][:] = patch
                     else:
@@ -2094,19 +2076,6 @@ class EarthAccessDownloader:
                             compressor=compressor,
                         )
                         arr[:] = patch
-
-                    # Write cloud_probability patch (MOD35 4-level confidence, 0-3)
-                    if gid_str in date_prob_grp:
-                        date_prob_grp[gid_str][:] = prob_patch
-                    else:
-                        prob_arr = date_prob_grp.create(
-                            name=gid_str,
-                            shape=prob_patch.shape,
-                            chunks=prob_patch.shape,
-                            dtype="uint8",
-                            compressor=compressor,
-                        )
-                        prob_arr[:] = prob_patch
 
                     written_counts[date_str] += 1
 
@@ -2232,7 +2201,7 @@ class EarthAccessDownloader:
 
                 # Safety: ensure reference band is reflectance (used to gate writes)
                 if band_types.get(reference_band) not in REFL_BANDS:
-                    raise RuntimeError(
+                    logger.warning(
                         f"Reference band {reference_band} is not reflectance: {band_types.get(reference_band)}"
                     )
 
@@ -2307,9 +2276,13 @@ class EarthAccessDownloader:
                             dtype = "float16"
                             patch = np.ascontiguousarray(patch, dtype=np.float16)
                         elif band_name in QC_BANDS:
-                            # QC bands stored as uint8
+                            # decoded QC mask stored as uint8 (boolean)
                             patch = np.ascontiguousarray(patch.astype(np.uint8))
                             dtype = "uint8"
+                        elif band_name in CLOUD_BANDS:
+                            # raw QA bits stored as uint16 for load-time decoding
+                            patch = np.ascontiguousarray(patch.astype(np.uint16))
+                            dtype = "uint16"
                         else:
                             # Unsupported band type for writing
                             continue
@@ -2365,66 +2338,209 @@ class EarthAccessDownloader:
         # Return the set of dates that received at least one successful write
         return set(written_counts.keys())
 
-    def _modis_qc_mask(self, QA: np.ndarray, band_name: str) -> np.ndarray:
-        # ----------------------------
-        # QC_250m / QC_500m
-        # ----------------------------
-        if band_name in {"qc_250m", "qc_500m"}:
+import numpy as np
 
 
-            # MODLAND + band quality
-            mask = (
-                (QA & 0b0000000000000011) == 0  # bits 0–1
-            ) & (
-                (QA & 0b0000000000001100) == 0  # bits 2–3
-            ) & (
-                (QA & 0b0000000000110000) == 0  # bits 4–5
+class MODISQCMask:
+    # -----------------------------
+    # Utility: extract bits
+    # -----------------------------
+    @staticmethod
+    def _bits(arr: np.ndarray, start: int, length: int = 1) -> np.ndarray:
+        """Extract bits from integer array."""
+        return (arr >> start) & ((1 << length) - 1)
+
+
+    # -----------------------------
+    # QC_250m / QC_500m
+    # -----------------------------
+    @staticmethod
+    def qc_reflectance_mask(QA: np.ndarray) -> np.ndarray:
+        """
+        Reflectance quality mask (QC_250m / QC_500m).
+
+        Returns:
+            True = BAD pixel (low quality)
+        """
+        modland = MODISQCMask._bits(QA, 0, 2)
+        band1   = MODISQCMask._bits(QA, 2, 2)
+        band2   = MODISQCMask._bits(QA, 4, 2)
+
+        good = (modland == 0) & (band1 == 0) & (band2 == 0)
+
+        return ~good  # True = bad
+
+
+    # -----------------------------
+    # MOD35 cloud mask
+    # -----------------------------
+    @staticmethod
+    def decode_mod35(raw: np.ndarray) -> tuple:
+        """
+        Decode the stored MOD35 cloud_mask band (4-level quality, uint8).
+
+        Stored values:
+            0 = confident cloudy, 1 = probably cloudy,
+            2 = probably clear,   3 = confident clear, 99 = fill
+
+        Binned algorithm: quality < 2 → cloud, quality >= 2 → clear.
+
+        Returns:
+            cloud_mask : bool array, True = cloudy (fill pixels → False)
+            confidence : uint8 array 0-3 (fill pixels remain 99)
+        """
+        raw = np.asarray(raw, dtype=np.uint8)
+        valid = raw != 99
+        cloud_mask = np.where(valid, raw < 2, False)
+        return cloud_mask, raw.copy()
+
+    @staticmethod
+    def mod35_cloud_mask(QA: np.ndarray) -> np.ndarray:
+        """
+        Binary cloud mask from the stored MOD35 4-level quality band.
+
+        Stored values: 0=confident cloudy, 1=probably cloudy,
+                       2=probably clear,   3=confident clear, 99=fill.
+
+        Binned algorithm: quality < 2 → cloudy, quality >= 2 → clear.
+
+        Returns:
+            True = cloudy (fill treated as clear)
+        """
+        QA = np.asarray(QA, dtype=np.uint8)
+        valid = QA != 99
+        return np.where(valid, QA < 2, False)
+
+
+    # -----------------------------
+    # MOD09 state_1km mask
+    # -----------------------------
+    def state_1km_cloud_mask(
+        QA: np.ndarray,
+        algorithm: Literal["strict", "internal", "cloud_state", "binned"] = "strict"
+        ) -> np.ndarray:
+
+        cloud_state = MODISQCMask._bits(QA, 0, 2)
+        shadow      = MODISQCMask._bits(QA, 2, 1)
+        aerosol     = MODISQCMask._bits(QA, 6, 2)
+        cirrus      = MODISQCMask._bits(QA, 8, 1)
+        int_cloud   = MODISQCMask._bits(QA, 10, 1)
+
+        if algorithm == "strict":
+            return (
+                (cloud_state == 1) | (cloud_state == 2) |
+                (shadow == 1) |
+                (aerosol >= 2) |
+                (cirrus == 1) |
+                (int_cloud == 1)
             )
+        elif algorithm == "cloud_state":
+            return (cloud_state == 1) | (cloud_state == 2)
 
-            return mask  # boolean array
+        elif algorithm == "binned":
+            return (cloud_state == 2) | (cloud_state == 3)
+
+        elif algorithm == "internal":
+            return int_cloud == 1
+
+        else:
+            raise ValueError(f"Unknown algorithm: {algorithm}")
+    
+    # -----------------------------
+    # 1. Cloud mask from bits 0–1
+    # -----------------------------
+    @staticmethod
+    def cloud_mask_bits_0_1(QA: xr.DataArray) -> xr.DataArray:
+        """
+        Cloud mask using bits 0–1 (cloud state).
+
+        Returns:
+            True = cloudy (cloudy + mixed)
+            False = clear
+        """
+        cloud_state = QA & 0b11  # extract bits 0–1
+
+        # 01 = cloudy, 10 = mixed
+        mask = (cloud_state == 0b01) | (cloud_state == 0b10)
+
+        return mask
+
+
+    # -----------------------------
+    # 2. Internal cloud mask (bit 10)
+    # -----------------------------
+    
+    @staticmethod
+    def cloud_mask_internal(QA: xr.DataArray) -> xr.DataArray:
+        """
+        MOD09 internal cloud mask (bit 10).
+
+        Returns:
+            True = cloudy
+            False = clear
+        """
+        return (QA & (1 << 10)) != 0
+
+    @staticmethod
+    def mod35_categories(QA: np.ndarray) -> np.ndarray:
+        """
+        Return the stored MOD35 4-level quality value directly.
+
+        Stored values (already extracted from bits 1-2 during download):
+            0 = confident cloudy, 1 = probably cloudy,
+            2 = probably clear,   3 = confident clear, 99 = fill
+        """
+        return np.asarray(QA, dtype=np.uint8)
+
+    # -----------------------------
+    # Binned MOD35 cloud mask (as in paper)
+    # -----------------------------
+    @staticmethod
+    def cloud_mask_mod35_binned(QA: np.ndarray) -> np.ndarray:
+        """
+        MOD35 cloud mask following MODIS science team recommendation:
+
+        Clear  = probably clear (2) + confident clear (3)
+        Cloudy = confident cloudy (0) + probably cloudy (1)
+
+        Returns:
+            True = cloudy, False = clear (fill treated as clear)
+        """
+        QA = np.asarray(QA, dtype=np.uint8)
+        valid = QA != 99
+        return np.where(valid, QA < 2, False)
+
+
+    # -----------------------------
+    # Unified interface
+    # -----------------------------
+    @staticmethod
+    def get_mask(QA: np.ndarray, band_name: str) -> np.ndarray:
+        """
+        Unified interface for MODIS QA masks.
+
+        Returns:
+            True = BAD pixel
+        """
+        if band_name in {"qc_250m", "qc_500m"}:
+            return MODISQCMask.qc_reflectance_mask(QA)
 
         elif band_name == "cloud_mask":
-            # If multi-byte (very common), take first byte
-            if QA.ndim == 3:
-                QA = QA[0, :, :]  # first byte only
+            return MODISQCMask.mod35_cloud_mask(QA)
 
-            QA = QA.astype(np.uint8)
-
-            # Bits 0–1 → cloud confidence
-            cloud_flag = QA & 0b00000011
-
-            # Convert to usable mask
-            # 0 = cloudy
-            # 1 = probably cloudy
-            # 2 = probably clear
-            # 3 = confident clear
-
-            # 👉 strict mask (recommended for training)
-            mask = cloud_flag >= 2   # True = clear
-
-            return mask.astype(np.uint8)
-
-        # ----------------------------
-        # state_1km
-        # ----------------------------
         elif band_name == "state_1km":
+            return MODISQCMask.state_1km_cloud_mask(QA)
 
-            clear      = ((QA >> 0)  & 0b11) == 0
-            shadow     = ((QA >> 2)  & 0b1)  == 0
-            land       = ((QA >> 3)  & 0b111) == 1
-            aerosol    = ((QA >> 6)  & 0b11) <= 1
-            cirrus     = ((QA >> 8)  & 0b1)  == 0
-            int_cloud  = ((QA >> 10) & 0b1)  == 0
-            snow_ice   = ((QA >> 12) & 0b1)  == 0
-
-            mask = clear & shadow & land & aerosol & cirrus & int_cloud & snow_ice
-
-            return mask  # boolean array
+        else:
+            raise ValueError(f"Unknown band: {band_name}")
 
 
 """
 Helper function to create bitmask for a range of bits (inclusive)
 """
+
+
+
 
 def bit_range_mask(start: int, end: int) -> int:
     return sum(1 << i for i in range(start, end + 1))
@@ -2451,6 +2567,7 @@ def decode_qc_250m(QA: xr.DataArray) -> xr.DataArray:
 
     QA = QA.astype(np.int32)
     return QA.where((QA & mask) == filters)
+
 
 
 def decode_state_1km(QA: xr.DataArray) -> xr.DataArray:

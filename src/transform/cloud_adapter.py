@@ -50,7 +50,7 @@ def generate_cloud_mask(
         Pixels with value 1 (cloudy) or 2 (mixed) are treated as cloud.
     mod35_confidence : np.ndarray (H, W), uint8
         MOD35 4-level unobstructed-FOV quality flag stored in zarr as
-        ``cloud_probability``:
+        ``cloud_mask``:
         0 = confident cloudy, 1 = probably cloudy,
         2 = probably clear,   3 = confident clear.
     blue_band : np.ndarray (H, W), float32
@@ -452,9 +452,9 @@ class MODISZarrPatchDataset(Dataset):
         Requires the blue band (loaded automatically even if use_blue=False).
     cube_mod35 : dict | None
         Optional output of extract_mod35_cube.  When provided its
-        cloud_probability array is used as the mod35_confidence input to
-        generate_cloud_mask.  When None a fully-confident-clear fallback
-        (all 3s) is used so the mask degrades gracefully to mod09 + blue.
+        cloud_mask array (4-level quality) is used as the mod35_confidence
+        input to generate_cloud_mask.  When None a fully-confident-clear
+        fallback (all 3s) is used so the mask degrades gracefully to mod09 + blue.
     """
 
     def __init__(
@@ -676,7 +676,7 @@ class CloudAdapterPipeline:
             "grid_ids": grid_ids,
         }
 
-    def extract_mod35_cube(self, path: str, band: str = "cloud_probability", samples: int = None):
+    def extract_mod35_cube(self, path: str, band: str = "cloud_mask", samples: int = None):
         """
         Open a MOD35 zarr store and return a cube dict compatible with
         MODISZarrPatchDataset(cube_mod35=...).
@@ -686,10 +686,9 @@ class CloudAdapterPipeline:
         path : str
             Path to the MOD35 zarr store.
         band : str
-            Variable name inside patches/ that holds the 4-level confidence
-            flag (0 = confident cloudy … 3 = confident clear).
-            Defaults to "cloud_probability"; use "Cloud_Mask" if that is what
-            was written during download.
+            Variable name inside patches/ that holds the 4-level quality
+            (0=confident cloudy … 3=confident clear, 99=fill).
+            Defaults to "cloud_mask".
         samples : int | None
             Limit to the first N grid_ids (useful for quick tests).
         """
@@ -1090,7 +1089,7 @@ class CloudAdapterPipeline:
         use_blue=False,
         use_meta_mask=False,
         path_mod35=None,
-        mod35_band="cloud_probability",
+        mod35_band="cloud_mask",
         start_date=None,
         end_date=None,
     ):
@@ -1109,8 +1108,7 @@ class CloudAdapterPipeline:
             MOD35 4-level confidence is fed to generate_cloud_mask.  When None
             the mask is computed from mod09 state + blue only.
         mod35_band : str
-            Variable name inside the MOD35 patches group (default
-            "cloud_probability").
+            Variable name inside the MOD35 patches group (default "cloud_mask").
         start_date : str | None
             Inclusive lower bound for training dates, "YYYY-MM-DD".
         end_date : str | None
