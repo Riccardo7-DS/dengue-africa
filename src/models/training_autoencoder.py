@@ -518,7 +518,7 @@ def main(config: dict | None = None):
     # ------------------------------------------------------------------
     viirs_data_path = DATA_PATH / "modis" / "VIIRS_nightlight"
     era5_path = DATA_PATH / "ERA5" / "Latin_america"
-    risk_raster_path = DATA_PATH / "riskmaps_public main data" / "DEN_riskmap_wmean_masked.tif"
+    risk_raster_path = DATA_PATH / "riskmaps" / "DEN_riskmap_wmean_masked.tif"
     admin_path = DATA_PATH / "dengue_cases"
 
     start_date = "2012-01-01"

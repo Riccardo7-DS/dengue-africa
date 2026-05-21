@@ -21,7 +21,7 @@ def tabular_dataset_pipeline(sample=False):
     # ------------------------------
     # 1. Load dengue risk data
     # ------------------------------
-    risk_data_path = Path(DATA_PATH) / "riskmaps_public main data/intermediate_datasets/Arbo_model_fit_data.rds"
+    risk_data_path = Path(DATA_PATH) / "riskmaps/intermediate_datasets/Arbo_model_fit_data.rds"
     df_arbo = read_predict_arbodata(risk_data_path, model="GAM")
 
     lon_min, lon_max = -83.1, -55.1
@@ -38,7 +38,7 @@ def tabular_dataset_pipeline(sample=False):
     df_risk = df_filtered[["pred_dengue_risk", "Latitude", "Longitude"]].copy()
     df_risk["location_id"] = range(len(df_risk))
 
-    tif_dir = DATA_PATH / "modis/-83.1_-55.1_-28.8_13.4"
+    tif_dir = DATA_PATH / "modis" / "modis_tiles"
     da = load_nightlights_data(tif_dir, n_sample_times= n_sample_times if sample else 0)
 
     lat_da = xr.DataArray(df_risk["Latitude"].values, dims="points")
@@ -307,7 +307,7 @@ def main(config: dict | None = None, checkpoint_epoch: int | None = None, sample
     # ------------------------------------------------------------------
     viirs_data_path = DATA_PATH / "modis" / "VIIRS_nightlight"
     era5_path = DATA_PATH / "ERA5" / "Latin_america"
-    risk_raster_path = DATA_PATH / "riskmaps_public main data" / "DEN_riskmap_wmean_masked.tif"
+    risk_raster_path = DATA_PATH / "riskmaps" / "DEN_riskmap_wmean_masked.tif"
     admin_path = DATA_PATH / "dengue_cases" #"weekly_admin2_cases.nc"
 
     start_date = "2012-01-01"

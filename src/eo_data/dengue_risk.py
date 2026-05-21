@@ -17,10 +17,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# path = "riskmaps_public main data/intermediate_datasets/DEN_occ_map_extract.rds"
+# path = "riskmaps/intermediate_datasets/DEN_occ_map_extract.rds"
 
 # df_occ_dengue = pyreadr.read_r(Path(DATA_PATH) / path )[None]
-# df_survey = pyreadr.read_r(Path(DATA_PATH) / "riskmaps_public main data/intermediate_datasets/Surv_model_fit_data.rds")[None]
+# df_survey = pyreadr.read_r(Path(DATA_PATH) / "riskmaps/intermediate_datasets/Surv_model_fit_data.rds")[None]
 
 
 def load_nightlights_data(tif_dir, n_sample_times=0, reproject:bool=False) -> xr.DataArray:
@@ -62,7 +62,7 @@ def read_predict_arbodata(risk_data_path:str, model="Logit"):
     if model not in ["Logit", "GAM"]:
         raise ValueError("Model must be either 'Logit' or 'GAM'")
 
-    # da_den_prev =  rioxarray.open_rasterio(Path(DATA_PATH) / "riskmaps_public main data" / "intermediate_datasets" / "DEN_previous_binrast.tif" )
+    # da_den_prev =  rioxarray.open_rasterio(Path(DATA_PATH) / "riskmaps" / "intermediate_datasets" / "DEN_previous_binrast.tif" )
 
 
     # 1️⃣ Prepare y
