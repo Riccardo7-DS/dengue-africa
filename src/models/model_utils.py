@@ -1711,31 +1711,47 @@ class DengueDataset(torch.utils.data.Dataset):
                 )
 
         # -----------------------------
-        # Compute valid patches
+        # Compute valid patches (vectorized: one xarray load per spatial patch)
         # -----------------------------
-        logger.info("[DengueDataset] Computing valid spatiotemporal patches...")
+        logger.info("[DengueDataset] Computing valid spatiotemporal patches (vectorized)...")
         self.valid_indices = []
+
+        var_name = self.y.variables[0] if hasattr(self.y, "variables") else list(self.y.ds.data_vars)[0]
+
+        # y coordinate may be descending (lat) — sel direction must be flipped
+        y_coords = self.y.ds.y.values
+        y_descending = bool(y_coords[0] > y_coords[-1])
 
         for spatial_idx, bbox in tqdm(
             enumerate(self.spatial_queries),
             total=len(self.spatial_queries),
             desc="Checking valid patches over space and time",
         ):
-
             x_slice, y_slice = bbox[0], bbox[1]
 
-            for time_idx, (t_week, _) in enumerate(self.time_pairs):
+            # Flip y slice for descending coordinate axis
+            y_sel = (slice(y_slice.stop, y_slice.start) if y_descending
+                     else slice(y_slice.start, y_slice.stop))
 
-                query_xarray = (x_slice, y_slice, slice(t_week, t_week))
-                y_patch = self.y[query_xarray]["image"].float()
+            ds_patch = self.y.ds.sel(
+                x=slice(x_slice.start, x_slice.stop),
+                y=y_sel,
+            )
 
-                if y_patch.numel() == 0:
-                    continue
+            if ds_patch.time.size == 0 or ds_patch.y.size == 0 or ds_patch.x.size == 0:
+                continue
 
-                valid_ratio = (~torch.isnan(y_patch)).float().mean()
+            # Load full (T, H, W) block for this spatial patch in one dask compute
+            arr = ds_patch[var_name].values  # (T, H, W)
 
-                if valid_ratio >= self.y_valid_threshold:
-                    self.valid_indices.append((spatial_idx, time_idx))
+            if arr.size == 0:
+                continue
+
+            # Valid ratio per time step — fully vectorized, no Python loop
+            valid_ratios = np.isfinite(arr).reshape(arr.shape[0], -1).mean(axis=1)  # (T,)
+
+            for time_idx in np.where(valid_ratios >= self.y_valid_threshold)[0].tolist():
+                self.valid_indices.append((spatial_idx, time_idx))
 
         if len(self.valid_indices) == 0:
             raise RuntimeError("No valid spatiotemporal patches found!")

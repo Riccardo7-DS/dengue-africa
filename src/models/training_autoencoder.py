@@ -305,7 +305,8 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        print(f"Rank {dist.get_rank()} batch time: {time.time() - start}")
+        rank_id = dist.get_rank() if dist.is_initialized() else 0
+        print(f"Rank {rank_id} batch time: {time.time() - start:.3f}s")
 
     # Handle trailing gradients
     if n_batches > 0 and (n_batches % grad_accum_steps) != 0:
@@ -463,7 +464,7 @@ def main(config: dict | None = None):
     from torch.utils.data.distributed import DistributedSampler
     
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    is_ddp = args.ddp and world_size > 1
+    is_ddp = cfg.get("ddp", False) and world_size > 1
     
     if is_ddp:
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -480,7 +481,7 @@ def main(config: dict | None = None):
 
     # Setup logging - ONLY on rank 0 (or when not using DDP)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = Path(config.get("save_dir", ROOT_DIR / "checkpoints"))
+    base_dir = Path(cfg.get("save_dir", ROOT_DIR / "checkpoints"))
     run_dir = base_dir / f"run_{timestamp}"
     
     # Only rank 0 creates directories and sets up logging
@@ -523,7 +524,7 @@ def main(config: dict | None = None):
     start_date = "2012-01-01"
     end_date = "2023-12-31"
 
-    ds_cases = xr.open_mfdataset(os.path.join(admin_path, "*.nc")).sel(time=slice(start_date, end_date)).chunk(chunks={"time": 1, "x": 86, "y": 86})
+    ds_cases = xr.open_mfdataset(os.path.join(admin_path, "*.nc")).sel(time=slice(start_date, end_date)).chunk(chunks={"time": 1})
     num_zones = len(np.unique(ds_cases["FAO_GAUL_code"].values))
 
     y = XarraySpatioTemporalDataset(ds_cases, variables=["dengue_total"], T_max=1)
@@ -764,6 +765,8 @@ if __name__ == "__main__":
         "amp": True,
         "save_dir": ROOT_DIR / "checkpoints",
         "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "loss_fn": args.loss_fn,
+        "ddp": args.ddp,
     }
 
     main(config=config)
