@@ -7,7 +7,7 @@ import torch.distributed as dist
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import torch
@@ -239,17 +239,27 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
     optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, batch in enumerate(train_loader):
+        if batch_idx == 0 and logger is not None:
+            logger.info("[train_one_epoch] First batch received from DataLoader")
         start = time.time()
-        if batch is None:
-            continue
 
-        x_high, x_med, x_static, x_cond, y_batch = [
-            b.to(device, non_blocking=True) for b in batch
-        ]
-
-        y_batch = ensure_bchw_1x86x86(y_batch)
-        valid_mask = (~torch.isnan(y_batch)).bool()
-        if not valid_mask.any():
+        # Synchronize skip decision: if any DDP rank has an invalid/None batch,
+        # all ranks skip — backward() call counts must match across ranks.
+        skip = (batch is None)
+        x_high = x_med = x_static = x_cond = y_batch = valid_mask = None
+        if not skip:
+            x_high, x_med, x_static, x_cond, y_batch = [
+                b.to(device, non_blocking=True) for b in batch
+            ]
+            y_batch = ensure_bchw_1x86x86(y_batch)
+            valid_mask = (~torch.isnan(y_batch)).bool()
+            if not valid_mask.any():
+                skip = True
+        if is_ddp:
+            skip_t = torch.tensor(int(skip), dtype=torch.int32, device=device)
+            dist.all_reduce(skip_t, op=dist.ReduceOp.MAX)
+            skip = skip_t.item() > 0
+        if skip:
             continue
 
         # Preprocess
@@ -277,9 +287,6 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
                 scaler.scale(scaled_loss).backward()
             else:
                 scaled_loss.backward()
-
-        if is_ddp:
-            torch.distributed.barrier()
 
         should_step = ((batch_idx + 1) % grad_accum_steps == 0)
         if should_step:
@@ -317,28 +324,28 @@ def train_one_epoch(model, train_loader, optimizer, device, data_min, data_max,
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-    if n_batches == 0:
-        return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
-    
-    # Aggregate across DDP replicas
+    # Aggregate across DDP replicas — must happen on all ranks before any early return.
     if is_ddp:
         world_size = torch.distributed.get_world_size()
-        loss_tensor = torch.tensor(running_loss / n_batches, device=device)
-        recon_tensor = torch.tensor(running_recon / n_batches, device=device)
-        kl_tensor = torch.tensor(running_kl / n_batches, device=device)
-        count_tensor = torch.tensor(n_batches, device=device)
-        
+        count_tensor = torch.tensor(float(n_batches), device=device)
+        torch.distributed.all_reduce(count_tensor)
+        if count_tensor.item() == 0:
+            return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
+        loss_tensor = torch.tensor(running_loss / max(n_batches, 1), device=device)
+        recon_tensor = torch.tensor(running_recon / max(n_batches, 1), device=device)
+        kl_tensor = torch.tensor(running_kl / max(n_batches, 1), device=device)
         torch.distributed.all_reduce(loss_tensor)
         torch.distributed.all_reduce(recon_tensor)
         torch.distributed.all_reduce(kl_tensor)
-        torch.distributed.all_reduce(count_tensor)
-        
         return {
             "loss": loss_tensor.item() / world_size,
             "recon": recon_tensor.item() / world_size,
             "kl": kl_tensor.item() / world_size,
         }
-    
+
+    if n_batches == 0:
+        return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
+
     return {
         "loss": running_loss / n_batches,
         "recon": running_recon / n_batches,
@@ -356,16 +363,23 @@ def evaluate_one_epoch(model, loader, device, data_min, data_max,
     n_batches = 0
 
     for batch_idx, batch in enumerate(loader):
-        if batch is None:
-            continue
-
-        x_high, x_med, x_static, x_cond, y_batch = [
-            b.to(device, non_blocking=True) for b in batch
-        ]
-
-        y_batch = ensure_bchw_1x86x86(y_batch)
-        valid_mask = (~torch.isnan(y_batch)).bool()
-        if not valid_mask.any():
+        # Synchronize skip decision: if any DDP rank has an invalid/None batch,
+        # all ranks skip — all_reduce call counts must match across ranks.
+        skip = (batch is None)
+        x_high = x_med = x_static = x_cond = y_batch = valid_mask = None
+        if not skip:
+            x_high, x_med, x_static, x_cond, y_batch = [
+                b.to(device, non_blocking=True) for b in batch
+            ]
+            y_batch = ensure_bchw_1x86x86(y_batch)
+            valid_mask = (~torch.isnan(y_batch)).bool()
+            if not valid_mask.any():
+                skip = True
+        if is_ddp:
+            skip_t = torch.tensor(int(skip), dtype=torch.int32, device=device)
+            dist.all_reduce(skip_t, op=dist.ReduceOp.MAX)
+            skip = skip_t.item() > 0
+        if skip:
             continue
 
         # Preprocess
@@ -403,28 +417,28 @@ def evaluate_one_epoch(model, loader, device, data_min, data_max,
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-    if n_batches == 0:
-        return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
-    
-    # Aggregate across DDP replicas
+    # Aggregate across DDP replicas — must happen on all ranks before any early return.
     if is_ddp:
         world_size = torch.distributed.get_world_size()
-        loss_tensor = torch.tensor(running_loss / n_batches, device=device)
-        recon_tensor = torch.tensor(running_recon / n_batches, device=device)
-        kl_tensor = torch.tensor(running_kl / n_batches, device=device)
-        count_tensor = torch.tensor(n_batches, device=device)
-        
+        count_tensor = torch.tensor(float(n_batches), device=device)
+        torch.distributed.all_reduce(count_tensor)
+        if count_tensor.item() == 0:
+            return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
+        loss_tensor = torch.tensor(running_loss / max(n_batches, 1), device=device)
+        recon_tensor = torch.tensor(running_recon / max(n_batches, 1), device=device)
+        kl_tensor = torch.tensor(running_kl / max(n_batches, 1), device=device)
         torch.distributed.all_reduce(loss_tensor)
         torch.distributed.all_reduce(recon_tensor)
         torch.distributed.all_reduce(kl_tensor)
-        torch.distributed.all_reduce(count_tensor)
-        
         return {
             "loss": loss_tensor.item() / world_size,
             "recon": recon_tensor.item() / world_size,
             "kl": kl_tensor.item() / world_size,
         }
-    
+
+    if n_batches == 0:
+        return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
+
     return {
         "loss": running_loss / n_batches,
         "recon": running_recon / n_batches,
@@ -468,7 +482,8 @@ def main(config: dict | None = None):
     
     if is_ddp:
         local_rank = int(os.environ["LOCAL_RANK"])
-        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
+        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"),
+                                timeout=timedelta(hours=2))
         rank = dist.get_rank()
         print(f"Initialized DDP: world_size={world_size}, local_rank={local_rank}, global_rank={rank}")
         torch.cuda.set_device(local_rank)
@@ -527,13 +542,49 @@ def main(config: dict | None = None):
     ds_cases = xr.open_mfdataset(os.path.join(admin_path, "*.nc")).sel(time=slice(start_date, end_date)).chunk(chunks={"time": 1})
     num_zones = len(np.unique(ds_cases["FAO_GAUL_code"].values))
 
+    # Materialize ds_cases into pure-numpy Dataset before any fork() happens.
+    # xr.open_mfdataset returns a lazy dask Dataset backed by HDF5/NetCDF4 handles;
+    # forked DataLoader workers inherit those handles and deadlock on first access.
+    ds_cases.load()
+    _dc_vars = {v: (ds_cases[v].dims, np.asarray(ds_cases[v].values)) for v in ds_cases.data_vars}
+    _dc_coords = {c: np.asarray(ds_cases.coords[c].values) for c in ds_cases.coords}
+    ds_cases = xr.Dataset(_dc_vars, _dc_coords)
+
     y = XarraySpatioTemporalDataset(ds_cases, variables=["dengue_total"], T_max=1)
     x_spatial = XarraySpatioTemporalDataset(ds_cases, variables=["FAO_GAUL_code"], T_max=1)
-    era5 = ERA5Daily(era5_path, T_max=63, min_date=start_date, max_date=end_date)
+    shared_cache_dir = base_dir / "dataset_cache"
+    shared_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- ERA5 weekly cache ---
+    # Rank 0 pre-computes the weekly zarr if needed; all other ranks wait.
+    # Two barriers: (a) non-0 wait before; (b) rank-0 releases after.
+    if is_ddp and rank != 0:
+        dist.barrier()  # (a) wait until rank 0 finishes ERA5 precomputation
+
+    if rank == 0:
+        weekly_zarr = shared_cache_dir / "era5_weekly.zarr"
+        if not weekly_zarr.exists():
+            logger.info("ERA5 weekly cache not found — precomputing (runs once, ~20–40 min)...")
+            _era5_tmp = ERA5Daily(era5_path, T_max=63, min_date=start_date, max_date=end_date)
+            _era5_tmp.precompute_weekly_cache(shared_cache_dir)
+
+    if is_ddp and rank == 0:
+        dist.barrier()  # (b) release other ranks; weekly zarr is now complete
+
+    # All ranks open ERA5 using the pre-computed weekly cache
+    era5 = ERA5Daily(
+        era5_path, T_max=63, min_date=start_date, max_date=end_date,
+        weekly_cache_dir=shared_cache_dir,
+    )
+
     viirs = VIIRSData(viirs_data_path, min_date=start_date, max_date=end_date)
     static = StaticLayer(risk_raster_path, nodata=-3.3999999521443642e+38)
 
-    shared_cache_dir = base_dir / "dataset_cache"
+    # --- DengueDataset patch cache ---
+    # Rank 0 computes (or loads) the valid-patch index, then releases others.
+    if is_ddp and rank != 0:
+        dist.barrier()
+
     full_dataset = DengueDataset(
         viirs, era5, static, x_spatial, y,
         bbox=latin_box(),
@@ -543,6 +594,9 @@ def main(config: dict | None = None):
         loss_fn=cfg.get("loss_fn", "mse"),
     )
 
+    if is_ddp and rank == 0:
+        dist.barrier()
+
     if rank == 0:
         logger.info(f"Full dataset size: {len(full_dataset)}")
 
@@ -551,8 +605,35 @@ def main(config: dict | None = None):
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-    def _worker_init_fn(_):
+    def _worker_init_fn(worker_id):
         torch.set_num_threads(1)
+        # Cap GDAL's per-process block cache BEFORE any rasterio/GDAL calls.
+        # Default = 5% of RAM (35 GB on this node) × 16 workers = OOM.
+        import os
+        os.environ['GDAL_CACHEMAX'] = '256'  # MB per worker process
+        try:
+            from osgeo import gdal
+            gdal.SetCacheMax(256 * 1024 * 1024)
+        except Exception:
+            pass
+        # Re-create GDAL/rasterio-backed datasets in each forked worker.
+        # GDAL and libspatialindex (rtree) have internal C++ mutexes; any that
+        # were locked at fork() time cause the child to deadlock. Re-creating
+        # these objects gives each worker fresh, unlocked mutex state.
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            return
+        ds = worker_info.dataset
+        if hasattr(ds, 'dataset'):  # unwrap torch.utils.data.Subset
+            ds = ds.dataset
+        for attr in ('viirs', 'static'):
+            old = getattr(ds, attr, None)
+            if old is None or not hasattr(old, 'paths'):
+                continue
+            try:
+                setattr(ds, attr, old.__class__(paths=old.paths, crs=old.crs, res=old.res))
+            except Exception:
+                pass
 
     train_loader_kwargs = dict(
         dataset=train_dataset,

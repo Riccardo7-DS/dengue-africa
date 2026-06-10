@@ -228,6 +228,7 @@ class EarlyStopping:
 
         if self.best_score is None:
             self.best_score = score
+            self.save_checkpoint(val_loss, model_dict, epoch, save_path)
         elif score < self.best_score:
             self.counter += 1
             logger.info(
@@ -1248,6 +1249,7 @@ class ERA5Daily:
         transform=None,
         min_date=None,
         max_date=None,
+        weekly_cache_dir=None,
     ):
         import xarray as xr
         from pathlib import Path
@@ -1259,17 +1261,43 @@ class ERA5Daily:
         self.T_offset = T_offset
         self.transform = transform
 
+        # Check for pre-computed weekly zarr cache (avoids on-the-fly resampling in __getitem__)
+        self._weekly_cache = None
+        if weekly_cache_dir is not None:
+            weekly_zarr = Path(weekly_cache_dir) / "era5_weekly.zarr"
+            if weekly_zarr.exists():
+                logger.info(f"ERA5: loading pre-computed weekly cache from {weekly_zarr}")
+                _ds = xr.open_zarr(str(weekly_zarr))
+                if min_date is not None and max_date is not None:
+                    _ds = _ds.sel(time=slice(min_date, max_date))
+                # Load entire cache into RAM and rebuild as a pure-numpy Dataset.
+                # xr.open_zarr() leaves dask graph references to the zarr store even after
+                # .load(). Forked DataLoader workers inherit those references and deadlock
+                # when they try to re-open the store. Rebuilding from numpy arrays severs
+                # all zarr/dask ties so fork() is safe with num_workers > 0.
+                logger.info("ERA5: loading zarr cache into RAM (5 GB, ~30s)...")
+                _ds.load()  # materialise all variables in-place
+                import numpy as np
+                data_vars = {v: (_ds[v].dims, np.asarray(_ds[v].values)) for v in _ds.data_vars}
+                coords_dict = {c: np.asarray(_ds.coords[c].values) for c in _ds.coords}
+                self._weekly_cache = xr.Dataset(data_vars, coords=coords_dict)
+                self.time_index = self._weekly_cache.time.values
+                self.x_coords = self._weekly_cache.x.values
+                self.y_coords = self._weekly_cache.y.values
+                logger.info(f"ERA5 weekly cache in RAM (fork-safe): {len(self.time_index)} weeks.")
+                return
+
         files = sorted(self.root.glob("era5land_latin_america*.nc"))
         if not files:
             raise RuntimeError("No ERA5 files found")
 
-        # 🔹 open lazily with chunking
+        # open lazily with chunking
         self.ds = xr.open_mfdataset(
             [str(f) for f in files],
             combine="by_coords",
             chunks={"time": 63,
             "x": 43,
-            "y": 43}, 
+            "y": 43},
         )
 
         self.ds = self._normalize_coords(self.ds)
@@ -1285,6 +1313,28 @@ class ERA5Daily:
         self.y_coords = self.ds.y.values
 
         logger.info("ERA5 opened lazily.")
+
+    def precompute_weekly_cache(self, cache_dir):
+        """
+        Compute weekly ERA5 aggregations for the full dataset and save as zarr.
+        Run this once before training to avoid on-the-fly resampling overhead.
+        """
+        import xarray as xr
+        from pathlib import Path
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        weekly_zarr = cache_dir / "era5_weekly.zarr"
+        if weekly_zarr.exists():
+            logger.info(f"ERA5 weekly cache already exists at {weekly_zarr}")
+            return
+
+        logger.info("Pre-computing weekly ERA5 aggregations (this runs once)...")
+        ds_weekly = self._era5_to_weekly(self.ds[self.vars_])
+        # rechunk for efficient spatial queries: (week, y, x)
+        ds_weekly = ds_weekly.chunk({"time": 9, "x": 43, "y": 43})
+        logger.info(f"Writing weekly ERA5 zarr to {weekly_zarr} ...")
+        ds_weekly.to_zarr(str(weekly_zarr), mode="w")
+        logger.info("ERA5 weekly cache written.")
 
 
     def _era5_to_weekly(self, ds, week_freq="1W-MON", week_label="left"):
@@ -1384,17 +1434,24 @@ class ERA5Daily:
 
         x_slice, y_slice, t_slice = query
 
-        # --- Select subset lazily ---
-        ds_sel = (
-            self.ds[self.vars_]
-            .sel(
+        if self._weekly_cache is not None:
+            # Fast path: read pre-computed weekly data directly from zarr cache
+            ds_sel = self._weekly_cache.sel(
                 time=slice(t_slice.start, t_slice.stop),
                 x=slice(x_slice.start, x_slice.stop),
                 y=slice(y_slice.start, y_slice.stop),
             )
-        )
-
-        ds_sel = self._era5_to_weekly(ds_sel)  # Resample to weekly on the fly
+        else:
+            # Slow path: select from daily data and resample to weekly on the fly
+            ds_sel = (
+                self.ds[self.vars_]
+                .sel(
+                    time=slice(t_slice.start, t_slice.stop),
+                    x=slice(x_slice.start, x_slice.stop),
+                    y=slice(y_slice.start, y_slice.stop),
+                )
+            )
+            ds_sel = self._era5_to_weekly(ds_sel)
 
         # --- Convert to array lazily ---
         da = ds_sel.to_array()  # [C,T,H,W] lazy
@@ -1403,7 +1460,7 @@ class ERA5Daily:
         da = da.transpose("time", "variable", "y", "x")
 
         # --- Compute ONLY this subset ---
-        arr = da.compute().values  # 🔥 loads only selected window
+        arr = da.compute().values  # loads only selected window
 
         if arr.size == 0:
             return {"image": torch.empty(0)}
@@ -1757,14 +1814,16 @@ class DengueDataset(torch.utils.data.Dataset):
             raise RuntimeError("No valid spatiotemporal patches found!")
 
         # -----------------------------
-        # Save cache
+        # Save cache (atomic write via tmp + rename, safe under DDP)
         # -----------------------------
         if cache_file:
             try:
                 cache_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp_file = cache_file.with_suffix(".tmp")
 
-                with open(cache_file, "wb") as f:
+                with open(tmp_file, "wb") as f:
                     pickle.dump(self.valid_indices, f)
+                tmp_file.replace(cache_file)  # atomic on POSIX / lustre
 
                 logger.info(
                     f"[DengueDataset] Cached {len(self.valid_indices)} patches to {cache_file}"
@@ -1782,7 +1841,11 @@ class DengueDataset(torch.utils.data.Dataset):
         x_slice, y_slice = bbox[0], bbox[1]
         t_week, t_viirs = self.time_pairs[time_idx]
 
-        rank = dist.get_rank() if dist.is_initialized() else 0
+        # DataLoader workers inherit the NCCL process group after fork(); calling
+        # dist.get_rank() from a worker is safe only for reading the stored int,
+        # but using dist.is_initialized() as a guard is sufficient.
+        _winfo = torch.utils.data.get_worker_info()
+        rank = 0 if _winfo is not None or not dist.is_initialized() else dist.get_rank()
         timings = {}
 
         static_query = (x_slice, y_slice)
@@ -1850,11 +1913,7 @@ class DengueDataset(torch.utils.data.Dataset):
 
         except Exception as e:
             logger.error(f"Error loading patch at spatial_idx={spatial_idx}, time_idx={time_idx}: {e}")
-            # fallback: pick another random index
-                # retry mechanism (safe for DDP)
-            if idx == 1:
-                raise  # avoid infinite loop
-            return self.__getitem__(1)  # deterministic fallback
+            return None
 
 
 # -----------------------------------------------------------------------------
