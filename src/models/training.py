@@ -132,17 +132,30 @@ def save_prediction_snapshot(model, snapshot_batch, device, num_zones, plot_dir,
     import matplotlib.pyplot as plt
 
     is_poisson = cfg.get("loss_fn", "mse") == "poisson"
+    add_sm = cfg.get("add_sm", False)
+    add_lc = cfg.get("add_lc", False)
+
     _items = [t.to(device) for t in snapshot_batch]
     x_high, x_med, x_static, x_cond = _items[0], _items[1], _items[2], _items[3]
     y_batch = _items[-1]
+    x_sm = x_lc = None
+    if add_sm and add_lc:
+        x_sm, x_lc = _items[4], _items[5]
+    elif add_sm:
+        x_sm = _items[4]
+    elif add_lc:
+        x_lc = _items[4]
+
     x_high   = torch.nan_to_num(x_high,   nan=0.0)
     x_med    = torch.nan_to_num(x_med,    nan=0.0)
     x_static = torch.nan_to_num(x_static, nan=0.0)
+    if x_sm is not None:
+        x_sm = torch.nan_to_num(x_sm, nan=0.0)
 
     m = model.module if hasattr(model, "module") else model
     m.eval()
     with torch.no_grad():
-        pred = m(x_high, x_med, x_static, x_cond)   # [B, 1, H, W]
+        pred = m(x_high, x_med, x_static, x_cond, x_sm, x_lc)   # [B, 1, H, W]
 
     pred_cpu = pred[0, 0].cpu().float()              # [H, W]
     zone_map = x_cond[0].squeeze().long().cpu()      # [H, W]
@@ -979,6 +992,31 @@ def main(config: dict | None = None):
     es_config = SimpleNamespace(patience=cfg["patience"], min_patience=0)
     early_stopper = EarlyStopping(es_config, verbose=True)
 
+    # ------------------------------------------------------------------
+    # Optional checkpoint resume
+    # ------------------------------------------------------------------
+    start_epoch = 1
+    ckpt_epoch = cfg.get("checkpoint", 0)
+    if ckpt_epoch > 0:
+        ckpt_run = cfg.get("checkpoint_run")
+        if not ckpt_run:
+            raise ValueError("--checkpoint_run is required when --checkpoint > 0")
+        ckpt_dir = Path(ckpt_run) / "checkpoints" / f"checkpoint_epoch_{ckpt_epoch}"
+        metadata_path = ckpt_dir / f"metadata_epoch_{ckpt_epoch}.pth"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Checkpoint metadata not found: {metadata_path}")
+        metadata = torch.load(metadata_path, map_location="cpu", weights_only=True)
+        raw_model = model.module if hasattr(model, "module") else model
+        raw_model.load_state_dict(
+            torch.load(metadata["components"]["model_state"], map_location="cpu", weights_only=True)
+        )
+        optimizer.load_state_dict(
+            torch.load(metadata["components"]["optimizer_state"], map_location=device, weights_only=True)
+        )
+        start_epoch = ckpt_epoch + 1
+        if rank == 0:
+            logger.info(f"Resumed from {ckpt_dir} — starting at epoch {start_epoch}")
+
     train_losses = []
     val_losses = []
 
@@ -998,7 +1036,7 @@ def main(config: dict | None = None):
     if rank == 0:
         logger.info(f"Starting training for {cfg['num_epochs']} epochs...")
 
-    for epoch in range(1, cfg["num_epochs"] + 1):
+    for epoch in range(start_epoch, cfg["num_epochs"] + 1):
         if is_ddp:
             train_loader.sampler.set_epoch(epoch)
 
@@ -1133,6 +1171,15 @@ def parse_args():
                              "(GPWv4_latin_america_YYYY.nc). "
                              "Only used with --loss_fn poisson; ignored otherwise.")
 
+    # --- resume ---
+    parser.add_argument("--checkpoint", type=int, default=0,
+                        help="Epoch to resume from (0 = start fresh). "
+                             "Requires --checkpoint_run.")
+    parser.add_argument("--checkpoint_run", type=str, default=None,
+                        help="Path to the run directory to resume from, e.g. "
+                             "checkpoints/run_20260613_150752. "
+                             "Required when --checkpoint > 0.")
+
     return parser.parse_args()
 
 
@@ -1169,6 +1216,8 @@ if __name__ == "__main__":
         "add_lc": args.add_lc,
         "lc_data_path": args.lc_data_path,
         "gpw_path": args.gpw_path,
+        "checkpoint": args.checkpoint,
+        "checkpoint_run": args.checkpoint_run,
     }
 
     main(config=config)
