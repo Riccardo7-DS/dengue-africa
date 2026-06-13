@@ -1035,7 +1035,7 @@ def main(config: dict | None = None):
     # then focuses on spatial/temporal variation rather than recovering the global scale.
     # The bias remains fully learnable after this initialisation.
     if population is not None:
-        total_cases = float(ds_cases["dengue_total"].values.sum())
+        total_cases = float(np.nansum(ds_cases["dengue_total"].values))
         log_base_rate = math.log(max(total_cases, 1.0)) - math.log(max(population.total_population, 1.0))
         with torch.no_grad():
             model.decoder[-1].bias.data.fill_(log_base_rate)
