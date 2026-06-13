@@ -849,8 +849,8 @@ def main(config: dict | None = None):
     risk_raster_path = DATA_PATH / "riskmaps" / "DEN_riskmap_wmean_masked.tif"
     admin_path = DATA_PATH / "dengue_cases"
 
-    start_date = "2012-01-01"
-    end_date = "2023-12-31"
+    start_date = cfg.get("start_date") or "2012-01-01"
+    end_date   = cfg.get("end_date")   or "2023-12-31"
 
     # Soil moisture is only available 2016-2022 — restrict window when enabled
     if cfg.get("add_sm", False):
@@ -1273,6 +1273,12 @@ def parse_args():
                         help="Directory containing GPWv4 NetCDF files "
                              "(GPWv4_latin_america_YYYY.nc). "
                              "Only used with --loss_fn poisson; ignored otherwise.")
+
+    # --- date range ---
+    parser.add_argument("--start_date", type=str, default=None,
+                        help="Override training start date (YYYY-MM-DD). Default: 2012-01-01.")
+    parser.add_argument("--end_date", type=str, default=None,
+                        help="Override training end date (YYYY-MM-DD). Default: 2023-12-31.")
 
     # --- resume ---
     parser.add_argument("--checkpoint", type=int, default=0,

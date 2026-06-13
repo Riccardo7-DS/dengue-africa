@@ -1,0 +1,43 @@
+#!/bin/bash
+#PBS -N dengue_baseline_restricted
+#PBS -q gpu4_std
+#PBS -P hpc-prj-1001
+#PBS -l select=1:ncpus=96:ngpus=4:mem=700gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o /lustre/projects/1001/rdercole/dengue-africa/pbs_baseline_restricted.log
+
+module load PrgEnv-nvidia
+
+export NCCL_SOCKET_IFNAME=lo
+export NCCL_IB_DISABLE=1
+export NCCL_DEBUG=WARN
+export MASTER_ADDR=localhost
+export MASTER_PORT=29503
+export HF_HOME=/lustre/projects/1001/rdercole/dengue-africa/.cache/huggingface
+export HF_HUB_OFFLINE=1
+
+cd /lustre/projects/1001/rdercole/dengue-africa
+
+PYTHONPATH=/lustre/projects/1001/rdercole/dengue-africa/src \
+uv run --no-sync torchrun \
+    --standalone --nproc_per_node=4 \
+    --master_addr=localhost --master_port=29503 \
+    /lustre/projects/1001/rdercole/dengue-africa/src/models/training.py \
+    --model transformer \
+    --batch_size 4 \
+    --num_epochs 100 \
+    --num_workers 8 \
+    --learning_rate 5e-4 \
+    --patience 10 \
+    --train_split 0.8 \
+    --loss_fn poisson \
+    --grad_accum_steps 1 \
+    --cleanup_every 100 \
+    --ddp \
+    --med_in_ch 18 \
+    --swin_model swin_tiny_patch4_window7_224.ms_in1k \
+    --titok_backbone vit_base_patch16_224.mae \
+    --titok_num_latent_tokens 32 \
+    --start_date 2016-01-01 \
+    --end_date 2022-12-31
