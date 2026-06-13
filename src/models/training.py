@@ -998,10 +998,31 @@ def main(config: dict | None = None):
     start_epoch = 1
     ckpt_epoch = cfg.get("checkpoint", 0)
     if ckpt_epoch > 0:
+        # If an explicit run dir was given, use it; otherwise scan save_dir for the
+        # most recent run that contains checkpoint_epoch_{ckpt_epoch}.
         ckpt_run = cfg.get("checkpoint_run")
-        if not ckpt_run:
-            raise ValueError("--checkpoint_run is required when --checkpoint > 0")
-        ckpt_dir = Path(ckpt_run) / "checkpoints" / f"checkpoint_epoch_{ckpt_epoch}"
+        if ckpt_run:
+            ckpt_run = Path(ckpt_run)
+        else:
+            base_dir = Path(cfg.get("save_dir", ROOT_DIR / "checkpoints"))
+            candidates = sorted(
+                [
+                    d for d in base_dir.iterdir()
+                    if d.is_dir() and d.name.startswith("run_")
+                    and (d / "checkpoints" / f"checkpoint_epoch_{ckpt_epoch}").exists()
+                ],
+                key=lambda d: d.name,
+                reverse=True,   # most recent first (timestamp in name)
+            )
+            if not candidates:
+                raise FileNotFoundError(
+                    f"No run in {base_dir} contains checkpoint_epoch_{ckpt_epoch}"
+                )
+            ckpt_run = candidates[0]
+            if rank == 0:
+                logger.info(f"Auto-selected checkpoint run: {ckpt_run}")
+
+        ckpt_dir = ckpt_run / "checkpoints" / f"checkpoint_epoch_{ckpt_epoch}"
         metadata_path = ckpt_dir / f"metadata_epoch_{ckpt_epoch}.pth"
         if not metadata_path.exists():
             raise FileNotFoundError(f"Checkpoint metadata not found: {metadata_path}")
