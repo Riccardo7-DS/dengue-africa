@@ -9,6 +9,41 @@ import torch.nn as nn
 import timm
 
 
+class LandCoverEmbeddingBranch(nn.Module):
+    """
+    Embeds per-pixel MODIS LC_Type1 class IDs into a learned spatial feature.
+
+    MODIS LC_Type1 has 17 classes (1-17) plus 0=water and 255=fill.
+    We map everything to [0, num_classes], clamping 255 → num_classes (unknown slot).
+
+    Input:  x_lc  [B, 1, H, W]  long integer class IDs
+    Output:        [B, out_dim]
+    """
+    def __init__(self, num_classes: int = 18, embed_dim: int = 16, out_dim: int = 128):
+        super().__init__()
+        self.num_classes = num_classes
+        # +1 extra slot for nodata / fill values (255)
+        self.embedding = nn.Embedding(num_classes + 1, embed_dim)
+        self.conv = nn.Sequential(
+            nn.Conv2d(embed_dim, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((8, 8)),
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 8 * 8, out_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x_lc: torch.Tensor) -> torch.Tensor:
+        if x_lc.dim() == 4:
+            x_lc = x_lc.squeeze(1)                              # [B, H, W]
+        ids = x_lc.long().clamp(0, self.num_classes)            # map 255→num_classes
+        emb = self.embedding(ids)                               # [B, H, W, embed_dim]
+        emb = emb.permute(0, 3, 1, 2)                          # [B, embed_dim, H, W]
+        return self.fc(self.conv(emb))                          # [B, out_dim]
+
+
 class TiTokBottleneck(nn.Module):
     """
     Compresses N patch tokens → K latent tokens via cross-attention.
@@ -313,7 +348,16 @@ class DenguePredictor(nn.Module):
                  use_titok=False,
                  titok_backbone='vit_base_patch16_224.mae',
                  titok_num_latent_tokens=32,
-                 titok_patch_size=256):
+                 titok_patch_size=256,
+                 # --- Soil moisture branch ---
+                 add_sm=False,
+                 sm_in_ch=2,   # ch0=SM value, ch1=validity mask
+                 sm_out=128,
+                 # --- Land cover embedding branch ---
+                 add_lc=False,
+                 lc_num_classes=18,
+                 lc_embed_dim=16,
+                 lc_out=128):
         super().__init__()
 
         # High-res branch: standard Swin OR TiTok-based
@@ -337,12 +381,30 @@ class DenguePredictor(nn.Module):
         self.static_branch = StaticBranch(out_dim=static_out, in_ch=static_in_ch)
         self.zone_branch = ZoneEmbeddingBlock(num_zones, static_out)
 
+        # Optional soil moisture branch (same architecture as ERA5 medium branch)
+        self.add_sm = add_sm
+        if add_sm:
+            self.sm_branch = MediumResBranchAttention(out_dim=sm_out, in_ch=sm_in_ch)
+
+        # Optional land cover embedding branch
+        self.add_lc = add_lc
+        if add_lc:
+            self.lc_branch = LandCoverEmbeddingBranch(
+                num_classes=lc_num_classes,
+                embed_dim=lc_embed_dim,
+                out_dim=lc_out,
+            )
+
         # Output configuration
         self.output_size = output_size
         self.output_channels = output_channels
         self.decoder_channels = decoder_channels
 
         total_in = high_out + med_out + static_out + static_out
+        if add_sm:
+            total_in += sm_out
+        if add_lc:
+            total_in += lc_out
         H, W = output_size
         proj_pixels = decoder_channels * H * W
         self.fc = nn.Sequential(
@@ -358,13 +420,19 @@ class DenguePredictor(nn.Module):
             nn.Conv2d(decoder_channels, output_channels, kernel_size=1)
         )
 
-    def forward(self, x_high, x_med, x_static, x_cond):
-        f_high = self.high_branch(x_high)
-        f_med = self.med_branch(x_med)
+    def forward(self, x_high, x_med, x_static, x_cond, x_sm=None, x_lc=None):
+        f_high   = self.high_branch(x_high)
+        f_med    = self.med_branch(x_med)
         f_static = self.static_branch(x_static)
-        f_embed = self.zone_branch(x_cond.long())
+        f_embed  = self.zone_branch(x_cond.long())
 
-        fusion = torch.cat([f_high, f_med, f_static, f_embed], dim=1)
+        parts = [f_high, f_med, f_static, f_embed]
+        if self.add_sm and x_sm is not None:
+            parts.append(self.sm_branch(x_sm))
+        if self.add_lc and x_lc is not None:
+            parts.append(self.lc_branch(x_lc))
+
+        fusion = torch.cat(parts, dim=1)
 
         out = self.fc(fusion)
         B = out.shape[0]

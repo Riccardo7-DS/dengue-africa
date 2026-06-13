@@ -1,9 +1,13 @@
 notebooks/
 checkpoints/
 solutions/
+outputs/
+
 data/
 *.pyc
 .env
+src/local_paths.py
+local.mk
 *.lock
 .vscode/
 *.log
@@ -14,8 +18,6 @@ __pycache__/
 *.pyo
 *.pyd
 .venv/
-outputs/
 *.png
 *.sh
-
 *.tar.gz

@@ -913,36 +913,71 @@ class MaskedAdmin2Loss():
         self.num_zones = num_zones
         self.pop_weights = torch.tensor(pop_weights, dtype=torch.float32, device=self.device) if pop_weights is not None else None
 
-    def zone_aggregate(self, pred, zone_map):
+    def zone_aggregate(self, pred, zone_map, pop_map=None):
+        """
+        Aggregate pixel log-rates to zone-level log-expected-cases.
+
+        Without population (pop_map=None):
+            log λ_z = logsumexp(ŷ_i for i∈z)  [uniform P=1]
+
+        With population weighting (pop_map provided):
+            λ_z = Σ_{i∈z} P_i · exp(ŷ_i)
+            log λ_z = m + log(Σ P_i · exp(ŷ_i − m))  where m = max(ŷ)
+
+        The max-shift trick prevents exp overflow. zone_max is computed
+        under no_grad to avoid inplace/backward conflicts.
+        """
         B = pred.shape[0]
         pred = pred.squeeze(1).float()          # [B, H, W]
 
-        # Handle any shape [..., H, W] → [B, H, W]
         H, W = pred.shape[-2], pred.shape[-1]
         zone_map = zone_map.view(B, H, W).long()
 
-        zone_preds  = torch.zeros(B, self.num_zones, device=pred.device, dtype=torch.float32)
+        if pop_map is not None:
+            pop_map = pop_map.view(B, H, W).float().to(pred.device)
+
         zone_counts = torch.zeros(B, self.num_zones, device=pred.device, dtype=torch.float32)
 
         # Valid mask: exclude -1 (out-of-zone) and out-of-bounds
         valid = (zone_map >= 0) & (zone_map < self.num_zones)  # [B, H, W]
 
+        # Pass 1: per-zone max of log-rates for numerical stability.
+        # Computed under no_grad — zone_max is a constant stabilizer, not a
+        # learnable quantity. scatter_reduce_ inplace on a grad-tracked tensor
+        # causes a ScatterReduceBackward version conflict in pass 2.
+        zone_max = torch.full((B, self.num_zones), float('-inf'),
+                              device=pred.device, dtype=torch.float32)
+        with torch.no_grad():
+            for b in range(B):
+                zm = zone_map[b][valid[b]].view(-1)
+                pv = pred[b][valid[b]].view(-1)
+                zone_max[b].scatter_reduce_(0, zm, pv, reduce='amax', include_self=True)
+                zone_counts[b].scatter_add_(0, zm, torch.ones_like(pv))
+
+        # Pass 2: Σ [P_i ·] exp(ŷ_i − m).  When pop_map is None, P_i = 1.
+        # zone_max is detached; gradients flow through pred → shifted_exp only.
+        zone_exp_sum = torch.zeros(B, self.num_zones, device=pred.device, dtype=torch.float32)
         for b in range(B):
             zm = zone_map[b][valid[b]].view(-1)
             pv = pred[b][valid[b]].view(-1)
-            zone_preds[b].scatter_add_(0, zm, pv)
-            zone_counts[b].scatter_add_(0, zm, torch.ones_like(pv))
+            shifted = torch.exp(pv - zone_max[b][zm])
+            if pop_map is not None:
+                shifted = pop_map[b][valid[b]].view(-1) * shifted
+            zone_exp_sum[b].scatter_add_(0, zm, shifted)
 
-        zone_means = zone_preds / (zone_counts + 1e-8)
-        return zone_means, zone_counts
+        # log λ_z = max + log(Σ [P_i ·] exp(ŷ_i − max))
+        # Zones with no pixels retain -inf from zone_max → masked out in zone_loss
+        log_zone_rates = zone_max + torch.log(zone_exp_sum + 1e-8)
+        return log_zone_rates, zone_counts
 
-    def zone_loss(self, pred, target, zone_map):
+    def zone_loss(self, pred, target, zone_map, pop_map=None):
         """
-        pred:     [B, 1, H, W]  — model output (log-counts)
+        pred:     [B, 1, H, W]  — model output (pixel log per-capita risk)
         target:   [B, num_zones] — ground truth zone-level case counts
         zone_map: [B, H, W]     — integer zone IDs
+        pop_map:  [B, H, W]     — GPWv4 population per pixel (optional)
         """
-        zone_preds, zone_counts = self.zone_aggregate(pred, zone_map)
+        zone_preds, zone_counts = self.zone_aggregate(pred, zone_map, pop_map)
 
         # Mask 1: zones not present in this spatial patch
         spatial_mask = zone_counts > 0              # [B, num_zones]
@@ -1233,6 +1268,455 @@ class XarraySpatioTemporalDataset(RasterDataset):
         return {"image": patch}
 
 
+class LandCoverData:
+    """
+    Annual MODIS MCD12Q1 land cover loader.
+
+    Expects one NetCDF per year under `root/`, named with a 4-digit year, e.g.:
+        MCD12Q1_latin_america_2016.nc
+
+    Each file must have (lat, lon) coords and a `LC_Type1` data variable
+    (IGBP classification, EPSG:4326).
+
+    __getitem__ receives (x_slice, y_slice, year_or_timestamp), crops to the
+    query bbox, resamples to `target_size` via nearest-neighbour, and returns
+    {"image": Tensor[1, H, W]} of raw IGBP class floats.
+
+    Falls back to the nearest available year when exact year is missing.
+    """
+
+    def __init__(self, root, target_size: tuple = (102, 102)):
+        import re
+
+        self.root = Path(root)
+        self.target_size = target_size
+
+        self._index: dict = {}
+        year_re = re.compile(r"(20\d{2})")
+        for fpath in sorted(self.root.rglob("*.nc")):
+            m = year_re.search(fpath.name)
+            if m:
+                self._index[int(m.group(1))] = fpath
+
+        if not self._index:
+            raise RuntimeError(f"No land-cover NetCDF files found under {self.root}")
+
+        self._years = sorted(self._index.keys())
+        logger.info(
+            f"LandCoverData: {len(self._years)} annual files indexed "
+            f"({self._years[0]}–{self._years[-1]})"
+        )
+
+    def _nearest_year(self, year: int) -> int:
+        return min(self._years, key=lambda y: abs(y - year))
+
+    def __getitem__(self, query) -> dict:
+        """
+        query: (x_slice, y_slice, year_or_timestamp)
+          x_slice.start/stop: lon degrees
+          y_slice.start/stop: lat degrees (start < stop)
+          year_or_timestamp: int year OR pandas Timestamp
+        """
+        import numpy as _np
+        from scipy.ndimage import zoom
+
+        x_slice, y_slice, year_ref = query
+        year = int(pd.Timestamp(year_ref).year) if not isinstance(year_ref, int) else year_ref
+        year = self._nearest_year(year)
+        fpath = self._index[year]
+
+        H, W = self.target_size
+        dst_arr = _np.full((1, H, W), _np.nan, dtype=_np.float32)
+
+        try:
+            ds = xr.open_dataset(fpath, engine="netcdf4")
+            da = ds["LC_Type1"]
+
+            # lat may be descending — normalise so sel works in either order
+            lat_asc = float(da.lat[0]) < float(da.lat[-1])
+            if lat_asc:
+                sub = da.sel(lon=slice(x_slice.start, x_slice.stop),
+                             lat=slice(y_slice.start, y_slice.stop))
+            else:
+                sub = da.sel(lon=slice(x_slice.start, x_slice.stop),
+                             lat=slice(y_slice.stop,  y_slice.start))
+
+            ds.close()
+            arr = sub.values.astype(_np.float32)   # [lat_crop, lon_crop]
+
+            if arr.size == 0:
+                return {"image": torch.from_numpy(dst_arr)}
+
+            # Nearest-neighbour resample to target_size via zoom
+            zy = H / arr.shape[0]
+            zx = W / arr.shape[1]
+            resampled = zoom(arr, (zy, zx), order=0, prefilter=False)
+            # Flip to standard top-left = N,W orientation if lat was descending
+            if not lat_asc:
+                resampled = resampled[::-1, :]
+            dst_arr[0] = resampled[:H, :W]
+
+        except Exception as e:
+            logger.warning(f"LandCoverData: failed to load {fpath}: {e}")
+
+        return {"image": torch.from_numpy(dst_arr.copy())}    # [1, H, W]
+
+
+class GPWv4Population:
+    """
+    GPWv4 Rev11 population count loader for exposure-weighted zone aggregation.
+
+    All available epochs are pre-loaded into RAM as float32 numpy arrays
+    for fork-safety in DataLoader workers.
+
+    Epoch assignment (no interpolation, per spec):
+      year < 2016  → 2010  (covers training years 2012–2015)
+      year < 2020  → 2015  (2016–2019)
+      year ≥ 2020  → 2020
+
+    __getitem__(x_slice, y_slice, year_or_timestamp)
+        Returns Tensor[H, W] of population counts aggregated to target_size.
+        NaN pixels in source (no-data) are treated as zero population.
+    """
+
+    _EPOCH_BREAKS = [(2016, 2010), (2020, 2015)]   # (threshold, epoch_if_below)
+    _FALLBACK_EPOCH = 2020
+
+    def __init__(self, root, target_size: tuple = (86, 86)):
+        import re as _re
+
+        self.root = Path(root)
+        self.target_size = target_size
+        self._cache: dict = {}   # epoch → {"arr": np.ndarray, "lat": ..., "lon": ...}
+
+        year_re = _re.compile(r"GPWv4.*?(\d{4})\.nc$")
+        indexed = {}
+        for fpath in sorted(self.root.glob("GPWv4*.nc")):
+            m = year_re.search(fpath.name)
+            if m:
+                indexed[int(m.group(1))] = fpath
+
+        if not indexed:
+            raise RuntimeError(f"No GPWv4 NetCDF files found under {self.root}")
+
+        for epoch, fpath in sorted(indexed.items()):
+            logger.info(f"GPWv4Population: loading epoch {epoch} from {fpath} ...")
+            ds = xr.open_dataset(fpath)
+            arr = np.asarray(ds["population_count"].values, dtype=np.float32)
+            lat = np.asarray(ds["lat"].values, dtype=np.float64)
+            lon = np.asarray(ds["lon"].values, dtype=np.float64)
+            ds.close()
+            arr = np.nan_to_num(arr, nan=0.0)   # uninhabited → 0
+            self._cache[epoch] = {"arr": arr, "lat": lat, "lon": lon}
+            logger.info(f"GPWv4Population: epoch {epoch} shape={arr.shape}")
+
+        self._available_epochs = sorted(self._cache.keys())
+
+    def _assign_epoch(self, year: int) -> int:
+        for threshold, epoch in self._EPOCH_BREAKS:
+            if year < threshold:
+                break_epoch = epoch
+                if break_epoch in self._cache:
+                    return break_epoch
+        # fallback: nearest available epoch
+        return min(self._available_epochs, key=lambda e: abs(e - year))
+
+    def __getitem__(self, query) -> torch.Tensor:
+        """
+        query: (x_slice, y_slice, year_or_timestamp)
+          x_slice.start/stop → lon bounds
+          y_slice.start/stop → lat bounds (start=south, stop=north)
+        Returns Tensor[H, W] at target_size resolution, north at row 0.
+        """
+        from scipy.ndimage import zoom as _zoom
+
+        x_slice, y_slice, year_ref = query
+        year = (
+            int(pd.Timestamp(year_ref).year)
+            if not isinstance(year_ref, int)
+            else year_ref
+        )
+        epoch = self._assign_epoch(year)
+        cache = self._cache[epoch]
+        arr, lat, lon = cache["arr"], cache["lat"], cache["lon"]
+
+        H_tgt, W_tgt = self.target_size
+
+        lon_lo = max(float(x_slice.start), float(lon.min()))
+        lon_hi = min(float(x_slice.stop),  float(lon.max()))
+        lat_lo = max(float(y_slice.start), float(lat.min()))
+        lat_hi = min(float(y_slice.stop),  float(lat.max()))
+
+        if lon_lo >= lon_hi or lat_lo >= lat_hi:
+            return torch.zeros(H_tgt, W_tgt, dtype=torch.float32)
+
+        lat_idx = np.where((lat >= lat_lo) & (lat <= lat_hi))[0]
+        lon_idx = np.where((lon >= lon_lo) & (lon <= lon_hi))[0]
+
+        if lat_idx.size == 0 or lon_idx.size == 0:
+            return torch.zeros(H_tgt, W_tgt, dtype=torch.float32)
+
+        # lat may be descending: lat_idx.min() = northernmost row
+        lat_i0, lat_i1 = int(lat_idx.min()), int(lat_idx.max()) + 1
+        lon_i0, lon_i1 = int(lon_idx.min()), int(lon_idx.max()) + 1
+        sub = arr[lat_i0:lat_i1, lon_i0:lon_i1]   # [H_src, W_src], north at row 0
+
+        if sub.size == 0:
+            return torch.zeros(H_tgt, W_tgt, dtype=torch.float32)
+
+        zy = H_tgt / sub.shape[0]
+        zx = W_tgt / sub.shape[1]
+        resampled = _zoom(sub, (zy, zx), order=1, prefilter=False)
+        # Convert bilinear mean → area-weighted sum to preserve total population
+        scale = (sub.shape[0] * sub.shape[1]) / (H_tgt * W_tgt)
+        resampled = np.clip(resampled * scale, 0.0, None).astype(np.float32)
+
+        return torch.from_numpy(resampled.copy())   # [H, W]
+
+
+class SoilMoistureData:
+    """
+    Loader for daily Sentinel-1 soil moisture GeoTIFFs.
+
+    File layout: <root>/<year>/SM_[A|D]_YYYYMMDD.tif
+    Two sensor passes per day (A = ascending, D = descending).
+
+    Fast path (recommended): pass `cache_dir` pointing to a directory that
+    contains `sm_6day_1km.zarr` (built by build_sm_cache.py).  The cache stores
+    all 6-day composites on a ~1 km (0.01°) grid covering Latin America;
+    __getitem__ becomes a lazy zarr crop — no rasterio per sample.
+    Values are stored as float32 m³/m³ (already scaled).
+
+    Slow path (fallback): when no cache is available, __getitem__ opens the
+    raw TIF files via rasterio on every call.  This is ~5 s/sample on lustre
+    and is only suitable for debugging.
+
+    Returns {"image": Tensor[num_steps, 2, H, W]}
+      channel 0: SM value in m³/m³ (0 where gap)
+      channel 1: validity mask (1 where data, 0 where gap)
+    """
+
+    def __init__(
+        self,
+        root,
+        min_date=None,
+        max_date=None,
+        window_days: int = 6,
+        num_steps: int = 5,
+        target_size: tuple = None,   # None = return native zarr resolution
+        cache_dir=None,
+    ):
+        import re
+        from datetime import date as _date, timedelta as _td
+
+        self.root = Path(root)
+        self.window_days = window_days
+        self.num_steps = num_steps
+        self.target_size = target_size  # None → native zarr resolution, else (H, W)
+
+        # ── Fast path: open zarr lazily (no RAM preload) ──────────────
+        self._zarr_cache = None
+        if cache_dir is not None:
+            sm_zarr = Path(cache_dir) / 'sm_6day_1km.zarr'
+            if sm_zarr.exists():
+                import zarr as _zarr
+                logger.info(f"SoilMoistureData: opening zarr cache at {sm_zarr}")
+                _store = _zarr.open(str(sm_zarr), mode='r')
+                attrs = dict(_store.attrs)
+                self._cache_start   = pd.Timestamp(attrs['start_date']).date()
+                self._cache_lon_min = float(attrs['lon_min'])
+                self._cache_lat_min = float(attrs['lat_min'])
+                self._cache_res     = float(attrs['resolution'])
+                self._cache_nwin    = int(attrs['n_windows'])
+                self._cache_h       = int(attrs.get('h_global', _store.shape[2]))
+                self._cache_w       = int(attrs.get('w_global', _store.shape[3]))
+                self._zarr_cache    = _store   # lazy — reads on demand
+                logger.info(
+                    f"SoilMoistureData: zarr ready "
+                    f"({self._cache_nwin} windows, {self._cache_res}°/px, "
+                    f"{_store.nbytes / 1e9:.1f} GB uncompressed)"
+                )
+
+        # ── Slow path: build index of raw TIF files ──────────────────
+        # Always index files so we can report the date range.
+        self._index: dict = {}
+        pattern = re.compile(r"^SM_([AD])_(\d{8})\.tif$")
+
+        min_dt = pd.Timestamp(min_date).date() if min_date else None
+        max_dt = pd.Timestamp(max_date).date() if max_date else None
+
+        for year_dir in sorted(self.root.iterdir()):
+            if not year_dir.is_dir():
+                continue
+            for fpath in sorted(year_dir.glob("SM_*.tif")):
+                m = pattern.match(fpath.name)
+                if not m:
+                    continue
+                sensor = m.group(1)          # 'A' or 'D'
+                dt = pd.Timestamp(m.group(2), tz=None).date()
+                if min_dt and dt < min_dt:
+                    continue
+                if max_dt and dt > max_dt:
+                    continue
+                if dt not in self._index:
+                    self._index[dt] = {"A": None, "D": None}
+                self._index[dt][sensor] = fpath
+
+        self._dates = sorted(self._index.keys())
+        if not self._dates:
+            raise RuntimeError(f"No SM files found under {self.root}")
+        logger.info(
+            f"SoilMoistureData: {len(self._dates)} days indexed "
+            f"({self._dates[0]} – {self._dates[-1]})"
+        )
+
+    # ------------------------------------------------------------------
+    def _load_window_max(self, window_dates, x_slice, y_slice) -> "np.ndarray":
+        """
+        Load all A+D files for the given list of dates, crop to bbox,
+        resample to target_size, return pixel-wise max + validity mask → [2, H, W].
+
+        Channel 0: SM value  (0 where no observation exists in the window)
+        Channel 1: valid mask (1 where ≥1 observation exists, 0 where gap)
+
+        Swath gaps are common — a 6-day window may cover only part of the bbox
+        or have no overpasses at all.  The mask lets the model distinguish
+        "no data" from "SM = 0 (measured wet/water)" and prevents the temporal
+        attention from collapsing on all-zero gap windows.
+        """
+        import rasterio
+        from rasterio.warp import reproject, Resampling
+        from rasterio.transform import from_bounds
+        import numpy as _np
+
+        H, W = self.target_size
+        stacked = []
+
+        for dt in window_dates:
+            entry = self._index.get(dt, {})
+            for sensor in ("A", "D"):
+                fpath = entry.get(sensor)
+                if fpath is None:
+                    continue
+                try:
+                    with rasterio.open(fpath) as src:
+                        dst_transform = from_bounds(
+                            x_slice.start, y_slice.start,
+                            x_slice.stop,  y_slice.stop,
+                            W, H
+                        )
+                        dst_crs = src.crs
+                        dst_arr = _np.full((1, H, W), _np.nan, dtype=_np.float32)
+                        reproject(
+                            source=rasterio.band(src, 1),
+                            destination=dst_arr,
+                            dst_transform=dst_transform,
+                            dst_crs=dst_crs,
+                            resampling=Resampling.nearest,
+                            dst_nodata=_np.nan,
+                        )
+                        # nodata is 32767 (int16 max) but not set in GeoTIFF metadata
+                        nd = src.nodata if src.nodata is not None else 32767.0
+                        dst_arr[dst_arr >= nd] = _np.nan
+                        stacked.append(dst_arr[0])   # [H, W]
+                except Exception as e:
+                    logger.debug(f"SM: failed to load {fpath}: {e}")
+
+        if not stacked:
+            # Entire window is a gap — return zeros + zero mask
+            return _np.zeros((2, H, W), dtype=_np.float32)
+
+        arr = _np.stack(stacked, axis=0)              # [N, H, W]
+        # valid mask: True where at least one swath covers the pixel
+        valid = _np.any(_np.isfinite(arr), axis=0)    # [H, W] bool
+        sm_max = _np.where(valid, _np.nanmax(arr, axis=0), 0.0).astype(_np.float32)
+        mask   = valid.astype(_np.float32)            # [H, W] 0/1
+        return _np.stack([sm_max, mask], axis=0)      # [2, H, W]
+
+    # ------------------------------------------------------------------
+    def __getitem__(self, query) -> dict:
+        """
+        query: (x_slice, y_slice, t_end)
+          x_slice, y_slice: slice objects with .start/.stop in lon/lat degrees
+          t_end: pandas Timestamp (or anything castable to pd.Timestamp)
+
+        Returns {"image": Tensor[num_steps, 2, H, W]}
+          Channel 0: SM composite value (0 where gap)
+          Channel 1: validity mask (1 where data, 0 where gap)
+        """
+        import numpy as _np
+        import datetime as _dt
+
+        x_slice, y_slice, t_end = query
+        t_end_date = pd.Timestamp(t_end).date()
+
+        if self._zarr_cache is not None:
+            # Derive pixel dimensions from bbox and cache resolution (native res)
+            res = self._cache_res
+            H_tgt = max(1, round((y_slice.stop - y_slice.start) / res))
+            W_tgt = max(1, round((x_slice.stop - x_slice.start) / res))
+            return self._getitem_cached(x_slice, y_slice, t_end_date, H_tgt, W_tgt)
+
+        if self.target_size is None:
+            raise RuntimeError("target_size must be set when no zarr cache is available")
+        H_tgt, W_tgt = self.target_size
+
+        # ── Slow rasterio fallback ───────────────────────────────────
+        composites = []
+        for step in range(self.num_steps - 1, -1, -1):   # oldest first → chronological
+            win_end   = t_end_date - _dt.timedelta(days=step * self.window_days)
+            win_start = win_end    - _dt.timedelta(days=self.window_days - 1)
+            window_dates = [win_start + _dt.timedelta(days=d) for d in range(self.window_days)]
+            composites.append(self._load_window_max(window_dates, x_slice, y_slice))
+
+        arr = _np.stack(composites, axis=0)
+        return {"image": torch.from_numpy(arr)}
+
+    def _getitem_cached(self, x_slice, y_slice, t_end_date, H_tgt: int, W_tgt: int) -> dict:
+        """Fast path: lazy zarr crop at native ~1 km resolution — no rasterio, no zoom.
+
+        Values are already float32 m³/m³ as stored by build_sm_cache.py.
+        H_tgt/W_tgt are derived from the bbox size and cache resolution, so the
+        zarr crop always matches exactly (no resize needed).
+        """
+        import numpy as _np
+
+        res = self._cache_res
+        current_win = (t_end_date - self._cache_start).days // self.window_days
+
+        lon_i0 = max(0, round((x_slice.start - self._cache_lon_min) / res))
+        lon_i1 = min(self._cache_w, round((x_slice.stop  - self._cache_lon_min) / res))
+        lat_i0 = max(0, round((y_slice.start - self._cache_lat_min) / res))
+        lat_i1 = min(self._cache_h, round((y_slice.stop  - self._cache_lat_min) / res))
+
+        empty = _np.zeros((2, H_tgt, W_tgt), dtype=_np.float32)
+
+        composites = []
+        for step in range(self.num_steps - 1, -1, -1):   # oldest first → chronological
+            win_idx = current_win - step
+            if win_idx < 0 or win_idx >= self._cache_nwin:
+                composites.append(empty)
+                continue
+
+            patch = self._zarr_cache[win_idx, :, lat_i0:lat_i1, lon_i0:lon_i1]  # [2, dH, dW]
+            dH, dW = patch.shape[1], patch.shape[2]
+
+            if dH == 0 or dW == 0:
+                composites.append(empty)
+                continue
+
+            # Pad to H_tgt×W_tgt if the crop lands near the bbox edge
+            if dH < H_tgt or dW < W_tgt:
+                padded = _np.zeros((2, H_tgt, W_tgt), dtype=_np.float32)
+                padded[:, :dH, :dW] = patch
+                composites.append(padded)
+            else:
+                composites.append(patch[:, :H_tgt, :W_tgt].astype(_np.float32))
+
+        arr = _np.stack(composites, axis=0)   # [num_steps, 2, H, W]
+        return {"image": torch.from_numpy(arr)}
+
+
 class ERA5Daily:
     """
     ERA5 lazy loader with TorchGeo-style [query] interface.
@@ -1501,14 +1985,18 @@ class DengueDataset(torch.utils.data.Dataset):
             "era5": (43, 43),
             "static": (102, 102),
             "y": (86, 86),
-            "spatial_conditioning":(86, 86)
+            "spatial_conditioning": (86, 86),
+            "soil_moisture": None,   # None = native zarr resolution (~1 km)
         },
         y_valid_threshold = 0.3,
         loss_fn:Literal["mse", "poisson"] = "mse",
         num_zones=None,
         bbox=None,
         skip_era5_bounds=False,
-        cache_dir=None):
+        cache_dir=None,
+        soil_moisture=None,
+        land_cover=None,
+        population=None):
 
 
 
@@ -1517,6 +2005,9 @@ class DengueDataset(torch.utils.data.Dataset):
         self.static = static
         self.y = y
         self.spatial_conditioning = spatial_conditioning
+        self.soil_moisture = soil_moisture
+        self.land_cover = land_cover
+        self.population = population
         self.cache_dir = cache_dir
         self.skip_era5_bounds = skip_era5_bounds
         self.loss_fn = loss_fn
@@ -1532,6 +2023,7 @@ class DengueDataset(torch.utils.data.Dataset):
         self.patch_size_static = patch_sizes.get("static", (512, 512))
         self.patch_size_y = patch_sizes.get("y", (86, 86))
         self.patch_size_spatial_cond = patch_sizes.get("spatial_conditioning", (86, 86))
+        self.patch_size_sm = patch_sizes.get("soil_moisture", (512, 512))
 
         self.y_valid_threshold = y_valid_threshold
         
@@ -1867,6 +2359,14 @@ class DengueDataset(torch.utils.data.Dataset):
             timings["era5"] = time.perf_counter() - t0
             t0 = time.perf_counter()
             x_static  = self._pad_to_size(self.static[static_query]["image"].float(), *self.patch_size_static)
+            x_lc = None
+            if self.land_cover is not None:
+                query_lc = (x_slice, y_slice, t_week)
+                x_lc = self._pad_to_size(
+                    self.land_cover[query_lc]["image"].float(), *self.patch_size_static
+                )   # [1, H, W] float class IDs
+                # Keep as integer class IDs for embedding lookup; replace nodata (nan→0)
+                x_lc = torch.nan_to_num(x_lc, nan=0.0).long()  # [1, H, W]
             timings["static"] = time.perf_counter() - t0
             t0 = time.perf_counter()
             x_cond    = self._pad_to_size(self.spatial_conditioning[query_current]["image"].float(), *self.patch_size_spatial_cond)
@@ -1874,6 +2374,17 @@ class DengueDataset(torch.utils.data.Dataset):
             t0 = time.perf_counter()
             y_spatial = self._pad_to_size(self.y[query_current]["image"].float(), *self.patch_size_y)
             timings["y"] = time.perf_counter() - t0
+
+            # Optional soil moisture branch
+            x_sm = None
+            if self.soil_moisture is not None:
+                t0 = time.perf_counter()
+                query_sm = (x_slice, y_slice, t_week)
+                x_sm = self.soil_moisture[query_sm]["image"].float()
+                # patch_size_sm=None means use native zarr resolution as-is
+                if self.patch_size_sm is not None:
+                    x_sm = self._pad_to_size(x_sm, *self.patch_size_sm)
+                timings["sm"] = time.perf_counter() - t0
 
             total = sum(timings.values())
             if total > 5.0:
@@ -1906,9 +2417,32 @@ class DengueDataset(torch.utils.data.Dataset):
                     torch.full_like(zone_sums, float('nan'))
                 )  # [num_zones]
 
+                # Population exposure map for this patch/year — [H, W]
+                pop_map = None
+                if self.population is not None:
+                    H_y, W_y = self.patch_size_y
+                    pop_map = self.population[(x_slice, y_slice, t_week)]  # [H, W]
+                    if pop_map.shape != (H_y, W_y):
+                        pop_map = self._pad_to_size(pop_map.unsqueeze(0), H_y, W_y).squeeze(0)
+
             else:
                 y_val = y_spatial  # [1, H, W] — original pixel-level behaviour
+                pop_map = None     # not used outside poisson mode
 
+            if x_sm is not None and x_lc is not None:
+                if pop_map is not None:
+                    return x_high, x_med, x_static, x_cond, x_sm, x_lc, pop_map, y_val
+                return x_high, x_med, x_static, x_cond, x_sm, x_lc, y_val
+            if x_sm is not None:
+                if pop_map is not None:
+                    return x_high, x_med, x_static, x_cond, x_sm, pop_map, y_val
+                return x_high, x_med, x_static, x_cond, x_sm, y_val
+            if x_lc is not None:
+                if pop_map is not None:
+                    return x_high, x_med, x_static, x_cond, x_lc, pop_map, y_val
+                return x_high, x_med, x_static, x_cond, x_lc, y_val
+            if pop_map is not None:
+                return x_high, x_med, x_static, x_cond, pop_map, y_val
             return x_high, x_med, x_static, x_cond, y_val
 
         except Exception as e:

@@ -1,0 +1,5 @@
+# Machine-local data paths — copy this file to local_paths.py and fill in.
+# local_paths.py is git-ignored; this example file is tracked.
+
+SM_DATA_PATH = "/path/to/soil_moisture"   # WorldSAR SM_[A|D]_YYYYMMDD.tif root
+LC_DATA_PATH = "/path/to/land_cover"      # WorldSAR MCD12Q1 annual GeoTIFF root

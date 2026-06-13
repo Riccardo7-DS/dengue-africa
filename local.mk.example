@@ -1,0 +1,8 @@
+# Machine-local Makefile overrides — copy to local.mk and fill in.
+# local.mk is git-ignored; this example file is tracked.
+
+# Path to qsub/qdel (required for HPC targets)
+PBS_BIN = /opt/pbs/bin
+
+# Nextflow work directory (temporary staging files; can live on scratch)
+WORKDIR = -w /path/to/scratch/nextflow_work
