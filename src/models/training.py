@@ -408,19 +408,47 @@ def build_model(cfg, num_zones):
                 # x_cond is [B, 1, 1, H, W] or [B, 1, H, W] — flatten to [B, H, W]
                 zone_map = x_cond.view(x_cond.shape[0], x_cond.shape[-2], x_cond.shape[-1]).long()
                 loss = _criterion.zone_loss(pred, y_batch, zone_map, pop_map=pop_map)
-                # Bias metrics: integer-rounded predicted counts vs actual, no gradient
+                # Diagnostic metrics — no gradient, float32 for numerical stability
                 with torch.no_grad():
                     log_rates, zone_counts = _criterion.zone_aggregate(pred, zone_map, pop_map)
-                    zone_pred_rates = torch.exp(log_rates)
+                    lam   = torch.exp(log_rates).float()   # continuous expected counts
                     valid = (zone_counts > 0) & torch.isfinite(y_batch)
                     if valid.any():
-                        pred_int = zone_pred_rates[valid].round()
-                        actual   = y_batch[valid]
-                        mae  = (pred_int - actual).abs().mean().item()
-                        bias = (pred_int - actual).mean().item()
+                        lam_v = lam[valid]
+                        y_v   = y_batch[valid].float()
+
+                        # MAE / Bias (integer-rounded, for interpretability)
+                        residual = lam_v.round() - y_v
+                        mae  = residual.abs().mean().item()
+                        bias = residual.mean().item()
+
+                        # RMSE — continuous λ̂, quadratic penalty amplifies extremes
+                        rmse = ((lam_v - y_v) ** 2).mean().sqrt().item()
+
+                        # RMSLE — log-scale; equal weight to relative errors at all scales
+                        rmsle = ((torch.log1p(lam_v) - torch.log1p(y_v)) ** 2).mean().sqrt().item()
+
+                        # Poisson unit deviance: 2·[Y·log(Y/λ̂) − (Y−λ̂)]
+                        # Y=0 branch reduces to 2λ̂ (correct by L'Hôpital)
+                        # Disabled at runtime — enable by uncommenting below:
+                        # lam_s  = lam_v.clamp(min=1e-8)
+                        # zero_y = y_v == 0
+                        # deviance = torch.where(
+                        #     zero_y,
+                        #     2.0 * lam_s,
+                        #     2.0 * (y_v * (y_v.clamp(min=1e-8).log() - lam_s.log()) - y_v + lam_s)
+                        # ).mean().item()
+                        deviance = float("nan")
+
+                        # Mean absolute log-ratio: |log((λ̂+1)/(Y+1))| — symmetric relative error
+                        log_ratio = (torch.log1p(lam_v) - torch.log1p(y_v)).abs().mean().item()
                     else:
-                        mae = bias = float("nan")
-                return loss, {"recon": loss.item(), "kl": 0.0, "mae": mae, "bias": bias}
+                        mae = bias = rmse = rmsle = deviance = log_ratio = float("nan")
+                return loss, {
+                    "recon": loss.item(), "kl": 0.0,
+                    "mae": mae, "bias": bias, "rmse": rmse,
+                    "rmsle": rmsle, "deviance": deviance, "log_ratio": log_ratio,
+                }
         else:
             def compute_loss_fn(model, x_high, x_med, x_static, x_cond, y_batch, valid_mask, x_sm=None, x_lc=None, pop_map=None):
                 # Replace NaN in inputs (cloud/nodata pixels, out-of-region ERA5) with 0
@@ -447,13 +475,18 @@ def build_model(cfg, num_zones):
 # ------------------------------------------------------------------
 
 
+_POISSON_METRIC_KEYS = ("mae", "bias", "rmse", "rmsle", "deviance", "log_ratio")
+
+
 def train_one_epoch(model, compute_loss_fn, train_loader, optimizer, device,
                     data_min, data_max, scaler=None, cfg=None, logger=None, is_ddp=False):
     model.train()
     running_loss = 0.0
     running_recon = 0.0
     running_kl = 0.0
+    running_pm = dict.fromkeys(_POISSON_METRIC_KEYS, 0.0)
     n_batches = 0
+    n_pm = 0   # batches with valid Poisson metrics
     grad_accum_steps = max(1, int(cfg.get("grad_accum_steps", 1) if cfg else 1))
     is_poisson = (cfg.get("loss_fn", "mse") == "poisson") if cfg else False
 
@@ -537,6 +570,10 @@ def train_one_epoch(model, compute_loss_fn, train_loader, optimizer, device,
         running_loss += loss.item() * bs
         running_recon += metrics["recon"] * bs
         running_kl += metrics["kl"] * bs
+        if is_poisson and not math.isnan(metrics.get("mae", float("nan"))):
+            for k in _POISSON_METRIC_KEYS:
+                running_pm[k] += metrics[k] * bs
+            n_pm += bs
 
         del x_high, x_med, x_static, x_cond, x_sm, x_lc, pop_map, y_batch, loss, valid_mask
 
@@ -558,31 +595,39 @@ def train_one_epoch(model, compute_loss_fn, train_loader, optimizer, device,
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+    _nan = float("nan")
+    _pm_avg = (
+        {k: running_pm[k] / n_pm for k in _POISSON_METRIC_KEYS}
+        if n_pm > 0
+        else {k: _nan for k in _POISSON_METRIC_KEYS}
+    )
+
     if is_ddp:
         world_size = dist.get_world_size()
         count_tensor = torch.tensor(float(n_batches), device=device)
         dist.all_reduce(count_tensor)
         if count_tensor.item() == 0:
-            return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
-        loss_t = torch.tensor(running_loss / max(n_batches, 1), device=device)
-        recon_t = torch.tensor(running_recon / max(n_batches, 1), device=device)
-        kl_t = torch.tensor(running_kl / max(n_batches, 1), device=device)
-        dist.all_reduce(loss_t)
-        dist.all_reduce(recon_t)
-        dist.all_reduce(kl_t)
-        return {
-            "loss": loss_t.item() / world_size,
-            "recon": recon_t.item() / world_size,
-            "kl": kl_t.item() / world_size,
-        }
+            return {"loss": _nan, "recon": _nan, "kl": _nan, **{k: _nan for k in _POISSON_METRIC_KEYS}}
+        scalars = {"loss": running_loss, "recon": running_recon, "kl": running_kl}
+        if n_pm > 0:
+            scalars.update(running_pm)
+        tensors = {k: torch.tensor(v / max(n_batches, 1), device=device) for k, v in scalars.items()}
+        for t in tensors.values():
+            dist.all_reduce(t)
+        out = {k: t.item() / world_size for k, t in tensors.items()}
+        for k in _POISSON_METRIC_KEYS:
+            if k not in out:
+                out[k] = _nan
+        return out
 
     if n_batches == 0:
-        return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan")}
+        return {"loss": _nan, "recon": _nan, "kl": _nan, **{k: _nan for k in _POISSON_METRIC_KEYS}}
 
     return {
         "loss": running_loss / n_batches,
         "recon": running_recon / n_batches,
         "kl": running_kl / n_batches,
+        **_pm_avg,
     }
 
 
@@ -593,10 +638,9 @@ def evaluate_one_epoch(model, compute_loss_fn, loader, device, data_min, data_ma
     running_loss = 0.0
     running_recon = 0.0
     running_kl = 0.0
-    running_mae = 0.0
-    running_bias = 0.0
+    running_pm = dict.fromkeys(_POISSON_METRIC_KEYS, 0.0)
     n_batches = 0
-    n_mae_batches = 0
+    n_pm = 0
     is_poisson = (cfg.get("loss_fn", "mse") == "poisson") if cfg else False
 
     add_sm  = (cfg.get("add_sm",  False) if cfg else False)
@@ -656,10 +700,10 @@ def evaluate_one_epoch(model, compute_loss_fn, loader, device, data_min, data_ma
         running_loss += loss.item() * bs
         running_recon += metrics["recon"] * bs
         running_kl += metrics["kl"] * bs
-        if is_poisson and not (math.isnan(metrics.get("mae", float("nan")))):
-            running_mae  += metrics["mae"]  * bs
-            running_bias += metrics["bias"] * bs
-            n_mae_batches += bs
+        if is_poisson and not math.isnan(metrics.get("mae", float("nan"))):
+            for k in _POISSON_METRIC_KEYS:
+                running_pm[k] += metrics[k] * bs
+            n_pm += bs
 
         del x_high, x_med, x_static, x_cond, x_sm, x_lc, pop_map, y_batch, loss, valid_mask
 
@@ -669,36 +713,39 @@ def evaluate_one_epoch(model, compute_loss_fn, loader, device, data_min, data_ma
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
+    _nan = float("nan")
+    _pm_avg = (
+        {k: running_pm[k] / n_pm for k in _POISSON_METRIC_KEYS}
+        if n_pm > 0
+        else {k: _nan for k in _POISSON_METRIC_KEYS}
+    )
+
     if is_ddp:
         world_size = dist.get_world_size()
         count_tensor = torch.tensor(float(n_batches), device=device)
         dist.all_reduce(count_tensor)
         if count_tensor.item() == 0:
-            return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan"), "mae": float("nan"), "bias": float("nan")}
-        loss_t  = torch.tensor(running_loss  / max(n_batches, 1), device=device)
-        recon_t = torch.tensor(running_recon / max(n_batches, 1), device=device)
-        kl_t    = torch.tensor(running_kl    / max(n_batches, 1), device=device)
-        mae_t   = torch.tensor(running_mae   / max(n_mae_batches, 1), device=device)
-        bias_t  = torch.tensor(running_bias  / max(n_mae_batches, 1), device=device)
-        for t in (loss_t, recon_t, kl_t, mae_t, bias_t):
+            return {"loss": _nan, "recon": _nan, "kl": _nan, **{k: _nan for k in _POISSON_METRIC_KEYS}}
+        scalars = {"loss": running_loss, "recon": running_recon, "kl": running_kl}
+        if n_pm > 0:
+            scalars.update(running_pm)
+        tensors = {k: torch.tensor(v / max(n_batches, 1), device=device) for k, v in scalars.items()}
+        for t in tensors.values():
             dist.all_reduce(t)
-        return {
-            "loss":  loss_t.item()  / world_size,
-            "recon": recon_t.item() / world_size,
-            "kl":    kl_t.item()    / world_size,
-            "mae":   mae_t.item()   / world_size if n_mae_batches > 0 else float("nan"),
-            "bias":  bias_t.item()  / world_size if n_mae_batches > 0 else float("nan"),
-        }
+        out = {k: t.item() / world_size for k, t in tensors.items()}
+        for k in _POISSON_METRIC_KEYS:
+            if k not in out:
+                out[k] = _nan
+        return out
 
     if n_batches == 0:
-        return {"loss": float("nan"), "recon": float("nan"), "kl": float("nan"), "mae": float("nan"), "bias": float("nan")}
+        return {"loss": _nan, "recon": _nan, "kl": _nan, **{k: _nan for k in _POISSON_METRIC_KEYS}}
 
     return {
         "loss":  running_loss  / n_batches,
         "recon": running_recon / n_batches,
         "kl":    running_kl    / n_batches,
-        "mae":   running_mae   / n_mae_batches  if n_mae_batches > 0 else float("nan"),
-        "bias":  running_bias  / n_mae_batches  if n_mae_batches > 0 else float("nan"),
+        **_pm_avg,
     }
 
 
@@ -979,6 +1026,25 @@ def main(config: dict | None = None):
     # ------------------------------------------------------------------
     model, compute_loss_fn = build_model(cfg, num_zones)
 
+    # Initialise the decoder output bias to the global log-incidence rate when
+    # using population-weighted Poisson loss. Without this, the model starts with
+    # ŷ_i ≈ 0, which implies λ_z ≈ total_zone_population (orders of magnitude above
+    # observed cases), causing large gradient oscillations in early epochs.
+    # Setting bias = log(total_cases / total_population) means the model's initial
+    # prediction of log per-capita risk is already in the right ballpark; learning
+    # then focuses on spatial/temporal variation rather than recovering the global scale.
+    # The bias remains fully learnable after this initialisation.
+    if population is not None:
+        total_cases = float(ds_cases["dengue_total"].values.sum())
+        log_base_rate = math.log(max(total_cases, 1.0)) - math.log(max(population.total_population, 1.0))
+        with torch.no_grad():
+            model.decoder[-1].bias.data.fill_(log_base_rate)
+        if rank == 0:
+            logger.info(
+                f"Decoder bias initialised to log-base-rate: {log_base_rate:.4f} "
+                f"(total_cases={total_cases:.0f}, total_pop={population.total_population:.0f})"
+            )
+
     if is_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
         model = DDP(model.to(device), device_ids=[local_rank])
@@ -1092,20 +1158,34 @@ def main(config: dict | None = None):
         scheduler.step(val_metrics["loss"])
 
         if rank == 0:
-            val_mae  = val_metrics.get("mae",  float("nan"))
-            val_bias = val_metrics.get("bias", float("nan"))
-            bias_str = (
-                f" | Val MAE: {val_mae:.2f}, Bias: {val_bias:+.2f}"
-                if not (math.isnan(val_mae) or math.isnan(val_bias)) else ""
-            )
             logger.info(
                 f"Epoch {epoch:03d} | "
                 f"Train Loss: {train_metrics['loss']:.6f} "
                 f"(Recon: {train_metrics['recon']:.6f}, KL: {train_metrics['kl']:.6f}) | "
                 f"Val Loss: {val_metrics['loss']:.6f} "
                 f"(Recon: {val_metrics['recon']:.6f}, KL: {val_metrics['kl']:.6f})"
-                f"{bias_str}"
             )
+            if cfg.get("loss_fn", "mse") == "poisson":
+                _fmt = [
+                    ("mae",       ".2f",  "MAE"),
+                    ("bias",      "+.2f", "Bias"),
+                    ("rmse",      ".2f",  "RMSE"),
+                    ("rmsle",     ".4f",  "RMSLE"),
+                    ("deviance",  ".4f",  "Deviance"),
+                    ("log_ratio", ".4f",  "LogRatio"),
+                ]
+                tr_parts, val_parts = [], []
+                for k, fmt, lbl in _fmt:
+                    tv = train_metrics.get(k, float("nan"))
+                    vv = val_metrics.get(k,   float("nan"))
+                    if not math.isnan(tv):
+                        tr_parts.append(f"{lbl}={tv:{fmt}}")
+                    if not math.isnan(vv):
+                        val_parts.append(f"{lbl}={vv:{fmt}}")
+                if tr_parts:
+                    logger.info(f"  Train: {', '.join(tr_parts)}")
+                if val_parts:
+                    logger.info(f"  Val:   {', '.join(val_parts)}")
 
             train_losses.append(train_metrics["loss"])
             val_losses.append(val_metrics["loss"])

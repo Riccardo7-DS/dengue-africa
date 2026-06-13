@@ -1425,6 +1425,8 @@ class GPWv4Population:
         self._log_mean_pop = float(np.log(inhabited + 1e-6).mean()) if inhabited.size > 0 else 0.0
         logger.info(f"GPWv4Population: global log-mean-pop = {self._log_mean_pop:.4f} "
                     f"(≈ mean population {np.exp(self._log_mean_pop):.1f} per pixel)")
+        self.total_population = float(ref_arr.sum())
+        logger.info(f"GPWv4Population: total population in domain = {self.total_population:.0f}")
 
     def _assign_epoch(self, year: int) -> int:
         for threshold, epoch in self._EPOCH_BREAKS:
