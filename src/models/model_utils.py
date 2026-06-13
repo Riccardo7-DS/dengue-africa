@@ -1469,14 +1469,14 @@ class GPWv4Population:
         zx = W_tgt / sub.shape[1]
         resampled = _zoom(sub, (zy, zx), order=1, prefilter=False)
         resampled = np.clip(resampled, 0.0, None).astype(np.float32)
-        # Normalise to mean=1.0 so values are relative weights, not raw counts.
-        # Keeps Poisson loss magnitude comparable to the no-population baseline
-        # while still up-weighting dense pixels and zeroing uninhabited ones.
-        mean_pop = resampled.mean()
-        if mean_pop > 0:
-            resampled = resampled / mean_pop
+        # log1p compresses the power-law tail (city pixels can be 1000× rural),
+        # then normalise to mean=1.0 so gradient scale matches the no-pop baseline.
+        resampled = np.log1p(resampled)
+        mean_log = resampled.mean()
+        if mean_log > 0:
+            resampled = resampled / mean_log
 
-        return torch.from_numpy(resampled.copy())   # [H, W], mean≈1.0
+        return torch.from_numpy(resampled.copy())   # [H, W], log1p-normalised
 
 
 class SoilMoistureData:
