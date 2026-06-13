@@ -1036,7 +1036,14 @@ def main(config: dict | None = None):
     # The bias remains fully learnable after this initialisation.
     if population is not None:
         total_cases = float(np.nansum(ds_cases["dengue_total"].values))
-        log_base_rate = math.log(max(total_cases, 1.0)) - math.log(max(population.total_population, 1.0))
+        n_times = int(ds_cases.dims.get("time", 1))
+        # Divide by n_times: total_cases is summed over all time steps, but
+        # total_population is a snapshot — rate must be per person per time step.
+        log_base_rate = (
+            math.log(max(total_cases, 1.0))
+            - math.log(max(population.total_population, 1.0))
+            - math.log(max(n_times, 1))
+        )
         with torch.no_grad():
             model.decoder[-1].bias.data.fill_(log_base_rate)
         if rank == 0:
