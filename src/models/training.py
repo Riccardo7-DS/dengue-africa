@@ -1028,9 +1028,10 @@ def main(config: dict | None = None):
             raise FileNotFoundError(f"Checkpoint metadata not found: {metadata_path}")
         metadata = torch.load(metadata_path, map_location="cpu", weights_only=True)
         raw_model = model.module if hasattr(model, "module") else model
-        raw_model.load_state_dict(
-            torch.load(metadata["components"]["model_state"], map_location="cpu", weights_only=True)
-        )
+        _sd = torch.load(metadata["components"]["model_state"], map_location="cpu", weights_only=True)
+        if all(k.startswith("module.") for k in _sd):
+            _sd = {k[len("module."):]: v for k, v in _sd.items()}
+        raw_model.load_state_dict(_sd)
         optimizer.load_state_dict(
             torch.load(metadata["components"]["optimizer_state"], map_location=device, weights_only=True)
         )
@@ -1117,9 +1118,10 @@ def main(config: dict | None = None):
                     plot_dir, epoch, cfg, logger,
                 )
 
+            _raw_m = model.module if hasattr(model, "module") else model
             model_dict = {
                 "epoch": epoch,
-                "model_state": model.state_dict(),
+                "model_state": _raw_m.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
             }
             early_stopper(val_metrics["loss"], model_dict, epoch, str(checkpoint_dir))
