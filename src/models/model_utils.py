@@ -919,14 +919,17 @@ class MaskedAdmin2Loss():
         Aggregate pixel log-rates to zone-level log-expected-cases.
 
         Without population (pop_map=None):
-            log λ_z = logsumexp(ŷ_i for i∈z)  [uniform P=1]
+            log λ_z = logsumexp(ŷ_i for i∈z)           [uniform P=1]
 
-        With population weighting (pop_map provided):
-            λ_z = Σ_{i∈z} P_i · exp(ŷ_i)
-            log λ_z = m + log(Σ P_i · exp(ŷ_i − m))  where m = max(ŷ)
+        With population weighting (pop_map = log(P_i)):
+            log λ_z = logsumexp(log(P_i) + ŷ_i for i∈z)
+                    ≡ log(Σ P_i · exp(ŷ_i))            [epidemiologically correct]
 
-        The max-shift trick prevents exp overflow. zone_max is computed
-        under no_grad to avoid inplace/backward conflicts.
+        pop_map must contain log-population (from GPWv4Population.__getitem__),
+        NOT raw counts. All arithmetic stays in log-space so there is no
+        P_i · exp(ŷ_i) product that can overflow.
+
+        zone_max is computed under no_grad to avoid inplace/backward conflicts.
         """
         B = pred.shape[0]
         pred = pred.squeeze(1).float()          # [B, H, W]
@@ -942,7 +945,7 @@ class MaskedAdmin2Loss():
         # Valid mask: exclude -1 (out-of-zone) and out-of-bounds
         valid = (zone_map >= 0) & (zone_map < self.num_zones)  # [B, H, W]
 
-        # Pass 1: per-zone max of log-rates for numerical stability.
+        # Pass 1: per-zone max of (log_pop + ŷ_i) for logsumexp stability.
         # Computed under no_grad — zone_max is a constant stabilizer, not a
         # learnable quantity. scatter_reduce_ inplace on a grad-tracked tensor
         # causes a ScatterReduceBackward version conflict in pass 2.
@@ -952,21 +955,21 @@ class MaskedAdmin2Loss():
             for b in range(B):
                 zm = zone_map[b][valid[b]].view(-1)
                 pv = pred[b][valid[b]].view(-1)
-                zone_max[b].scatter_reduce_(0, zm, pv, reduce='amax', include_self=True)
+                pv_eff = pv + pop_map[b][valid[b]].view(-1) if pop_map is not None else pv
+                zone_max[b].scatter_reduce_(0, zm, pv_eff, reduce='amax', include_self=True)
                 zone_counts[b].scatter_add_(0, zm, torch.ones_like(pv))
 
-        # Pass 2: Σ [P_i ·] exp(ŷ_i − m).  When pop_map is None, P_i = 1.
-        # zone_max is detached; gradients flow through pred → shifted_exp only.
+        # Pass 2: Σ exp(log(P_i) + ŷ_i − m).  When pop_map is None, log(P_i)=0.
+        # zone_max is detached; gradients flow through pred only.
         zone_exp_sum = torch.zeros(B, self.num_zones, device=pred.device, dtype=torch.float32)
         for b in range(B):
             zm = zone_map[b][valid[b]].view(-1)
             pv = pred[b][valid[b]].view(-1)
-            shifted = torch.exp(pv - zone_max[b][zm])
-            if pop_map is not None:
-                shifted = pop_map[b][valid[b]].view(-1) * shifted
+            pv_eff = pv + pop_map[b][valid[b]].view(-1) if pop_map is not None else pv
+            shifted = torch.exp(pv_eff - zone_max[b][zm])
             zone_exp_sum[b].scatter_add_(0, zm, shifted)
 
-        # log λ_z = max + log(Σ [P_i ·] exp(ŷ_i − max))
+        # log λ_z = max + log(Σ exp(log(P_i) + ŷ_i − max))
         # Zones with no pixels retain -inf from zone_max → masked out in zone_loss
         log_zone_rates = zone_max + torch.log(zone_exp_sum + 1e-8)
         return log_zone_rates, zone_counts
@@ -1469,14 +1472,12 @@ class GPWv4Population:
         zx = W_tgt / sub.shape[1]
         resampled = _zoom(sub, (zy, zx), order=1, prefilter=False)
         resampled = np.clip(resampled, 0.0, None).astype(np.float32)
-        # log1p compresses the power-law tail (city pixels can be 1000× rural),
-        # then normalise to mean=1.0 so gradient scale matches the no-pop baseline.
-        resampled = np.log1p(resampled)
-        mean_log = resampled.mean()
-        if mean_log > 0:
-            resampled = resampled / mean_log
-
-        return torch.from_numpy(resampled.copy())   # [H, W], log1p-normalised
+        # Return log-population so zone_aggregate can compute
+        # logsumexp(log(P_i) + ŷ_i) ≡ log(Σ P_i · exp(ŷ_i)) without overflow.
+        # epsilon avoids log(0) for uninhabited pixels (they get log(1e-6) ≈ −14,
+        # contributing near-zero weight in the aggregation).
+        log_pop = np.log(resampled + 1e-6).astype(np.float32)
+        return torch.from_numpy(log_pop.copy())   # [H, W], log-population
 
 
 class SoilMoistureData:
