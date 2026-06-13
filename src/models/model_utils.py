@@ -1468,11 +1468,15 @@ class GPWv4Population:
         zy = H_tgt / sub.shape[0]
         zx = W_tgt / sub.shape[1]
         resampled = _zoom(sub, (zy, zx), order=1, prefilter=False)
-        # Convert bilinear mean → area-weighted sum to preserve total population
-        scale = (sub.shape[0] * sub.shape[1]) / (H_tgt * W_tgt)
-        resampled = np.clip(resampled * scale, 0.0, None).astype(np.float32)
+        resampled = np.clip(resampled, 0.0, None).astype(np.float32)
+        # Normalise to mean=1.0 so values are relative weights, not raw counts.
+        # Keeps Poisson loss magnitude comparable to the no-population baseline
+        # while still up-weighting dense pixels and zeroing uninhabited ones.
+        mean_pop = resampled.mean()
+        if mean_pop > 0:
+            resampled = resampled / mean_pop
 
-        return torch.from_numpy(resampled.copy())   # [H, W]
+        return torch.from_numpy(resampled.copy())   # [H, W], mean≈1.0
 
 
 class SoilMoistureData:
