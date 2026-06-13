@@ -1416,6 +1416,16 @@ class GPWv4Population:
 
         self._available_epochs = sorted(self._cache.keys())
 
+        # Global mean of log-population across the most recent epoch, over all
+        # pixels with P > 0. Used to centre log(P_i) in __getitem__ so the typical
+        # pixel has log-pop ≈ 0. Equivalent to dividing raw population by its
+        # global mean before taking the log, as recommended for numerical stability.
+        ref_arr = self._cache[self._available_epochs[-1]]["arr"]
+        inhabited = ref_arr[ref_arr > 0]
+        self._log_mean_pop = float(np.log(inhabited + 1e-6).mean()) if inhabited.size > 0 else 0.0
+        logger.info(f"GPWv4Population: global log-mean-pop = {self._log_mean_pop:.4f} "
+                    f"(≈ mean population {np.exp(self._log_mean_pop):.1f} per pixel)")
+
     def _assign_epoch(self, year: int) -> int:
         for threshold, epoch in self._EPOCH_BREAKS:
             if year < threshold:
@@ -1472,12 +1482,16 @@ class GPWv4Population:
         zx = W_tgt / sub.shape[1]
         resampled = _zoom(sub, (zy, zx), order=1, prefilter=False)
         resampled = np.clip(resampled, 0.0, None).astype(np.float32)
-        # Return log-population so zone_aggregate can compute
-        # logsumexp(log(P_i) + ŷ_i) ≡ log(Σ P_i · exp(ŷ_i)) without overflow.
-        # epsilon avoids log(0) for uninhabited pixels (they get log(1e-6) ≈ −14,
-        # contributing near-zero weight in the aggregation).
-        log_pop = np.log(resampled + 1e-6).astype(np.float32)
-        return torch.from_numpy(log_pop.copy())   # [H, W], log-population
+        # Return centred log-population: log(P_i) − log(mean_P_global).
+        # Equivalent to log(P_i / mean_P_global) — population remains linear
+        # exposure in the epidemiological sense; dividing by a global constant
+        # does not change the proportional weighting between pixels.
+        # Centring makes the typical pixel have log-pop ≈ 0, so the model
+        # does not need to learn a large negative bias to compensate for the
+        # raw-count scale.  Uninhabited pixels get log(1e-6) − mean ≈ −20,
+        # contributing near-zero weight in the logsumexp aggregation.
+        log_pop = np.log(resampled + 1e-6).astype(np.float32) - self._log_mean_pop
+        return torch.from_numpy(log_pop.copy())   # [H, W], centred log-population
 
 
 class SoilMoistureData:
