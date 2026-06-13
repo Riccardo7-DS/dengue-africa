@@ -117,15 +117,17 @@ def _compute_window(args):
 # ────────────────────────── main ──────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--sm_root',   required=True,
+    parser.add_argument('--sm_root',    required=True,
                         help='Root directory of SM_[A|D]_YYYYMMDD.tif files')
-    parser.add_argument('--cache_dir', required=True,
-                        help='Output directory; zarr written as sm_6day_1km.zarr inside it')
-    parser.add_argument('--workers',   type=int, default=24)
+    parser.add_argument('--cache_dir',  required=True,
+                        help='Output directory; zarr written as <cache_name> inside it')
+    parser.add_argument('--cache_name', default='sm_6day_1km_v2.zarr',
+                        help='Output zarr filename (default: sm_6day_1km_v2.zarr)')
+    parser.add_argument('--workers',    type=int, default=24)
     args = parser.parse_args()
 
     sm_root    = Path(args.sm_root)
-    cache_path = Path(args.cache_dir) / 'sm_6day_1km.zarr'
+    cache_path = Path(args.cache_dir) / args.cache_name
 
     print(f"SM root  : {sm_root}", flush=True)
     print(f"Cache    : {cache_path}", flush=True)
@@ -146,7 +148,7 @@ def main():
     store = zarr.open(
         str(cache_path), mode='w',
         shape=(n_windows, 2, H_GLOBAL, W_GLOBAL),
-        chunks=(1, 2, 50, 50),   # one window × both channels × 50×50 spatial tile
+        chunks=(5, 2, 100, 100),  # 5 windows × both channels × 100×100 spatial tile
         dtype='float32',
         fill_value=0.0,
         zarr_format=2,

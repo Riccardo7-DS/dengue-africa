@@ -1516,10 +1516,17 @@ class SoilMoistureData:
         self.target_size = target_size  # None → native zarr resolution, else (H, W)
 
         # ── Fast path: open zarr lazily (no RAM preload) ──────────────
+        # Prefer v2 zarr (chunks=(5,2,100,100), ~10x fewer I/Os per sample).
+        # Fall back to v1 if v2 not yet built.
         self._zarr_cache = None
         if cache_dir is not None:
-            sm_zarr = Path(cache_dir) / 'sm_6day_1km.zarr'
-            if sm_zarr.exists():
+            _cache_dir = Path(cache_dir)
+            sm_zarr = next(
+                (p for p in [_cache_dir / 'sm_6day_1km_v2.zarr',
+                              _cache_dir / 'sm_6day_1km.zarr'] if p.exists()),
+                None,
+            )
+            if sm_zarr is not None:
                 import zarr as _zarr
                 logger.info(f"SoilMoistureData: opening zarr cache at {sm_zarr}")
                 _store = _zarr.open(str(sm_zarr), mode='r')
