@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 from tqdm import tqdm
 import xarray as xr
 
@@ -40,6 +40,7 @@ from models.model_utils import (
     LandCoverData,
     GPWv4Population,
     _compute_zone_populations,
+    temporal_split,
 )
 from models.transformer import DenguePredictor
 from modis_majortom.utils import latin_box, init_logging
@@ -967,9 +968,27 @@ def main(config: dict | None = None):
     if rank == 0:
         logger.info(f"Full dataset size: {len(full_dataset)}")
 
-    train_size = int(cfg["train_split"] * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    train_end = cfg.get("train_end")
+    val_end   = cfg.get("val_end")
+
+    if train_end and val_end:
+        train_dataset, val_dataset, test_dataset = temporal_split(
+            full_dataset,
+            pd.Timestamp(train_end),
+            pd.Timestamp(val_end),
+        )
+        if rank == 0:
+            logger.info(
+                f"Temporal split: train≤{train_end} ({len(train_dataset)} samples), "
+                f"val {train_end}–{val_end} ({len(val_dataset)} samples), "
+                f"test>{val_end} ({len(test_dataset)} samples)"
+            )
+    else:
+        train_size = int(cfg["train_split"] * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+        if rank == 0:
+            logger.info(f"Random split: train={train_size}, val={val_size}")
 
     def _worker_init_fn(worker_id):
         torch.set_num_threads(1)
@@ -1326,6 +1345,15 @@ def parse_args():
                         help="Override training start date (YYYY-MM-DD). Default: 2012-01-01.")
     parser.add_argument("--end_date", type=str, default=None,
                         help="Override training end date (YYYY-MM-DD). Default: 2023-12-31.")
+
+    # --- temporal split (comparable cross-run evaluation) ---
+    parser.add_argument("--train_end", type=str, default=None,
+                        help="Last date (inclusive) for training set (YYYY-MM-DD). "
+                             "When set together with --val_end, uses temporal_split "
+                             "instead of random_split.")
+    parser.add_argument("--val_end", type=str, default=None,
+                        help="Last date (inclusive) for validation set (YYYY-MM-DD). "
+                             "Samples after this date form the held-out test set.")
 
     # --- resume ---
     parser.add_argument("--checkpoint", type=int, default=0,

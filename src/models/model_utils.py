@@ -2381,7 +2381,14 @@ class DengueDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.valid_indices)
-    
+
+    def get_target_times(self) -> np.ndarray:
+        """Return array of pd.Timestamp, one per valid index (target week)."""
+        return np.array([
+            pd.Timestamp(self.time_pairs[time_idx][0])
+            for _, time_idx in self.valid_indices
+        ])
+
     def is_mostly_nan(self, tensor, threshold=0.9):
         nan_ratio = torch.isnan(tensor).float().mean()
         return nan_ratio > threshold
