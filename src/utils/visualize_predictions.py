@@ -93,6 +93,7 @@ def plot_sample(
     num_zones: int,
     output_dir: Path,
     timestamp: str,
+    burden_map: torch.Tensor = None,
 ):
     zone_map = x_cond.squeeze().long()
     H, W = zone_map.shape
@@ -122,7 +123,8 @@ def plot_sample(
     zone_actual_img = zone_map_to_image(zone_actual_rounded, zone_map, num_zones)
     zone_diff_img   = zone_map_to_image(zone_diff,           zone_map, num_zones)
 
-    fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+    n_panels = 6 if burden_map is not None else 5
+    fig, axes = plt.subplots(1, n_panels, figsize=(n_panels * 5, 5))
     fig.suptitle(f"Sample {sample_idx}  |  {timestamp}", fontsize=12)
 
     ax = axes[0]
@@ -159,6 +161,16 @@ def plot_sample(
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.axis("off")
 
+    if burden_map is not None:
+        burden_np = burden_map.numpy()
+        ax = axes[5]
+        finite_b = burden_np[np.isfinite(burden_np)]
+        vmax_b = np.nanpercentile(finite_b, 99) if finite_b.size > 0 else 1.0
+        im = ax.imshow(burden_np, cmap="YlOrRd", origin="upper", vmin=0, vmax=vmax_b)
+        ax.set_title("Pixel burden\n(cases / admin-grid cell)")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.axis("off")
+
     plt.tight_layout()
     out_path = output_dir / f"pred_vs_actual_{sample_idx:03d}.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -188,6 +200,8 @@ def main():
                         help="Enable soil moisture branch (restricts data to 2016-2022)")
     parser.add_argument("--sm_data_path", type=str, default=SM_DATA_PATH,
                         help="Root directory of SM_[A|D]_YYYYMMDD.tif files (required with --add_sm)")
+    parser.add_argument("--gpw_path", type=str, default=None,
+                        help="Path to GPWv4 data directory. If given, adds a per-capita risk panel.")
     args = parser.parse_args()
 
     if args.add_sm and not args.sm_data_path:
@@ -254,6 +268,12 @@ def main():
     dataset = val_ds if args.split == "val" else train_ds
     print(f"Using {args.split} split: {len(dataset)} samples")
 
+    gpw_population  = None   # GPWv4Population object, or None
+    gpw_pixel_arr   = None   # [H_model, W_model] population per model pixel (lazy init)
+    if args.gpw_path:
+        from models.model_utils import GPWv4Population, _resample_gpw_to_pixel_grid
+        gpw_population = GPWv4Population(args.gpw_path)
+
     cfg = vars(args)
     print(f"Loading checkpoint: {args.checkpoint}")
     model = load_model(args.checkpoint, cfg, num_zones, device)
@@ -272,25 +292,27 @@ def main():
             continue
 
         if args.add_sm:
-            x_high, x_med, x_static, x_cond, x_sm, y_val = item
+            x_high, x_med, x_static, x_suit, x_cond, x_sm, y_val = item
         else:
-            x_high, x_med, x_static, x_cond, y_val = item
+            x_high, x_med, x_static, x_suit, x_cond, y_val = item
             x_sm = None
 
         x_high_b   = x_high.unsqueeze(0).to(device)
         x_med_b    = x_med.unsqueeze(0).to(device)
         x_static_b = x_static.unsqueeze(0).to(device)
+        x_suit_b   = x_suit.unsqueeze(0).to(device)
         x_cond_b   = x_cond.unsqueeze(0).to(device)
         x_sm_b     = x_sm.unsqueeze(0).to(device) if x_sm is not None else None
 
         x_high_b   = torch.nan_to_num(x_high_b,   nan=0.0)
         x_med_b    = torch.nan_to_num(x_med_b,    nan=0.0)
         x_static_b = torch.nan_to_num(x_static_b, nan=0.0)
+        x_suit_b   = torch.nan_to_num(x_suit_b,   nan=0.0)
         if x_sm_b is not None:
             x_sm_b = torch.nan_to_num(x_sm_b, nan=0.0)
 
         with torch.no_grad():
-            pred = model(x_high_b, x_med_b, x_static_b, x_cond_b, x_sm_b)
+            pred = model(x_high_b, x_med_b, x_static_b, x_suit_b, x_cond_b, x_sm_b)
 
         pred_cpu = pred[0].cpu()
         zone_map = x_cond.squeeze().long()
@@ -321,27 +343,62 @@ def main():
             zone_actual = torch.where(zone_cnt > 0, zone_actual / zone_cnt,
                                       torch.full_like(zone_actual, float('nan')))
 
+        # Lazily build the GPW pixel grid once we know the model output resolution
+        if gpw_population is not None and gpw_pixel_arr is None:
+            H_m, W_m = log_rates.shape
+            gpw_pixel_arr = _resample_gpw_to_pixel_grid(x_spatial, gpw_population, H_m, W_m)
+            print(f"GPW pixel grid: shape={gpw_pixel_arr.shape}, "
+                  f"total_pop={gpw_pixel_arr.sum():.3e}, max_cell={gpw_pixel_arr.max():.0f}")
+
+        burden_map = None
+        if gpw_pixel_arr is not None:
+            P    = torch.from_numpy(gpw_pixel_arr)        # [H, W] population per pixel
+            suit = torch.exp(log_rates)                   # [H, W] exp(ŷ_i), pixel suitability
+            Ps   = P * suit                               # [H, W] population-weighted suitability
+
+            # D_z = Σ_{j∈z} P_j · exp(ŷ_j)  (independent of Ŷ_z)
+            D_z = torch.zeros(num_zones)
+            D_z.scatter_add_(0, zm_flat, Ps[valid_mask].view(-1))
+
+            # Broadcast Ŷ_z and D_z from zone → pixel
+            zone_clamped = zone_map.clamp(min=0, max=num_zones - 1)
+            Yhat_z_px = zone_pred_rates[zone_clamped]     # [H, W]
+            D_z_px    = D_z[zone_clamped]                 # [H, W]
+
+            # b_i = Ŷ_z · P_i · exp(ŷ_i) / D_z  (sums to Ŷ_z within each zone)
+            b = Yhat_z_px * Ps / D_z_px.clamp(min=1e-8)
+            burden_map = b.masked_fill(~valid_mask, float("nan"))
+
         zone_counts = torch.zeros(num_zones)
         zone_counts.scatter_add_(0, zm_flat, torch.ones_like(pv_flat))
         present = (zone_counts > 0) & torch.isfinite(zone_actual)
         if present.any():
-            pred_int    = zone_pred_rates[present].round()
+            lam_v       = zone_pred_rates[present]
             actual      = zone_actual[present]
+            pred_int    = lam_v.round()
             sample_mae  = (pred_int - actual).abs().mean().item()
             sample_bias = (pred_int - actual).mean().item()
             sample_loss = criterion(zone_log_rates[present], actual).item()
+            sample_rmse = ((lam_v - actual) ** 2).mean().sqrt().item()
+            sample_rmsle = ((torch.log1p(lam_v) - torch.log1p(actual)) ** 2).mean().sqrt().item()
+            sample_log_ratio = (torch.log1p(lam_v) - torch.log1p(actual)).abs().mean().item()
         else:
             sample_mae = sample_bias = sample_loss = float("nan")
+            sample_rmse = sample_rmsle = sample_log_ratio = float("nan")
 
         sample_records.append({
             "sample":      done,
             "poisson_nll": sample_loss,
             "mae":         sample_mae,
             "bias":        sample_bias,
+            "rmse":        sample_rmse,
+            "rmsle":       sample_rmsle,
+            "log_ratio":   sample_log_ratio,
             "n_zones":     int(present.sum().item()),
         })
         print(f"  sample {done:03d} | loss={sample_loss:.4f} | mae={sample_mae:.2f} | "
-              f"bias={sample_bias:+.2f} | zones={present.sum().item()}")
+              f"bias={sample_bias:+.2f} | rmse={sample_rmse:.2f} | "
+              f"rmsle={sample_rmsle:.4f} | log_ratio={sample_log_ratio:.4f} | zones={present.sum().item()}")
 
         from datetime import datetime
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -355,34 +412,43 @@ def main():
             num_zones=num_zones,
             output_dir=output_dir,
             timestamp=ts,
+            burden_map=burden_map,
         )
         done += 1
 
     if sample_records:
         import csv, math
         valid_recs = [r for r in sample_records if not math.isnan(r["poisson_nll"])]
+        n_valid = max(len(valid_recs), 1)
         avg = {
             "sample":      "AVERAGE",
-            "poisson_nll": sum(r["poisson_nll"] for r in valid_recs) / max(len(valid_recs), 1),
-            "mae":         sum(r["mae"]         for r in valid_recs) / max(len(valid_recs), 1),
-            "bias":        sum(r["bias"]        for r in valid_recs) / max(len(valid_recs), 1),
-            "n_zones":     sum(r["n_zones"]     for r in valid_recs) // max(len(valid_recs), 1),
+            "poisson_nll": sum(r["poisson_nll"] for r in valid_recs) / n_valid,
+            "mae":         sum(r["mae"]         for r in valid_recs) / n_valid,
+            "bias":        sum(r["bias"]        for r in valid_recs) / n_valid,
+            "rmse":        sum(r["rmse"]        for r in valid_recs) / n_valid,
+            "rmsle":       sum(r["rmsle"]       for r in valid_recs) / n_valid,
+            "log_ratio":   sum(r["log_ratio"]   for r in valid_recs) / n_valid,
+            "n_zones":     sum(r["n_zones"]     for r in valid_recs) // n_valid,
         }
         rows = sample_records + [avg]
+        fieldnames = ["sample", "poisson_nll", "mae", "bias", "rmse", "rmsle", "log_ratio", "n_zones"]
         csv_path = output_dir / "metrics_summary.csv"
         with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["sample", "poisson_nll", "mae", "bias", "n_zones"])
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for row in rows:
                 writer.writerow({k: (f"{v:.4f}" if isinstance(v, float) else v) for k, v in row.items()})
         print(f"\nMetrics summary saved to {csv_path}")
-        print(f"\n{'sample':>8} {'poisson_nll':>12} {'mae':>8} {'bias':>8} {'n_zones':>8}")
-        print("-" * 50)
+        print(f"\n{'sample':>8} {'poisson_nll':>12} {'mae':>8} {'bias':>8} {'rmse':>8} {'rmsle':>8} {'log_ratio':>10} {'n_zones':>8}")
+        print("-" * 80)
         for r in rows:
-            nll  = f"{r['poisson_nll']:.4f}" if isinstance(r['poisson_nll'], float) else r['poisson_nll']
-            mae  = f"{r['mae']:.2f}"          if isinstance(r['mae'],  float)        else r['mae']
-            bias = f"{r['bias']:+.2f}"        if isinstance(r['bias'], float)        else r['bias']
-            print(f"{str(r['sample']):>8} {nll:>12} {mae:>8} {bias:>8} {str(r['n_zones']):>8}")
+            nll       = f"{r['poisson_nll']:.4f}" if isinstance(r['poisson_nll'], float) else r['poisson_nll']
+            mae       = f"{r['mae']:.2f}"          if isinstance(r['mae'],         float) else r['mae']
+            bias      = f"{r['bias']:+.2f}"        if isinstance(r['bias'],        float) else r['bias']
+            rmse      = f"{r['rmse']:.2f}"         if isinstance(r['rmse'],        float) else r['rmse']
+            rmsle     = f"{r['rmsle']:.4f}"        if isinstance(r['rmsle'],       float) else r['rmsle']
+            log_ratio = f"{r['log_ratio']:.4f}"    if isinstance(r['log_ratio'],   float) else r['log_ratio']
+            print(f"{str(r['sample']):>8} {nll:>12} {mae:>8} {bias:>8} {rmse:>8} {rmsle:>8} {log_ratio:>10} {str(r['n_zones']):>8}")
 
     print(f"\nDone — {done} figures saved to {output_dir}")
 

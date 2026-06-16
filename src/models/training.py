@@ -39,6 +39,7 @@ from models.model_utils import (
     SoilMoistureData,
     LandCoverData,
     GPWv4Population,
+    _compute_zone_populations,
 )
 from models.transformer import DenguePredictor
 from modis_majortom.utils import latin_box, init_logging
@@ -136,26 +137,27 @@ def save_prediction_snapshot(model, snapshot_batch, device, num_zones, plot_dir,
     add_lc = cfg.get("add_lc", False)
 
     _items = [t.to(device) for t in snapshot_batch]
-    x_high, x_med, x_static, x_cond = _items[0], _items[1], _items[2], _items[3]
+    x_high, x_med, x_static, x_suit, x_cond = _items[0], _items[1], _items[2], _items[3], _items[4]
     y_batch = _items[-1]
     x_sm = x_lc = None
     if add_sm and add_lc:
-        x_sm, x_lc = _items[4], _items[5]
+        x_sm, x_lc = _items[5], _items[6]
     elif add_sm:
-        x_sm = _items[4]
+        x_sm = _items[5]
     elif add_lc:
-        x_lc = _items[4]
+        x_lc = _items[5]
 
     x_high   = torch.nan_to_num(x_high,   nan=0.0)
     x_med    = torch.nan_to_num(x_med,    nan=0.0)
     x_static = torch.nan_to_num(x_static, nan=0.0)
+    x_suit   = torch.nan_to_num(x_suit,   nan=0.0)
     if x_sm is not None:
         x_sm = torch.nan_to_num(x_sm, nan=0.0)
 
     m = model.module if hasattr(model, "module") else model
     m.eval()
     with torch.no_grad():
-        pred = m(x_high, x_med, x_static, x_cond, x_sm, x_lc)   # [B, 1, H, W]
+        pred = m(x_high, x_med, x_static, x_suit, x_cond, x_sm, x_lc)   # [B, 1, H, W]
 
     pred_cpu = pred[0, 0].cpu().float()              # [H, W]
     zone_map = x_cond[0].squeeze().long().cpu()      # [H, W]
@@ -349,7 +351,7 @@ def masked_mse_loss(pred, target, valid_mask):
 # ------------------------------------------------------------------
 
 
-def build_model(cfg, num_zones):
+def build_model(cfg, num_zones, log_zone_pop=None):
     """Return (model, compute_loss_fn) for the requested cfg["model"]."""
 
     if cfg["model"] == "vae":
@@ -396,18 +398,21 @@ def build_model(cfg, num_zones):
                 loss_fn=nn.PoissonNLLLoss(log_input=True, reduction='mean'),
                 num_zones=num_zones,
                 device=cfg.get("device", "cpu"),
+                log_zone_pop=log_zone_pop,
             )
 
-            def compute_loss_fn(model, x_high, x_med, x_static, x_cond, y_batch, valid_mask, x_sm=None, x_lc=None, pop_map=None):
+            def compute_loss_fn(model, x_high, x_med, x_static, x_suit, x_cond, y_batch, valid_mask, x_sm=None, x_lc=None, pop_map=None):
                 x_high   = torch.nan_to_num(x_high,   nan=0.0)
                 x_med    = torch.nan_to_num(x_med,    nan=0.0)
                 x_static = torch.nan_to_num(x_static, nan=0.0)
+                x_suit   = torch.nan_to_num(x_suit,   nan=0.0)
                 if x_sm is not None:
                     x_sm = torch.nan_to_num(x_sm, nan=0.0)
-                pred = model(x_high, x_med, x_static, x_cond, x_sm, x_lc)
+                pred = model(x_high, x_med, x_static, x_suit, x_cond, x_sm, x_lc)
                 # x_cond is [B, 1, 1, H, W] or [B, 1, H, W] — flatten to [B, H, W]
                 zone_map = x_cond.view(x_cond.shape[0], x_cond.shape[-2], x_cond.shape[-1]).long()
-                loss = _criterion.zone_loss(pred, y_batch, zone_map, pop_map=pop_map)
+                loss = _criterion.zone_loss(pred, y_batch, zone_map, pop_map=pop_map,
+                                            normalize_exposure=cfg.get("normalize_gpw_exposure", False))
                 # Diagnostic metrics — no gradient, float32 for numerical stability
                 with torch.no_grad():
                     log_rates, zone_counts = _criterion.zone_aggregate(pred, zone_map, pop_map)
@@ -450,15 +455,16 @@ def build_model(cfg, num_zones):
                     "rmsle": rmsle, "deviance": deviance, "log_ratio": log_ratio,
                 }
         else:
-            def compute_loss_fn(model, x_high, x_med, x_static, x_cond, y_batch, valid_mask, x_sm=None, x_lc=None, pop_map=None):
+            def compute_loss_fn(model, x_high, x_med, x_static, x_suit, x_cond, y_batch, valid_mask, x_sm=None, x_lc=None, pop_map=None):
                 # Replace NaN in inputs (cloud/nodata pixels, out-of-region ERA5) with 0
                 # before forward pass — NaN propagates through Swin attention and BatchNorm.
                 x_high   = torch.nan_to_num(x_high,   nan=0.0)
                 x_med    = torch.nan_to_num(x_med,    nan=0.0)
                 x_static = torch.nan_to_num(x_static, nan=0.0)
+                x_suit   = torch.nan_to_num(x_suit,   nan=0.0)
                 if x_sm is not None:
                     x_sm = torch.nan_to_num(x_sm, nan=0.0)
-                pred = model(x_high, x_med, x_static, x_cond, x_sm, x_lc)
+                pred = model(x_high, x_med, x_static, x_suit, x_cond, x_sm, x_lc)
                 if pred.shape != y_batch.shape:
                     raise ValueError(f"Shape mismatch: pred {pred.shape} vs y_batch {y_batch.shape}")
                 loss = masked_mse_loss(pred, y_batch, valid_mask)
@@ -499,7 +505,7 @@ def train_one_epoch(model, compute_loss_fn, train_loader, optimizer, device,
 
         # Synchronize skip decision across DDP ranks.
         skip = (batch is None)
-        x_high = x_med = x_static = x_cond = x_sm = x_lc = pop_map = y_batch = valid_mask = None
+        x_high = x_med = x_static = x_suit = x_cond = x_sm = x_lc = pop_map = y_batch = valid_mask = None
         add_sm  = (cfg.get("add_sm",  False) if cfg else False)
         add_lc  = (cfg.get("add_lc",  False) if cfg else False)
         add_pop = (cfg.get("add_pop", False) if cfg else False)
@@ -510,13 +516,13 @@ def train_one_epoch(model, compute_loss_fn, train_loader, optimizer, device,
                 pop_map = items[-2]
                 items = items[:-2] + [items[-1]]
             if add_sm and add_lc:
-                x_high, x_med, x_static, x_cond, x_sm, x_lc, y_batch = items
+                x_high, x_med, x_static, x_suit, x_cond, x_sm, x_lc, y_batch = items
             elif add_sm:
-                x_high, x_med, x_static, x_cond, x_sm, y_batch = items
+                x_high, x_med, x_static, x_suit, x_cond, x_sm, y_batch = items
             elif add_lc:
-                x_high, x_med, x_static, x_cond, x_lc, y_batch = items
+                x_high, x_med, x_static, x_suit, x_cond, x_lc, y_batch = items
             else:
-                x_high, x_med, x_static, x_cond, y_batch = items
+                x_high, x_med, x_static, x_suit, x_cond, y_batch = items
             if is_poisson:
                 # y_batch is [B, num_zones] — zone-level counts from DengueDataset
                 valid_mask = None
@@ -542,7 +548,7 @@ def train_one_epoch(model, compute_loss_fn, train_loader, optimizer, device,
         amp_enabled = cfg.get("amp", True) if cfg else True
         with torch.amp.autocast(enabled=amp_enabled, device_type=amp_device):
             loss, metrics = compute_loss_fn(
-                model, x_high, x_med, x_static, x_cond, y_batch, valid_mask,
+                model, x_high, x_med, x_static, x_suit, x_cond, y_batch, valid_mask,
                 x_sm=x_sm, x_lc=x_lc, pop_map=pop_map,
             )
 
@@ -558,10 +564,16 @@ def train_one_epoch(model, compute_loss_fn, train_loader, optimizer, device,
                 scaled_loss.backward()
 
         if (batch_idx + 1) % grad_accum_steps == 0:
+            max_grad_norm = float(cfg.get("max_grad_norm", 0)) if cfg else 0
             if scaler:
+                scaler.unscale_(optimizer)
+                if max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                if max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -575,7 +587,7 @@ def train_one_epoch(model, compute_loss_fn, train_loader, optimizer, device,
                 running_pm[k] += metrics[k] * bs
             n_pm += bs
 
-        del x_high, x_med, x_static, x_cond, x_sm, x_lc, pop_map, y_batch, loss, valid_mask
+        del x_high, x_med, x_static, x_suit, x_cond, x_sm, x_lc, pop_map, y_batch, loss, valid_mask
 
         cleanup_every = int(cfg.get("memory_cleanup_interval", 0) if cfg else 0)
         if cleanup_every > 0 and (batch_idx + 1) % cleanup_every == 0:
@@ -588,10 +600,16 @@ def train_one_epoch(model, compute_loss_fn, train_loader, optimizer, device,
 
     # Handle trailing gradients from incomplete accumulation window.
     if n_batches > 0 and (n_batches % grad_accum_steps) != 0:
+        max_grad_norm = float(cfg.get("max_grad_norm", 0)) if cfg else 0
         if scaler:
+            scaler.unscale_(optimizer)
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -648,20 +666,20 @@ def evaluate_one_epoch(model, compute_loss_fn, loader, device, data_min, data_ma
     add_pop = (cfg.get("add_pop", False) if cfg else False)
     for batch_idx, batch in enumerate(loader):
         skip = (batch is None)
-        x_high = x_med = x_static = x_cond = x_sm = x_lc = pop_map = y_batch = valid_mask = None
+        x_high = x_med = x_static = x_suit = x_cond = x_sm = x_lc = pop_map = y_batch = valid_mask = None
         if not skip:
             items = [b.to(device, non_blocking=True) for b in batch]
             if add_pop:
                 pop_map = items[-2]
                 items = items[:-2] + [items[-1]]
             if add_sm and add_lc:
-                x_high, x_med, x_static, x_cond, x_sm, x_lc, y_batch = items
+                x_high, x_med, x_static, x_suit, x_cond, x_sm, x_lc, y_batch = items
             elif add_sm:
-                x_high, x_med, x_static, x_cond, x_sm, y_batch = items
+                x_high, x_med, x_static, x_suit, x_cond, x_sm, y_batch = items
             elif add_lc:
-                x_high, x_med, x_static, x_cond, x_lc, y_batch = items
+                x_high, x_med, x_static, x_suit, x_cond, x_lc, y_batch = items
             else:
-                x_high, x_med, x_static, x_cond, y_batch = items
+                x_high, x_med, x_static, x_suit, x_cond, y_batch = items
             if is_poisson:
                 valid_mask = None
                 if not torch.isfinite(y_batch).any():
@@ -686,7 +704,7 @@ def evaluate_one_epoch(model, compute_loss_fn, loader, device, data_min, data_ma
         amp_enabled = cfg.get("amp", True) if cfg else True
         with torch.amp.autocast(enabled=amp_enabled, device_type=amp_device):
             loss, metrics = compute_loss_fn(
-                model, x_high, x_med, x_static, x_cond, y_batch, valid_mask,
+                model, x_high, x_med, x_static, x_suit, x_cond, y_batch, valid_mask,
                 x_sm=x_sm, x_lc=x_lc, pop_map=pop_map,
             )
 
@@ -705,7 +723,7 @@ def evaluate_one_epoch(model, compute_loss_fn, loader, device, data_min, data_ma
                 running_pm[k] += metrics[k] * bs
             n_pm += bs
 
-        del x_high, x_med, x_static, x_cond, x_sm, x_lc, pop_map, y_batch, loss, valid_mask
+        del x_high, x_med, x_static, x_suit, x_cond, x_sm, x_lc, pop_map, y_batch, loss, valid_mask
 
         cleanup_every = int(cfg.get("memory_cleanup_interval", 0) if cfg else 0)
         if cleanup_every > 0 and (batch_idx + 1) % cleanup_every == 0:
@@ -794,6 +812,7 @@ def main(config: dict | None = None):
         # --- GPWv4 population exposure (Poisson loss only) ---
         "gpw_path": None,
         "add_pop": False,
+        "normalize_gpw_exposure": False,
     }
     if config:
         default_config.update(config)
@@ -1024,7 +1043,17 @@ def main(config: dict | None = None):
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
-    model, compute_loss_fn = build_model(cfg, num_zones)
+    log_zone_pop = None
+    if cfg.get("normalize_gpw_exposure", False) and population is not None:
+        if rank == 0:
+            logger.info("normalize_gpw_exposure: precomputing full zone populations from GPWv4 ...")
+        log_zone_pop = _compute_zone_populations(x_spatial, population)
+        if rank == 0:
+            logger.info(f"Zone populations precomputed: {log_zone_pop.shape}, "
+                        f"mean log(E_z/mean_pop)={log_zone_pop.mean():.3f}, "
+                        f"min={log_zone_pop.min():.3f}, max={log_zone_pop.max():.3f}")
+
+    model, compute_loss_fn = build_model(cfg, num_zones, log_zone_pop=log_zone_pop)
 
     # Initialise the decoder output bias to the global log-incidence rate when
     # using population-weighted Poisson loss. Without this, the model starts with
@@ -1044,6 +1073,9 @@ def main(config: dict | None = None):
             - math.log(max(population.total_population, 1.0))
             - math.log(max(n_times, 1))
         )
+        # Note: when normalize_gpw_exposure=True, the optimal decoder bias equals
+        # the unnormalized case (the log_mean_pop factors cancel in the derivation
+        # because they appear symmetrically in zone_preds and log_E_z_full).
         with torch.no_grad():
             model.decoder[-1].bias.data.fill_(log_base_rate)
         if rank == 0:
@@ -1062,7 +1094,7 @@ def main(config: dict | None = None):
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
     scaler = torch.amp.GradScaler(enabled=cfg["amp"])
 
-    es_config = SimpleNamespace(patience=cfg["patience"], min_patience=0)
+    es_config = SimpleNamespace(patience=cfg["patience"], min_patience=cfg.get("min_epochs_before_early_stop", 0))
     early_stopper = EarlyStopping(es_config, verbose=True)
 
     # ------------------------------------------------------------------
@@ -1244,6 +1276,10 @@ def parse_args():
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--min_epochs_before_early_stop", type=int, default=0,
+                        help="Early stopping cannot trigger before this many epochs.")
+    parser.add_argument("--max_grad_norm", type=float, default=0.0,
+                        help="Gradient clipping max norm. 0 disables clipping.")
     parser.add_argument("--cleanup_every", type=int, default=100)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--loss_fn", type=str, choices=["mse", "poisson"], default="mse")
@@ -1280,6 +1316,10 @@ def parse_args():
                         help="Directory containing GPWv4 NetCDF files "
                              "(GPWv4_latin_america_YYYY.nc). "
                              "Only used with --loss_fn poisson; ignored otherwise.")
+    parser.add_argument("--normalize_gpw_exposure", action="store_true",
+                        help="Normalise GPW Poisson loss by per-zone population E_z, "
+                             "making gradient magnitude invariant to zone exposure scale. "
+                             "Only effective with --gpw_path and --loss_fn poisson.")
 
     # --- date range ---
     parser.add_argument("--start_date", type=str, default=None,
@@ -1310,6 +1350,8 @@ if __name__ == "__main__":
         "num_epochs": args.num_epochs,
         "learning_rate": args.learning_rate,
         "patience": args.patience,
+        "min_epochs_before_early_stop": args.min_epochs_before_early_stop,
+        "max_grad_norm": args.max_grad_norm,
         "beta_kl": args.beta_kl,
         "use_kl": args.use_kl,
         "latent_channels": args.latent_channels,
@@ -1332,6 +1374,7 @@ if __name__ == "__main__":
         "add_lc": args.add_lc,
         "lc_data_path": args.lc_data_path,
         "gpw_path": args.gpw_path,
+        "normalize_gpw_exposure": args.normalize_gpw_exposure,
         "checkpoint": args.checkpoint,
         "checkpoint_run": args.checkpoint_run,
     }

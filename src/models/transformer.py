@@ -349,6 +349,9 @@ class DenguePredictor(nn.Module):
                  titok_backbone='vit_base_patch16_224.mae',
                  titok_num_latent_tokens=32,
                  titok_patch_size=256,
+                 # --- Aedes suitability branch (mandatory) ---
+                 suit_in_ch=1,
+                 suit_out=128,
                  # --- Soil moisture branch ---
                  add_sm=False,
                  sm_in_ch=2,   # ch0=SM value, ch1=validity mask
@@ -377,9 +380,10 @@ class DenguePredictor(nn.Module):
                 swin_model=swin_model
             )
 
-        self.med_branch = MediumResBranchAttention(out_dim=med_out, in_ch=med_in_ch)
+        self.med_branch    = MediumResBranchAttention(out_dim=med_out,    in_ch=med_in_ch)
         self.static_branch = StaticBranch(out_dim=static_out, in_ch=static_in_ch)
-        self.zone_branch = ZoneEmbeddingBlock(num_zones, static_out)
+        self.suit_branch   = StaticBranch(out_dim=suit_out,   in_ch=suit_in_ch)
+        self.zone_branch   = ZoneEmbeddingBlock(num_zones, static_out)
 
         # Optional soil moisture branch (same architecture as ERA5 medium branch)
         self.add_sm = add_sm
@@ -400,7 +404,7 @@ class DenguePredictor(nn.Module):
         self.output_channels = output_channels
         self.decoder_channels = decoder_channels
 
-        total_in = high_out + med_out + static_out + static_out
+        total_in = high_out + med_out + static_out + suit_out + static_out
         if add_sm:
             total_in += sm_out
         if add_lc:
@@ -420,13 +424,14 @@ class DenguePredictor(nn.Module):
             nn.Conv2d(decoder_channels, output_channels, kernel_size=1)
         )
 
-    def forward(self, x_high, x_med, x_static, x_cond, x_sm=None, x_lc=None):
+    def forward(self, x_high, x_med, x_static, x_suit, x_cond, x_sm=None, x_lc=None):
         f_high   = self.high_branch(x_high)
         f_med    = self.med_branch(x_med)
         f_static = self.static_branch(x_static)
+        f_suit   = self.suit_branch(x_suit)
         f_embed  = self.zone_branch(x_cond.long())
 
-        parts = [f_high, f_med, f_static, f_embed]
+        parts = [f_high, f_med, f_static, f_suit, f_embed]
         if self.add_sm and x_sm is not None:
             parts.append(self.sm_branch(x_sm))
         if self.add_lc and x_lc is not None:

@@ -23,6 +23,7 @@ from pathlib import Path
 from tqdm import tqdm
 import torch.distributed as dist
 from typing import List, Optional, Literal
+from utils.seasonal_encoding import append_seasonal_encoding_tensor, weekly_timestamps_for_window
 
 logger = logging.getLogger(__name__)
 
@@ -908,11 +909,18 @@ def mask_mbe(preds, labels, mask, return_value=True):
         
 
 class MaskedAdmin2Loss():
-    def __init__(self, loss_fn, num_zones, device, pop_weights=None):
+    def __init__(self, loss_fn, num_zones, device, pop_weights=None, log_zone_pop=None):
         self.device = device
         self.loss_fn = loss_fn
         self.num_zones = num_zones
         self.pop_weights = torch.tensor(pop_weights, dtype=torch.float32, device=self.device) if pop_weights is not None else None
+        # Precomputed log(E_z / mean_pop) per zone using the FULL zone population (not crop-level).
+        # Shape [num_zones]. Required for normalize_exposure=True in zone_loss.
+        if log_zone_pop is not None:
+            arr = log_zone_pop if isinstance(log_zone_pop, np.ndarray) else np.asarray(log_zone_pop)
+            self.log_zone_pop = torch.tensor(arr, dtype=torch.float32)  # kept on CPU; moved in zone_loss
+        else:
+            self.log_zone_pop = None
 
     def zone_aggregate(self, pred, zone_map, pop_map=None):
         """
@@ -974,12 +982,43 @@ class MaskedAdmin2Loss():
         log_zone_rates = zone_max + torch.log(zone_exp_sum + 1e-8)
         return log_zone_rates, zone_counts
 
-    def zone_loss(self, pred, target, zone_map, pop_map=None):
+    @torch.no_grad()
+    def _log_zone_pop(self, zone_map: torch.Tensor, pop_map: torch.Tensor) -> torch.Tensor:
+        """
+        logsumexp(pop_map_i for i∈z) per zone → log(E_z / mean_pop).
+        Same logsumexp pattern as zone_aggregate but without model predictions.
+        Returns [B, num_zones], all no_grad.
+        """
+        B = pop_map.shape[0]
+        H, W = pop_map.shape[-2], pop_map.shape[-1]
+        zm = zone_map.view(B, H, W).long()
+        pp = pop_map.view(B, H, W).float()
+        valid = (zm >= 0) & (zm < self.num_zones)
+
+        pop_max = torch.full((B, self.num_zones), float('-inf'),
+                             device=pop_map.device, dtype=torch.float32)
+        for b in range(B):
+            zm_b = zm[b][valid[b]].view(-1)
+            pp_b = pp[b][valid[b]].view(-1)
+            pop_max[b].scatter_reduce_(0, zm_b, pp_b, reduce='amax', include_self=True)
+
+        pop_exp = torch.zeros(B, self.num_zones, device=pop_map.device, dtype=torch.float32)
+        for b in range(B):
+            zm_b = zm[b][valid[b]].view(-1)
+            pp_b = pp[b][valid[b]].view(-1)
+            pop_exp[b].scatter_add_(0, zm_b, torch.exp(pp_b - pop_max[b][zm_b]))
+
+        return pop_max + torch.log(pop_exp + 1e-8)
+
+    def zone_loss(self, pred, target, zone_map, pop_map=None, normalize_exposure=False):
         """
         pred:     [B, 1, H, W]  — model output (pixel log per-capita risk)
         target:   [B, num_zones] — ground truth zone-level case counts
         zone_map: [B, H, W]     — integer zone IDs
-        pop_map:  [B, H, W]     — GPWv4 population per pixel (optional)
+        pop_map:  [B, H, W]     — GPWv4 log-centred population per pixel (optional)
+        normalize_exposure: if True and pop_map is not None, normalise both predicted
+            rate and target by per-zone total population E_z so that gradient magnitude
+            is invariant to zone-level exposure scale (see _log_zone_pop).
         """
         zone_preds, zone_counts = self.zone_aggregate(pred, zone_map, pop_map)
 
@@ -996,7 +1035,26 @@ class MaskedAdmin2Loss():
             # No valid zones in this batch — return zero loss with gradient
             return (zone_preds * 0).sum()
 
-        loss = self.loss_fn(zone_preds[valid_mask], target[valid_mask])
+        if normalize_exposure and self.log_zone_pop is not None:
+            # Full-zone log(E_z/mean_pop) precomputed from the entire admin grid (not crop-level).
+            # Using crop-level E_z would divide Y_z (all zone cases) by a tiny partial exposure,
+            # inflating normalized targets by orders of magnitude.
+            B = zone_preds.shape[0]
+            log_E_z = self.log_zone_pop.to(zone_preds.device).unsqueeze(0).expand(B, -1)
+            # Clamp log_E_z ≥ 0 before applying normalization.
+            # Zones with zero or near-zero GPWv4 population hit the log(1e-8) floor → log_E_z ≈ -18.7.
+            # Without clamping: preds_for_loss = zone_preds + 18.7 (large positive) and
+            # target_for_loss = Y_z / 7.9e-9 = Y_z × 1.3e8 (enormous), making the Poisson NLL
+            # ≈ -1.5e9 per zone and dominating the batch mean.  Clamping at 0 falls back to
+            # unnormalized scale (pred=zone_preds, target=Y_z) for those zones, which is valid.
+            log_E_z_safe = log_E_z.clamp(min=0.0)
+            preds_for_loss  = zone_preds - log_E_z_safe          # log(λ_z / max(E_z, mean_pop))
+            target_for_loss = target / log_E_z_safe.exp()        # Y_z · mean_pop / max(E_z, mean_pop)
+        else:
+            preds_for_loss  = zone_preds
+            target_for_loss = target
+
+        loss = self.loss_fn(preds_for_loss[valid_mask], target_for_loss[valid_mask])
         return loss
     
     def weighted_zone_loss(self, zone_preds, target, valid_mask, weights):
@@ -1494,6 +1552,136 @@ class GPWv4Population:
         # contributing near-zero weight in the logsumexp aggregation.
         log_pop = np.log(resampled + 1e-6).astype(np.float32) - self._log_mean_pop
         return torch.from_numpy(log_pop.copy())   # [H, W], centred log-population
+
+
+def _compute_zone_populations(x_spatial, population):
+    """
+    Compute log(E_z / mean_pop) per zone using the FULL admin-grid zone map + GPWv4.
+    E_z = sum of raw GPWv4 population for all pixels in zone z across the whole domain.
+
+    Upsamples the zone map to GPWv4 native resolution (nearest-neighbour) and
+    scatter-adds raw GPWv4 counts. Downsampling GPWv4 first with scipy zoom would
+    produce pixel *averages* (not sums), underestimating E_z by ~15-20×.
+
+    Returns numpy float32 array of shape [num_zones].
+    """
+    from scipy.ndimage import zoom as _zoom
+
+    zone_da = x_spatial.ds["FAO_GAUL_code"]
+    if "time" in zone_da.dims:
+        zone_da = zone_da.isel(time=0)
+    zone_np = np.asarray(zone_da.values, dtype=np.int64)  # [H_adm, W_adm]
+
+    adm_y = np.asarray(x_spatial.ds.coords["y"].values)
+    adm_x = np.asarray(x_spatial.ds.coords["x"].values)
+    H_adm, W_adm = zone_np.shape
+
+    epoch = population._available_epochs[-1]
+    cache = population._cache[epoch]
+    gpw_arr = cache["arr"]   # [H_gpw, W_gpw], raw population counts (not log)
+    gpw_lat = cache["lat"]
+    gpw_lon = cache["lon"]
+
+    lat_lo = float(min(adm_y.min(), adm_y.max()))
+    lat_hi = float(max(adm_y.min(), adm_y.max()))
+    lon_lo = float(min(adm_x.min(), adm_x.max()))
+    lon_hi = float(max(adm_x.min(), adm_x.max()))
+
+    lat_idx = np.where((gpw_lat >= lat_lo) & (gpw_lat <= lat_hi))[0]
+    lon_idx = np.where((gpw_lon >= lon_lo) & (gpw_lon <= lon_hi))[0]
+    if lat_idx.size == 0 or lon_idx.size == 0:
+        raise RuntimeError("GPWv4 domain does not overlap with admin NC domain")
+
+    lat_i0, lat_i1 = int(lat_idx.min()), int(lat_idx.max()) + 1
+    lon_i0, lon_i1 = int(lon_idx.min()), int(lon_idx.max()) + 1
+    gpw_crop = gpw_arr[lat_i0:lat_i1, lon_i0:lon_i1].astype(np.float32)
+    gpw_lat_crop = gpw_lat[lat_i0:lat_i1]
+
+    H_gpw, W_gpw = gpw_crop.shape
+
+    # Make both arrays north-first for geographic alignment
+    zone_north = zone_np[::-1, :].copy() if adm_y[0] < adm_y[-1] else zone_np.copy()
+    gpw_north  = gpw_crop[::-1, :].copy() if gpw_lat_crop[0] < gpw_lat_crop[-1] else gpw_crop.copy()
+
+    # Upsample zone map to GPWv4 native resolution (nearest-neighbour preserves integer IDs)
+    zy = H_gpw / H_adm
+    zx = W_gpw / W_adm
+    zone_at_gpw = _zoom(zone_north.astype(np.float32), (zy, zx), order=0).astype(np.int64)
+
+    num_zones = int(x_spatial.num_zones)
+    valid = (zone_at_gpw >= 0) & (zone_at_gpw < num_zones)
+    zone_pop_sum = np.zeros(num_zones, dtype=np.float64)
+    np.add.at(zone_pop_sum, zone_at_gpw[valid], gpw_north[valid])
+
+    log_zone_pop = np.log(zone_pop_sum + 1e-8) - population._log_mean_pop
+    return log_zone_pop.astype(np.float32)
+
+
+def _resample_gpw_to_pixel_grid(x_spatial, population, H_out: int, W_out: int) -> np.ndarray:
+    """
+    Aggregate GPWv4 population into an H_out × W_out pixel grid via scatter-sum.
+    The grid spans the same geographic extent as x_spatial.  Each output cell (r, c)
+    receives the sum of all GPWv4 pixels that fall within it — sum-preserving.
+
+    H_out × W_out should match the model's spatial output resolution so that the
+    returned population array aligns pixel-for-pixel with pred_log_rate.
+
+    Returns float32 array of shape [H_out, W_out].
+    """
+    zone_da = x_spatial.ds["FAO_GAUL_code"]
+    if "time" in zone_da.dims:
+        zone_da = zone_da.isel(time=0)
+
+    adm_y = np.asarray(x_spatial.ds.coords["y"].values, dtype=np.float64)
+    adm_x = np.asarray(x_spatial.ds.coords["x"].values, dtype=np.float64)
+
+    epoch = population._available_epochs[-1]
+    cache = population._cache[epoch]
+    gpw_arr = cache["arr"]
+    gpw_lat = cache["lat"]
+    gpw_lon = cache["lon"]
+
+    lat_lo, lat_hi = float(adm_y.min()), float(adm_y.max())
+    lon_lo, lon_hi = float(adm_x.min()), float(adm_x.max())
+
+    lat_idx = np.where((gpw_lat >= lat_lo) & (gpw_lat <= lat_hi))[0]
+    lon_idx = np.where((gpw_lon >= lon_lo) & (gpw_lon <= lon_hi))[0]
+    if lat_idx.size == 0 or lon_idx.size == 0:
+        raise RuntimeError("GPWv4 domain does not overlap with admin grid")
+
+    lat_i0, lat_i1 = int(lat_idx.min()), int(lat_idx.max()) + 1
+    lon_i0, lon_i1 = int(lon_idx.min()), int(lon_idx.max()) + 1
+
+    gpw_crop     = gpw_arr[lat_i0:lat_i1, lon_i0:lon_i1].astype(np.float32)
+    gpw_crop     = np.clip(np.nan_to_num(gpw_crop, nan=0.0), 0, None)
+    gpw_lat_crop = gpw_lat[lat_i0:lat_i1]   # [H_gpw]
+    gpw_lon_crop = gpw_lon[lon_i0:lon_i1]   # [W_gpw]
+    H_gpw, W_gpw = gpw_crop.shape
+
+    # Build a virtual H_out-point lat axis matching the admin grid's orientation.
+    # searchsorted then maps each GPWv4 lat to the nearest output row.
+    if adm_y[0] < adm_y[-1]:   # south-first
+        lat_axis = np.linspace(lat_lo, lat_hi, H_out)
+        row_out  = np.searchsorted(lat_axis, gpw_lat_crop, side="left")
+    else:                        # north-first
+        lat_axis = np.linspace(lat_hi, lat_lo, H_out)
+        row_out  = np.searchsorted(-lat_axis, -gpw_lat_crop, side="left")
+    row_out = np.clip(row_out, 0, H_out - 1).astype(np.int64)
+
+    if adm_x[0] < adm_x[-1]:   # west-first (normal)
+        lon_axis = np.linspace(lon_lo, lon_hi, W_out)
+        col_out  = np.searchsorted(lon_axis, gpw_lon_crop, side="left")
+    else:
+        lon_axis = np.linspace(lon_hi, lon_lo, W_out)
+        col_out  = np.searchsorted(-lon_axis, -gpw_lon_crop, side="left")
+    col_out = np.clip(col_out, 0, W_out - 1).astype(np.int64)
+
+    row_idx = np.broadcast_to(row_out[:, None], (H_gpw, W_gpw)).ravel()
+    col_idx = np.broadcast_to(col_out[None, :], (H_gpw, W_gpw)).ravel()
+
+    output = np.zeros((H_out, W_out), dtype=np.float64)
+    np.add.at(output, (row_idx, col_idx), gpw_crop.ravel())
+    return output.astype(np.float32)
 
 
 class SoilMoistureData:
@@ -2025,7 +2213,8 @@ class DengueDataset(torch.utils.data.Dataset):
         cache_dir=None,
         soil_moisture=None,
         land_cover=None,
-        population=None):
+        population=None,
+        suitability=None):
 
 
 
@@ -2037,6 +2226,7 @@ class DengueDataset(torch.utils.data.Dataset):
         self.soil_moisture = soil_moisture
         self.land_cover = land_cover
         self.population = population
+        self.suitability = suitability
         self.cache_dir = cache_dir
         self.skip_era5_bounds = skip_era5_bounds
         self.loss_fn = loss_fn
@@ -2052,7 +2242,8 @@ class DengueDataset(torch.utils.data.Dataset):
         self.patch_size_static = patch_sizes.get("static", (512, 512))
         self.patch_size_y = patch_sizes.get("y", (86, 86))
         self.patch_size_spatial_cond = patch_sizes.get("spatial_conditioning", (86, 86))
-        self.patch_size_sm = patch_sizes.get("soil_moisture", (512, 512))
+        self.patch_size_sm   = patch_sizes.get("soil_moisture",  (512, 512))
+        self.patch_size_suit = patch_sizes.get("suitability",    (43,  43))
 
         self.y_valid_threshold = y_valid_threshold
         
@@ -2210,6 +2401,8 @@ class DengueDataset(torch.utils.data.Dataset):
         Pads tensor [T, C, H, W] to target spatial size.
         Pads on the right and bottom only.
         """
+        if tensor.ndim < 3 or 0 in tensor.shape:
+            raise ValueError(f"Unexpected tensor shape {tensor.shape}")
         if tensor.ndim == 5:
             _, _, _, h, w = tensor.shape
         elif tensor.ndim == 4:
@@ -2401,9 +2594,25 @@ class DengueDataset(torch.utils.data.Dataset):
             timings["viirs"] = time.perf_counter() - t0
             t0 = time.perf_counter()
             x_med     = self._pad_to_size(self.era5[query_previous_n_days]["image"].float(), *self.patch_size_era5)
+            # Append sin/cos-of-day-of-year channels: [T, C, H, W] → [T, C+2, H, W]
+            _n_weeks  = x_med.shape[0]
+            _week_ts  = weekly_timestamps_for_window(t_week, _n_weeks)
+            x_med     = append_seasonal_encoding_tensor(x_med, _week_ts)
             timings["era5"] = time.perf_counter() - t0
             t0 = time.perf_counter()
             x_static  = self._pad_to_size(self.static[static_query]["image"].float(), *self.patch_size_static)
+
+            # Aedes suitability branch (mandatory) — monthly raster, queried by month start
+            t_month = pd.Timestamp(t_week).to_period("M").to_timestamp()
+            if self.suitability is not None:
+                query_suit = (x_slice, y_slice, slice(t_month, t_month))
+                x_suit = self._pad_to_size(
+                    self.suitability[query_suit]["image"].float(), *self.patch_size_suit
+                )
+            else:
+                h_s, w_s = self.patch_size_suit
+                x_suit = torch.zeros(1, h_s, w_s, dtype=torch.float32)
+
             x_lc = None
             if self.land_cover is not None:
                 query_lc = (x_slice, y_slice, t_week)
@@ -2476,19 +2685,19 @@ class DengueDataset(torch.utils.data.Dataset):
 
             if x_sm is not None and x_lc is not None:
                 if pop_map is not None:
-                    return x_high, x_med, x_static, x_cond, x_sm, x_lc, pop_map, y_val
-                return x_high, x_med, x_static, x_cond, x_sm, x_lc, y_val
+                    return x_high, x_med, x_static, x_suit, x_cond, x_sm, x_lc, pop_map, y_val
+                return x_high, x_med, x_static, x_suit, x_cond, x_sm, x_lc, y_val
             if x_sm is not None:
                 if pop_map is not None:
-                    return x_high, x_med, x_static, x_cond, x_sm, pop_map, y_val
-                return x_high, x_med, x_static, x_cond, x_sm, y_val
+                    return x_high, x_med, x_static, x_suit, x_cond, x_sm, pop_map, y_val
+                return x_high, x_med, x_static, x_suit, x_cond, x_sm, y_val
             if x_lc is not None:
                 if pop_map is not None:
-                    return x_high, x_med, x_static, x_cond, x_lc, pop_map, y_val
-                return x_high, x_med, x_static, x_cond, x_lc, y_val
+                    return x_high, x_med, x_static, x_suit, x_cond, x_lc, pop_map, y_val
+                return x_high, x_med, x_static, x_suit, x_cond, x_lc, y_val
             if pop_map is not None:
-                return x_high, x_med, x_static, x_cond, pop_map, y_val
-            return x_high, x_med, x_static, x_cond, y_val
+                return x_high, x_med, x_static, x_suit, x_cond, pop_map, y_val
+            return x_high, x_med, x_static, x_suit, x_cond, y_val
 
         except Exception as e:
             logger.error(f"Error loading patch at spatial_idx={spatial_idx}, time_idx={time_idx}: {e}")
