@@ -2449,7 +2449,7 @@ class DengueDataset(torch.utils.data.Dataset):
                 f"valid_indices_"
                 f"{len(self.time_pairs)}t_"
                 f"{len(self.spatial_queries)}s_"
-                f"{time_hash}_v2.pkl"
+                f"{time_hash}_v3.pkl"
             )
 
             cache_file = Path(self.cache_dir) / cache_name
@@ -2522,22 +2522,6 @@ class DengueDataset(torch.utils.data.Dataset):
             valid_ratios = np.isfinite(arr).reshape(arr.shape[0], -1).mean(axis=1)  # (T,)
 
             for time_idx in np.where(valid_ratios >= self.y_valid_threshold)[0].tolist():
-                # Fast rtree check: skip if VIIRS has no tile covering this bbox+month.
-                # This is a metadata-only query (no pixel loading) — O(log n) per call.
-                t_week, t_viirs = self.time_pairs[time_idx]
-                try:
-                    t_ts = pd.Timestamp(t_viirs).to_period("M").to_timestamp()
-                    mint = t_ts.timestamp()
-                    maxt = (t_ts + pd.offsets.MonthEnd(1)).timestamp()
-                    viirs_bb = TorchGeoBoundingBox(
-                        x_slice.start, x_slice.stop,
-                        y_slice.start, y_slice.stop,
-                        mint, maxt,
-                    )
-                    if not list(self.viirs.index.intersection(viirs_bb.to_tuple(), objects=False)):
-                        continue
-                except Exception:
-                    pass  # if the check fails for any reason, keep the patch
                 self.valid_indices.append((spatial_idx, time_idx))
 
         if len(self.valid_indices) == 0:
